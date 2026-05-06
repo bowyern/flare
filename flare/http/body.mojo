@@ -39,7 +39,7 @@ Pieces deferred (documented per-section):
   pulls the next chunk on each writable edge. The piece that
   delivers the headline "100MB without 100MB allocation" lands
   with the reactor adoption.
-- The SSE example (``examples/24_sse.mojo``) demonstrates the
+- The SSE example (``examples/intermediate/sse.mojo``) demonstrates the
   ``ChunkSource`` + ``ChunkedBody`` shape against an in-process
   loop; the network-side demo follows the reactor adoption.
 

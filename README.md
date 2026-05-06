@@ -126,7 +126,7 @@ def main() raises:
     HttpServer.bind(SocketAddr.localhost(8080)).serve(r^, num_workers=4)
 ```
 
-Middleware is the same shape: a `Handler` that wraps another `Handler`. The stock layers (`Logger`, `RequestId`, `Compress`, `CatchPanic`, `Cors`, `FileServer`) all compose by nesting structs, no callback chain. `examples/18_middleware.mojo` walks through the production-shaped pipeline (`RequestID → Logger → Timing → Recover → RequireAuth → Router`).
+Middleware is the same shape: a `Handler` that wraps another `Handler`. The stock layers (`Logger`, `RequestId`, `Compress`, `CatchPanic`, `Cors`, `FileServer`) all compose by nesting structs, no callback chain. `examples/intermediate/middleware.mojo` walks through the production-shaped pipeline (`RequestID → Logger → Timing → Recover → RequireAuth → Router`).
 
 ### Advanced: compile-time dispatch, shared state, cancel awareness
 
@@ -250,7 +250,7 @@ flare ships safety asserts on every FFI / unsafe-pointer boundary (`debug_assert
 For production deployments and apples-to-apples benchmarks, build with asserts compiled out:
 
 ```bash
-mojo build -D ASSERT=none -I . examples/08_http_server.mojo -o myserver
+mojo build -D ASSERT=none -I . examples/basic/http_server.mojo -o myserver
 ./myserver
 ```
 

@@ -35,23 +35,23 @@ an example file. For layering and the request lifecycle, see
 
 | Surface | Where |
 |---|---|
-| `HttpServer.bind(addr)` / `serve(handler)` / `serve(handler, num_workers=N)` — version-aware listener that dispatches HTTP/1.1, HTTP/2 over TLS (ALPN), and h2c (RFC 9113 §3.4 preface peek, no `Upgrade` dance) to the same handler | [`08_http_server.mojo`](../examples/08_http_server.mojo), [`35_http2.mojo`](../examples/35_http2.mojo), [`41_http2_server_router.mojo`](../examples/41_http2_server_router.mojo) |
-| `HttpServer.serve_static(StaticResponse)` — pre-encoded static-response fast path that skips parsing and handler dispatch (used by `flare_mc_static` bench row) | [`21_static_response.mojo`](../examples/21_static_response.mojo) |
+| `HttpServer.bind(addr)` / `serve(handler)` / `serve(handler, num_workers=N)` — version-aware listener that dispatches HTTP/1.1, HTTP/2 over TLS (ALPN), and h2c (RFC 9113 §3.4 preface peek, no `Upgrade` dance) to the same handler | [`http_server.mojo`](../examples/basic/http_server.mojo), [`http2.mojo`](../examples/advanced/http2.mojo), [`http2_server_router.mojo`](../examples/advanced/http2_server_router.mojo) |
+| `HttpServer.serve_static(StaticResponse)` — pre-encoded static-response fast path that skips parsing and handler dispatch (used by `flare_mc_static` bench row) | [`static_response.mojo`](../examples/intermediate/static_response.mojo) |
 | `HttpServer.serve_comptime[handler, config]()` — comptime-specialised reactor with build-time invariant checks on `ServerConfig` | `flare.http.server` |
-| Per-worker `SO_REUSEPORT` listeners by default (`num_workers >= 2`); `FLARE_REUSEPORT_WORKERS=0` switches to single-listener `EPOLLEXCLUSIVE` shape | [`17_multicore.mojo`](../examples/17_multicore.mojo) |
-| `pin_cores=True` (default): worker N pinned to core `N % num_cpus()` on Linux, no-op on macOS | [`17_multicore.mojo`](../examples/17_multicore.mojo) |
-| `HttpServer.drain(timeout_ms) -> ShutdownReport` per worker, `install_drain_on_sigterm` | [`23_drain.mojo`](../examples/23_drain.mojo) |
+| Per-worker `SO_REUSEPORT` listeners by default (`num_workers >= 2`); `FLARE_REUSEPORT_WORKERS=0` switches to single-listener `EPOLLEXCLUSIVE` shape | [`multicore.mojo`](../examples/intermediate/multicore.mojo) |
+| `pin_cores=True` (default): worker N pinned to core `N % num_cpus()` on Linux, no-op on macOS | [`multicore.mojo`](../examples/intermediate/multicore.mojo) |
+| `HttpServer.drain(timeout_ms) -> ShutdownReport` per worker, `install_drain_on_sigterm` | [`drain.mojo`](../examples/intermediate/drain.mojo) |
 | `ServerConfig` (request / handler / body-read deadlines, `max_header_size`, `max_body_size`, `max_keepalive_requests`, `idle_timeout_ms`) | `flare.http.server` |
 | Response builders: `ok(body)`, `ok_json(body)`, `bad_request(msg)`, `not_found(msg)`, `internal_error(msg)`, `redirect(url)` | `flare.http.server` |
 | `Method` enum, `Status` enum, `Response` with header / body / status, `ResponsePool` for response object reuse | `flare.http.{request,response,response_pool}` |
 | `Request.peer` threaded from the accept path | `flare.http.request` |
-| `precompute_response(status, content_type, body) -> StaticResponse` — keep-alive + `Connection: close` wire forms both pre-encoded | [`21_static_response.mojo`](../examples/21_static_response.mojo) |
+| `precompute_response(status, content_type, body) -> StaticResponse` — keep-alive + `Connection: close` wire forms both pre-encoded | [`static_response.mojo`](../examples/intermediate/static_response.mojo) |
 
 ## HTTP client
 
 | Surface | Where |
 |---|---|
-| `HttpClient(base_url, auth=...)`, `HttpClient(prefer_h2c=True)` — version-aware over TLS+ALPN; `prefer_h2c=True` opts into HTTP/2 cleartext via prior knowledge | [`05_http_get.mojo`](../examples/05_http_get.mojo), [`40_http2_client.mojo`](../examples/40_http2_client.mojo) |
+| `HttpClient(base_url, auth=...)`, `HttpClient(prefer_h2c=True)` — version-aware over TLS+ALPN; `prefer_h2c=True` opts into HTTP/2 cleartext via prior knowledge | [`http_get.mojo`](../examples/basic/http_get.mojo), [`http2_client.mojo`](../examples/advanced/http2_client.mojo) |
 | Module-level helpers: `get`, `post`, `put`, `patch`, `delete`, `head` — `post` with `String` body sets `Content-Type: application/json` automatically | `flare.http.client` |
 | `RedirectPolicy.FOLLOW_ALL` / `SAME_ORIGIN_ONLY` / `DENY` (default), `TooManyRedirects` error | `flare.http.{redirect_policy,error}` |
 | `Auth`, `BasicAuth(user, pass)`, `BearerAuth(token)` — both wires | `flare.http.auth` |
@@ -61,10 +61,10 @@ an example file. For layering and the request lifecycle, see
 
 | Surface | Where |
 |---|---|
-| `Router` — runtime trie with path parameters (`:name`), wildcards (`*`), method dispatch, 404 / 405-with-`Allow` | [`15_router.mojo`](../examples/15_router.mojo) |
-| `ComptimeRouter[ROUTES]`, `ComptimeRoute(method, path, handler)` — segments parsed at compile time, dispatch loop unrolled per route | [`20_comptime_router.mojo`](../examples/20_comptime_router.mojo) |
-| `App[S, H]` — application-scoped state bundled with a handler; `state_view()` hands out a `State[S]` borrow that middleware can read or mutate | [`16_state.mojo`](../examples/16_state.mojo) |
-| `State[S]` typed handle, `state.get()` borrow | [`16_state.mojo`](../examples/16_state.mojo) |
+| `Router` — runtime trie with path parameters (`:name`), wildcards (`*`), method dispatch, 404 / 405-with-`Allow` | [`router.mojo`](../examples/basic/router.mojo) |
+| `ComptimeRouter[ROUTES]`, `ComptimeRoute(method, path, handler)` — segments parsed at compile time, dispatch loop unrolled per route | [`comptime_router.mojo`](../examples/advanced/comptime_router.mojo) |
+| `App[S, H]` — application-scoped state bundled with a handler; `state_view()` hands out a `State[S]` borrow that middleware can read or mutate | [`state.mojo`](../examples/intermediate/state.mojo) |
+| `State[S]` typed handle, `state.get()` borrow | [`state.mojo`](../examples/intermediate/state.mojo) |
 
 ## Handlers and extractors
 
@@ -73,7 +73,7 @@ an example file. For layering and the request lifecycle, see
 | Trait | What it gets | Where |
 |---|---|---|
 | `Handler` | `serve(req: Request) raises -> Response` | `flare.http.handler` |
-| `CancelHandler` | `serve(req: Request, cancel: Cancel) raises -> Response`; `cancel.cancelled()` flips on peer FIN, deadline elapse, or graceful drain | [`22_cancel.mojo`](../examples/22_cancel.mojo) |
+| `CancelHandler` | `serve(req: Request, cancel: Cancel) raises -> Response`; `cancel.cancelled()` flips on peer FIN, deadline elapse, or graceful drain | [`cancel.mojo`](../examples/intermediate/cancel.mojo) |
 | `ViewHandler` | Receives `RequestView[origin]` for zero-copy reads (no `String` materialisation) | `flare.http.handler` |
 | `WithCancel[Inner]` | Adapt a `CancelHandler` to fit the `Handler` shape | `flare.http.handler` |
 | `WithViewCancel[Inner]` | Same, for `ViewHandler` + `Cancel` | `flare.http.handler` |
@@ -85,17 +85,17 @@ Concrete typed extractors (`.value` is the parsed primitive):
 
 | Extractor | Type | Source |
 |---|---|---|
-| `PathInt[name]` / `PathStr[name]` / `PathFloat[name]` / `PathBool[name]` | path parameter | [`19_extractors.mojo`](../examples/19_extractors.mojo) |
-| `QueryInt[name]` / `QueryStr` / `QueryFloat` / `QueryBool` | query string | [`19_extractors.mojo`](../examples/19_extractors.mojo) |
-| `OptionalQueryInt[name]` / `OptionalQueryStr` / `OptionalQueryFloat` / `OptionalQueryBool` | optional query | [`19_extractors.mojo`](../examples/19_extractors.mojo) |
-| `HeaderInt[name]` / `HeaderStr` / `HeaderFloat` / `HeaderBool` | request header | [`19_extractors.mojo`](../examples/19_extractors.mojo) |
-| `OptionalHeaderInt[name]` / `OptionalHeaderStr` / `OptionalHeaderFloat` / `OptionalHeaderBool` | optional header | [`19_extractors.mojo`](../examples/19_extractors.mojo) |
+| `PathInt[name]` / `PathStr[name]` / `PathFloat[name]` / `PathBool[name]` | path parameter | [`extractors.mojo`](../examples/intermediate/extractors.mojo) |
+| `QueryInt[name]` / `QueryStr` / `QueryFloat` / `QueryBool` | query string | [`extractors.mojo`](../examples/intermediate/extractors.mojo) |
+| `OptionalQueryInt[name]` / `OptionalQueryStr` / `OptionalQueryFloat` / `OptionalQueryBool` | optional query | [`extractors.mojo`](../examples/intermediate/extractors.mojo) |
+| `HeaderInt[name]` / `HeaderStr` / `HeaderFloat` / `HeaderBool` | request header | [`extractors.mojo`](../examples/intermediate/extractors.mojo) |
+| `OptionalHeaderInt[name]` / `OptionalHeaderStr` / `OptionalHeaderFloat` / `OptionalHeaderBool` | optional header | [`extractors.mojo`](../examples/intermediate/extractors.mojo) |
 | `Peer` | client `SocketAddr` from accept path | `flare.http.extract` |
 | `BodyBytes` / `BodyText` | raw request body | `flare.http.extract` |
 | `Json[T]` | JSON-decoded body | `flare.http.extract` |
-| `Form[T]` | `application/x-www-form-urlencoded` body | [`28_forms.mojo`](../examples/28_forms.mojo) |
-| `Multipart` | `multipart/form-data` body | [`29_multipart_upload.mojo`](../examples/29_multipart_upload.mojo) |
-| `Cookies` | inbound `Cookie:` header → `CookieJar` | [`27_request_cookies.mojo`](../examples/27_request_cookies.mojo) |
+| `Form[T]` | `application/x-www-form-urlencoded` body | [`forms.mojo`](../examples/intermediate/forms.mojo) |
+| `Multipart` | `multipart/form-data` body | [`multipart_upload.mojo`](../examples/intermediate/multipart_upload.mojo) |
+| `Cookies` | inbound `Cookie:` header → `CookieJar` | [`request_cookies.mojo`](../examples/intermediate/request_cookies.mojo) |
 
 Parametric / pluggable forms:
 
@@ -104,7 +104,7 @@ Parametric / pluggable forms:
 | `Path[T: ParamParser, name]`, `Query[T, name]`, `OptionalQuery[T, name]`, `Header[T, name]`, `OptionalHeader[T, name]` | Plug in a custom `ParamParser` for non-standard primitives | `flare.http.extract` |
 | `ParamParser` trait + `ParamInt` / `ParamFloat64` / `ParamBool` / `ParamString` | Stock parser implementations | `flare.http.extract` |
 | `Extractor` trait | Anything that pulls a value from a `Request` | `flare.http.extract` |
-| `Extracted[H]` | Reflects on a struct's fields, runs every extractor before `serve`; malformed input becomes a sanitised 400 | [`19_extractors.mojo`](../examples/19_extractors.mojo) |
+| `Extracted[H]` | Reflects on a struct's fields, runs every extractor before `serve`; malformed input becomes a sanitised 400 | [`extractors.mojo`](../examples/intermediate/extractors.mojo) |
 
 ## Middleware
 
@@ -113,25 +113,25 @@ by nesting structs:
 
 | Layer | Behaviour | Where |
 |---|---|---|
-| `Logger[Inner]` | Space-delimited per-request line (`[flare] GET /users 200 12ms`) | [`18_middleware.mojo`](../examples/18_middleware.mojo) |
-| `RequestId[Inner]` | Generate / propagate `X-Request-Id` | [`31_middleware_stack.mojo`](../examples/31_middleware_stack.mojo) |
-| `Compress[Inner]` | gzip / brotli / identity content-encoding via q-value negotiation; small-body / already-encoded skip | [`31_middleware_stack.mojo`](../examples/31_middleware_stack.mojo), [`34_brotli.mojo`](../examples/34_brotli.mojo) |
-| `CatchPanic[Inner]` | Convert handler panic to sanitised 500 | [`31_middleware_stack.mojo`](../examples/31_middleware_stack.mojo) |
-| `Cors[Inner]` + `CorsConfig` | RFC 6454 + Fetch CORS protocol; permissive / allowlist / preflight short-circuit / credentials echo / exposed-headers / max-age | [`32_cors.mojo`](../examples/32_cors.mojo) |
+| `Logger[Inner]` | Space-delimited per-request line (`[flare] GET /users 200 12ms`) | [`middleware.mojo`](../examples/intermediate/middleware.mojo) |
+| `RequestId[Inner]` | Generate / propagate `X-Request-Id` | [`middleware_stack.mojo`](../examples/intermediate/middleware_stack.mojo) |
+| `Compress[Inner]` | gzip / brotli / identity content-encoding via q-value negotiation; small-body / already-encoded skip | [`middleware_stack.mojo`](../examples/intermediate/middleware_stack.mojo), [`brotli.mojo`](../examples/intermediate/brotli.mojo) |
+| `CatchPanic[Inner]` | Convert handler panic to sanitised 500 | [`middleware_stack.mojo`](../examples/intermediate/middleware_stack.mojo) |
+| `Cors[Inner]` + `CorsConfig` | RFC 6454 + Fetch CORS protocol; permissive / allowlist / preflight short-circuit / credentials echo / exposed-headers / max-age | [`cors.mojo`](../examples/intermediate/cors.mojo) |
 | `Conditional[Inner]` | RFC 9110 §13 preconditions: `If-Match` / `If-None-Match` (304 / 412), `If-Modified-Since` / `If-Unmodified-Since`; opt-in auto-ETag from FNV-1a body hash via `Conditional.with_auto_etag` | `flare.http.conditional` |
-| `FileServer.new(root)` | Static file serving with GET / HEAD + RFC 9110 §14.4 single-Range, MIME inference, path safety (`..` / NUL / absolute path rejection), `index.html` directory fall-through | [`33_static_files.mojo`](../examples/33_static_files.mojo) |
+| `FileServer.new(root)` | Static file serving with GET / HEAD + RFC 9110 §14.4 single-Range, MIME inference, path safety (`..` / NUL / absolute path rejection), `index.html` directory fall-through | [`static_files.mojo`](../examples/intermediate/static_files.mojo) |
 | `negotiate_encoding(Accept-Encoding) -> Encoding` | RFC 9110 §12.5.3 q-value parser exposed for direct use | `flare.http.middleware` |
 
 ## Cookies, sessions, auth
 
 | Surface | Where |
 |---|---|
-| `Cookie`, `CookieJar`, `SameSite` | [`13_cookies.mojo`](../examples/13_cookies.mojo) |
-| `parse_cookie_header`, `parse_set_cookie_header` (RFC 6265) | [`13_cookies.mojo`](../examples/13_cookies.mojo) |
+| `Cookie`, `CookieJar`, `SameSite` | [`cookies.mojo`](../examples/basic/cookies.mojo) |
+| `parse_cookie_header`, `parse_set_cookie_header` (RFC 6265) | [`cookies.mojo`](../examples/basic/cookies.mojo) |
 | `signed_cookie_encode(value, key)` / `signed_cookie_decode(cookie, key)` — HMAC-SHA256 over base64url payload + tag | `flare.http.session` |
 | `signed_cookie_decode_keys(cookie, keys)` — accept any of N keys, for graceful key rotation | `flare.http.session` |
-| `Session[T]`, `SessionCodec`, `StringSessionCodec` | [`30_sessions.mojo`](../examples/30_sessions.mojo) |
-| `CookieSessionStore[T]` (signed-cookie-backed), `InMemorySessionStore[T]` (server-side) | [`30_sessions.mojo`](../examples/30_sessions.mojo) |
+| `Session[T]`, `SessionCodec`, `StringSessionCodec` | [`sessions.mojo`](../examples/intermediate/sessions.mojo) |
+| `CookieSessionStore[T]` (signed-cookie-backed), `InMemorySessionStore[T]` (server-side) | [`sessions.mojo`](../examples/intermediate/sessions.mojo) |
 | `Auth`, `BasicAuth`, `BearerAuth`, `AuthError` | `flare.http.{auth,auth_extract}` |
 | HAProxy PROXY v1 + v2 parser, `ProxyParseError` | `flare.http.proxy_protocol` |
 
@@ -139,10 +139,10 @@ by nesting structs:
 
 | Surface | Where |
 |---|---|
-| `FormData`, `parse_form_urlencoded`, `urldecode`, `urlencode`, `Form` extractor | [`28_forms.mojo`](../examples/28_forms.mojo) |
-| `MultipartPart`, `MultipartForm`, `parse_multipart_form_data`, `Multipart` extractor | [`29_multipart_upload.mojo`](../examples/29_multipart_upload.mojo) |
+| `FormData`, `parse_form_urlencoded`, `urldecode`, `urlencode`, `Form` extractor | [`forms.mojo`](../examples/intermediate/forms.mojo) |
+| `MultipartPart`, `MultipartForm`, `parse_multipart_form_data`, `Multipart` extractor | [`multipart_upload.mojo`](../examples/intermediate/multipart_upload.mojo) |
 | `Url`, `UrlParseError` — URL parser, percent decoding | `flare.http.url` |
-| `Encoding` enum, `compress_gzip` / `decompress_gzip`, `compress_brotli` / `decompress_brotli`, `decompress_deflate` | [`10_encoding.mojo`](../examples/10_encoding.mojo), [`34_brotli.mojo`](../examples/34_brotli.mojo) |
+| `Encoding` enum, `compress_gzip` / `decompress_gzip`, `compress_brotli` / `decompress_brotli`, `decompress_deflate` | [`encoding.mojo`](../examples/basic/encoding.mojo), [`brotli.mojo`](../examples/intermediate/brotli.mojo) |
 | `decode_content("br" / "gzip" / "deflate" / "identity", ...)` | `flare.http.encoding` |
 
 ## Body, streaming, SSE, templates, static files
@@ -153,8 +153,8 @@ by nesting structs:
 | `StreamingResponse[B]`, `serialize_streaming_response` | `flare.http.streaming_response` |
 | `RequestView[origin]`, `parse_request_view` — zero-copy borrow over the parsed request, paired with `ViewHandler` | `flare.http.request_view` |
 | `HeaderMap`, `HeaderInjectionError`, `HeaderMapView`, `parse_header_view` | `flare.http.{headers,header_view}` |
-| `StaticResponse`, `precompute_response` — pre-encoded wire form for fixed-body endpoints | [`21_static_response.mojo`](../examples/21_static_response.mojo) |
-| `SseEvent`, `SseChannel` (in-memory FIFO + cancel-aware `ChunkSource` wrapper), `format_sse_event`, `sse_response`, `SseStreamingResponse[B]` | [`24_sse.mojo`](../examples/24_sse.mojo) |
+| `StaticResponse`, `precompute_response` — pre-encoded wire form for fixed-body endpoints | [`static_response.mojo`](../examples/intermediate/static_response.mojo) |
+| `SseEvent`, `SseChannel` (in-memory FIFO + cancel-aware `ChunkSource` wrapper), `format_sse_event`, `sse_response`, `SseStreamingResponse[B]` | [`sse.mojo`](../examples/intermediate/sse.mojo) |
 | Askama-shape templates: `{{ name }}` (HTML-escaped, `| safe` opt-out), `{% if %}...{% endif %}`, `{% for x in name %}...{% endfor %}`, `TemplateError` | `flare.http.template` |
 | `ByteRange`, `parse_range`, `FileServer` (see [Middleware](#middleware)) | `flare.http.fs` |
 
@@ -176,11 +176,11 @@ deferred-to-a-later-minor.
 
 | Surface | Status | Where |
 |---|---|---|
-| `H2Connection` synchronous driver — `take_request() -> Request`, `emit_response(...)` queues `HEADERS [+ DATA]`; strips `Connection / Transfer-Encoding / Keep-Alive / Proxy-Connection / Upgrade` per RFC 9113 §8.2.2 | Shipped, fuzz-clean | [`35_http2.mojo`](../examples/35_http2.mojo) |
-| Reactor wiring (one fd → one `H2Connection`, ALPN dispatch, h2 prior-knowledge per RFC 9113 §3.4) | Shipped (v0.7) | `flare.http._unified_reactor_impl`, [`41_http2_server_router.mojo`](../examples/41_http2_server_router.mojo) |
+| `H2Connection` synchronous driver — `take_request() -> Request`, `emit_response(...)` queues `HEADERS [+ DATA]`; strips `Connection / Transfer-Encoding / Keep-Alive / Proxy-Connection / Upgrade` per RFC 9113 §8.2.2 | Shipped, fuzz-clean | [`http2.mojo`](../examples/advanced/http2.mojo) |
+| Reactor wiring (one fd → one `H2Connection`, ALPN dispatch, h2 prior-knowledge per RFC 9113 §3.4) | Shipped (v0.7) | `flare.http._unified_reactor_impl`, [`http2_server_router.mojo`](../examples/advanced/http2_server_router.mojo) |
 | h2c via Upgrade (mid-stream switch from h1 to h2 per RFC 7540 §3.2) | Shipped (v0.7) | `flare.http._unified_reactor_impl._migrate_h1_to_h2`, [`tests/test_h2c_upgrade.mojo`](../tests/test_h2c_upgrade.mojo) |
 | RFC 8441 Extended CONNECT dispatch + SETTINGS latch (server side) | Shipped (v0.6), fuzz-covered (`fuzz-extended-connect`) | `flare.http2.state` |
-| `Http2Config` — SETTINGS knobs validated at construction | Shipped | [`37_http2_config.mojo`](../examples/37_http2_config.mojo) |
+| `Http2Config` — SETTINGS knobs validated at construction | Shipped | [`http2_config.mojo`](../examples/advanced/http2_config.mojo) |
 | `is_h2_alpn(...)`, `detect_h2c_upgrade(headers)` | Shipped | `flare.http2.server` |
 | `H2_PREFACE`, `H2_DEFAULT_FRAME_SIZE`, `H2_MAX_FRAME_SIZE`, `H2Error`, `H2ErrorCode` | Shipped | `flare.http2` |
 | Frame codec: `Frame`, `FrameFlags`, `FrameHeader`, `FrameType`, `encode_frame`, `parse_frame` (RFC 9113 §4, all 10 frame types) | Shipped, fuzz-clean (`fuzz-h2-frame`) | `flare.http2.frame` |
@@ -196,9 +196,9 @@ deferred-to-a-later-minor.
 
 | Surface | Where |
 |---|---|
-| `WsClient.connect(url)` — handshake + frame loop, `WsHandshakeError` | [`06_websocket_echo.mojo`](../examples/06_websocket_echo.mojo) |
-| `WsServer` — server-side handshake + frame loop | [`09_ws_server.mojo`](../examples/09_ws_server.mojo) |
-| `WsMessage` — high-level text / binary message wrapper | [`07_ergonomics.mojo`](../examples/07_ergonomics.mojo) |
+| `WsClient.connect(url)` — handshake + frame loop, `WsHandshakeError` | [`websocket_echo.mojo`](../examples/basic/websocket_echo.mojo) |
+| `WsServer` — server-side handshake + frame loop | [`ws_server.mojo`](../examples/basic/ws_server.mojo) |
+| `WsMessage` — high-level text / binary message wrapper | [`ergonomics.mojo`](../examples/basic/ergonomics.mojo) |
 | `WsFrame`, `WsOpcode`, `WsCloseCode`, `WsProtocolError` — low-level frame surface | `flare.ws.frame` |
 | Mandatory client-mask validation, UTF-8 validation on text frames (RFC 6455) | `flare.ws.frame` |
 
@@ -206,11 +206,11 @@ deferred-to-a-later-minor.
 
 | Surface | Where |
 |---|---|
-| `TlsStream.connect(host, port, TlsConfig)` — client | [`12_tls.mojo`](../examples/12_tls.mojo) |
+| `TlsStream.connect(host, port, TlsConfig)` — client | [`tls.mojo`](../examples/basic/tls.mojo) |
 | `TlsConfig`, `TlsVerify` — verification mode (full / hostname / none) | `flare.tls.config` |
 | `TlsAcceptor`, `TlsServerConfig`, `TlsInfo` — server side over OpenSSL | `flare.tls.acceptor` |
-| `TlsAcceptor.reload()` — ACME / Let's Encrypt cert rotation without restart | [`25_cert_reload.mojo`](../examples/25_cert_reload.mojo) |
-| mTLS — construction-time validation of CA chain + client cert | [`26_mtls.mojo`](../examples/26_mtls.mojo) |
+| `TlsAcceptor.reload()` — ACME / Let's Encrypt cert rotation without restart | [`cert_reload.mojo`](../examples/advanced/cert_reload.mojo) |
+| mTLS — construction-time validation of CA chain + client cert | [`mtls.mojo`](../examples/advanced/mtls.mojo) |
 | ALPN advertised + parsed on both sides; refusal-to-downgrade enforced | `flare.tls` |
 | `TLS_PROTOCOL_TLS12`, `TLS_PROTOCOL_TLS13` (1.0 / 1.1 refused) | `flare.tls.acceptor` |
 | Errors: `TlsHandshakeError`, `CertificateExpired`, `CertificateHostnameMismatch`, `CertificateUntrusted`, `TlsServerError`, `TlsServerNotImplemented` | `flare.tls.error` |
@@ -219,11 +219,11 @@ deferred-to-a-later-minor.
 
 | Surface | Where |
 |---|---|
-| `TcpStream.connect(host, port)`, `TcpListener.bind(addr)`, IPv4 + IPv6, TCP options | [`04_tcp_echo.mojo`](../examples/04_tcp_echo.mojo) |
-| `UdpSocket.bind`, `send_to`, `recv_from`, `DatagramTooLarge` | [`11_udp.mojo`](../examples/11_udp.mojo) |
-| `UnixListener`, `UnixStream`, `accept_uds_fd` — AF_UNIX sidecar IPC | [`38_uds_sidecar.mojo`](../examples/38_uds_sidecar.mojo) |
-| `IpAddr.parse(...)`, `IpAddr.is_v4/v6`, `is_private`, `is_loopback`, `SocketAddr.parse(...)`, `SocketAddr.localhost(port)`, `RawSocket` | [`01_addresses.mojo`](../examples/01_addresses.mojo) |
-| `resolve()`, `resolve_v4()`, `resolve_v6()` — getaddrinfo, dual-stack, numeric-IP passthrough | [`02_dns_resolution.mojo`](../examples/02_dns_resolution.mojo) |
+| `TcpStream.connect(host, port)`, `TcpListener.bind(addr)`, IPv4 + IPv6, TCP options | [`tcp_echo.mojo`](../examples/basic/tcp_echo.mojo) |
+| `UdpSocket.bind`, `send_to`, `recv_from`, `DatagramTooLarge` | [`udp.mojo`](../examples/basic/udp.mojo) |
+| `UnixListener`, `UnixStream`, `accept_uds_fd` — AF_UNIX sidecar IPC | [`uds_sidecar.mojo`](../examples/advanced/uds_sidecar.mojo) |
+| `IpAddr.parse(...)`, `IpAddr.is_v4/v6`, `is_private`, `is_loopback`, `SocketAddr.parse(...)`, `SocketAddr.localhost(port)`, `RawSocket` | [`addresses.mojo`](../examples/basic/addresses.mojo) |
+| `resolve()`, `resolve_v4()`, `resolve_v6()` — getaddrinfo, dual-stack, numeric-IP passthrough | [`dns_resolution.mojo`](../examples/basic/dns_resolution.mojo) |
 
 ## Crypto
 
@@ -238,19 +238,19 @@ deferred-to-a-later-minor.
 | Surface | Where |
 |---|---|
 | `Readable` trait | `flare.io.buf_reader` |
-| `BufReader` over any `Readable` | [`07_ergonomics.mojo`](../examples/07_ergonomics.mojo) |
+| `BufReader` over any `Readable` | [`ergonomics.mojo`](../examples/basic/ergonomics.mojo) |
 
 ## Reactor and runtime
 
 | Surface | Where |
 |---|---|
-| `Reactor` — `kqueue` (macOS), `epoll` (Linux); register / deregister fds, run one tick or until shutdown | [`14_reactor.mojo`](../examples/14_reactor.mojo) |
+| `Reactor` — `kqueue` (macOS), `epoll` (Linux); register / deregister fds, run one tick or until shutdown | [`reactor.mojo`](../examples/advanced/reactor.mojo) |
 | `Event`, `INTEREST_READ`, `INTEREST_WRITE`, `EVENT_READABLE`, `EVENT_WRITABLE`, `EVENT_ERROR`, `EVENT_HUP`, `WAKEUP_TOKEN` | `flare.runtime.event` |
 | `TimerWheel` — hashed timing wheel for idle / deadline timeouts | `flare.runtime.timer_wheel` |
 | `default_worker_count()`, `num_cpus()` | `flare.runtime` |
-| `HandoffPolicy.from_env()`, `HandoffQueue` (bounded MPSC FIFO of fd tokens), `WorkerHandoffPool.peek_idle_worker(exclude)` — cross-worker steering, gated on `FLARE_SOAK_WORKERS=on` | [`36_work_stealing.mojo`](../examples/36_work_stealing.mojo) |
-| `IoUringRing`, `IoUringParams`, `is_io_uring_available()` — opt-in `io_uring` reactor on Linux ≥ 6.0 (`FLARE_BUFRING_HANDLER=1`); auto-fallback to `epoll` | [`39_iouring_plaintext.mojo`](../examples/39_iouring_plaintext.mojo) |
-| `Cancel`, `CancelCell`, `CancelReason` (peer FIN / deadline / drain) plumbed to `CancelHandler` | [`22_cancel.mojo`](../examples/22_cancel.mojo) |
+| `HandoffPolicy.from_env()`, `HandoffQueue` (bounded MPSC FIFO of fd tokens), `WorkerHandoffPool.peek_idle_worker(exclude)` — cross-worker steering, gated on `FLARE_SOAK_WORKERS=on` | [`work_stealing.mojo`](../examples/advanced/work_stealing.mojo) |
+| `IoUringRing`, `IoUringParams`, `is_io_uring_available()` — opt-in `io_uring` reactor on Linux ≥ 6.0 (`FLARE_BUFRING_HANDLER=1`); auto-fallback to `epoll` | [`iouring_plaintext.mojo`](../examples/advanced/iouring_plaintext.mojo) |
+| `Cancel`, `CancelCell`, `CancelReason` (peer FIN / deadline / drain) plumbed to `CancelHandler` | [`cancel.mojo`](../examples/intermediate/cancel.mojo) |
 
 ## Performance internals
 
