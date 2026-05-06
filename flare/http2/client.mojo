@@ -342,6 +342,58 @@ struct Http2ClientConnection(Defaultable, Movable):
             pass
 
     @staticmethod
+    def from_h2c_upgrade(
+        var config: Http2ClientConfig,
+    ) raises -> Http2ClientConnection:
+        """Build a client-side driver pre-seeded for an h2c upgrade.
+
+        Per RFC 7540 §3.2 ("Starting HTTP/2 for HTTP URIs"), after the
+        server accepts the upgrade with ``101 Switching Protocols``
+        the original HTTP/1.1 request implicitly becomes stream id 1
+        in HALF_CLOSED_LOCAL state from the client's perspective: the
+        request body has already been delivered on the h1 wire, so
+        the client sends no further bytes on stream 1; the server
+        will respond on stream 1 with HEADERS + DATA.
+
+        After construction the caller MUST:
+
+        1. Drain the connection preface + SETTINGS frame from
+           :attr:`outbox` and write it to the (now-h2) socket as the
+           client's connection preface (RFC 9113 §3.5);
+        2. Feed inbound bytes into :meth:`feed`, expecting the
+           server's initial SETTINGS frame followed by a HEADERS+DATA
+           response on stream 1;
+        3. Poll :meth:`response_ready(1)` and pop the response via
+           :meth:`take_response(1)`.
+
+        The next client-initiated stream id starts at 3 (RFC 9113
+        §5.1.1: odd, monotonically increasing, and stream 1 is
+        already taken).
+
+        Args:
+            config: Same client config the upgrade request advertised
+                via the ``HTTP2-Settings`` header (the SETTINGS frame
+                in the connection preface MUST agree with the values
+                the upgrade request committed to).
+
+        Returns:
+            An :class:`Http2ClientConnection` whose outbox holds the
+            client's connection preface + initial SETTINGS frame and
+            whose ``conn.streams`` already contains stream id 1 in
+            HALF_CLOSED_LOCAL state.
+        """
+        config.validate()
+        var out = Http2ClientConnection.with_config(config^)
+        var s = Stream()
+        s.id = 1
+        s.send_window = out.conn.initial_window_size
+        s.recv_window = out.conn.initial_window_size
+        s.state = StreamState.HALF_CLOSED_LOCAL()
+        out.conn.streams[1] = s^
+        out._next_sid = 3
+        return out^
+
+    @staticmethod
     def with_config(
         var config: Http2ClientConfig,
     ) raises -> Http2ClientConnection:
@@ -833,6 +885,52 @@ struct Http2ClientConnection(Defaultable, Movable):
         §6.8). The high-level facade SHOULD stop opening new
         streams; in-flight streams MAY complete."""
         return self.conn.goaway_received
+
+
+# ── h2c upgrade SETTINGS payload helper ──────────────────────────────────
+
+
+def build_h2c_settings_payload(config: Http2ClientConfig) -> List[UInt8]:
+    """Serialise ``config``'s non-default SETTINGS pairs as a raw
+    SETTINGS frame *body* (no 9-byte frame header) suitable for the
+    ``HTTP2-Settings`` request-header value (RFC 7540 §3.2.1).
+
+    Each pair is 6 bytes: 2-byte big-endian id then 4-byte
+    big-endian value (RFC 9113 §6.5.1). The encoded blob is the
+    base64url-safe-no-pad encoding of these bytes; the higher-level
+    h2c-via-Upgrade client base64url-encodes the return value of
+    this function before stuffing it into ``HTTP2-Settings``.
+
+    The set of pairs MUST agree with the SETTINGS frame the client
+    later sends inside its h2 connection preface so the server's
+    view of the negotiated values is consistent before and after the
+    101-switch (RFC 7540 §3.2.1: the upgrade-time SETTINGS replaces
+    the *protocol defaults* on the server, and the client's
+    connection preface SETTINGS is then ACK'd as a normal SETTINGS
+    frame).
+    """
+    var p = List[UInt8]()
+    if config.header_table_size != 4096:
+        _append_setting_pair(p, 0x1, config.header_table_size)
+    _append_setting_pair(p, 0x2, 0)
+    if config.initial_window_size != 65535:
+        _append_setting_pair(p, 0x4, config.initial_window_size)
+    if config.max_frame_size != H2_DEFAULT_FRAME_SIZE:
+        _append_setting_pair(p, 0x5, config.max_frame_size)
+    if config.max_header_list_size > 0:
+        _append_setting_pair(p, 0x6, config.max_header_list_size)
+    return p^
+
+
+def _append_setting_pair(mut buf: List[UInt8], id: Int, value: Int):
+    """Append one 6-byte SETTINGS pair (RFC 9113 §6.5.1):
+    big-endian 2-byte id then big-endian 4-byte value."""
+    buf.append(UInt8((id >> 8) & 0xFF))
+    buf.append(UInt8(id & 0xFF))
+    buf.append(UInt8((value >> 24) & 0xFF))
+    buf.append(UInt8((value >> 16) & 0xFF))
+    buf.append(UInt8((value >> 8) & 0xFF))
+    buf.append(UInt8(value & 0xFF))
 
 
 # ── Http2Response -> flare.http.Response lowering ────────────────────────

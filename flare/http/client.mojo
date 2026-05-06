@@ -51,11 +51,14 @@ from ..net import SocketAddr
 from ..dns import resolve
 
 from ..http2.client import (
+    Http2ClientConfig,
     Http2ClientConnection,
     Http2Response,
     _h2_response_to_http,
+    build_h2c_settings_payload,
 )
 from ..http2.hpack import HpackHeader
+from ..crypto.hmac import base64url_encode
 
 
 struct HttpClient(Movable):
@@ -101,6 +104,18 @@ struct HttpClient(Movable):
     independent of this flag -- they always advertise ALPN
     ``["h2", "http/1.1"]`` and dispatch on what the server
     picks."""
+    var _h2c_upgrade: Bool
+    """When ``True``, ``http://`` requests negotiate HTTP/2 over
+    cleartext via the RFC 7540 §3.2 Upgrade dance: send the
+    request as HTTP/1.1 with ``Connection: Upgrade,
+    HTTP2-Settings`` + ``Upgrade: h2c`` + ``HTTP2-Settings:
+    <base64url(SETTINGS)>``; if the server replies
+    ``101 Switching Protocols``, switch the connection to h2
+    and read the response from stream id 1. Servers that don't
+    speak h2 just answer the original request as h1 and the
+    client returns that response unchanged. Orthogonal to
+    :attr:`_prefer_h2c` (prior-knowledge path); both default
+    ``False``."""
 
     def __init__(
         out self,
@@ -109,6 +124,7 @@ struct HttpClient(Movable):
         timeout_ms: Int = 30_000,
         user_agent: String = "flare/0.1.0",
         prefer_h2c: Bool = False,
+        h2c_upgrade: Bool = False,
     ):
         """Initialise an ``HttpClient`` with secure defaults.
 
@@ -128,6 +144,7 @@ struct HttpClient(Movable):
         self._base_url = base_url
         self._auth_header = ""
         self._prefer_h2c = prefer_h2c
+        self._h2c_upgrade = h2c_upgrade
 
     def __init__(
         out self,
@@ -137,6 +154,7 @@ struct HttpClient(Movable):
         timeout_ms: Int = 30_000,
         user_agent: String = "flare/0.1.0",
         prefer_h2c: Bool = False,
+        h2c_upgrade: Bool = False,
     ):
         """Initialise an ``HttpClient`` with custom TLS configuration."""
         self._config = tls.copy()
@@ -146,6 +164,7 @@ struct HttpClient(Movable):
         self._base_url = base_url
         self._auth_header = ""
         self._prefer_h2c = prefer_h2c
+        self._h2c_upgrade = h2c_upgrade
 
     def __init__[
         A: Auth
@@ -157,6 +176,7 @@ struct HttpClient(Movable):
         timeout_ms: Int = 30_000,
         user_agent: String = "flare/0.1.0",
         prefer_h2c: Bool = False,
+        h2c_upgrade: Bool = False,
     ) raises:
         """Initialise an ``HttpClient`` with authentication."""
         self._config = TlsConfig()
@@ -168,6 +188,7 @@ struct HttpClient(Movable):
         auth.apply(auth_headers)
         self._auth_header = auth_headers.get("Authorization")
         self._prefer_h2c = prefer_h2c
+        self._h2c_upgrade = h2c_upgrade
 
     def __init__[
         A: Auth
@@ -179,6 +200,7 @@ struct HttpClient(Movable):
         timeout_ms: Int = 30_000,
         user_agent: String = "flare/0.1.0",
         prefer_h2c: Bool = False,
+        h2c_upgrade: Bool = False,
     ) raises:
         """Initialise an ``HttpClient`` with a base URL and authentication."""
         self._config = TlsConfig()
@@ -190,6 +212,7 @@ struct HttpClient(Movable):
         auth.apply(auth_headers)
         self._auth_header = auth_headers.get("Authorization")
         self._prefer_h2c = prefer_h2c
+        self._h2c_upgrade = h2c_upgrade
 
     # ── Context manager ───────────────────────────────────────────────────────
 
@@ -653,6 +676,22 @@ struct HttpClient(Movable):
                     self._auth_header,
                 )
                 return resp_h2c^
+            if self._h2c_upgrade:
+                # h2c via the RFC 7540 §3.2 Upgrade dance: send the
+                # request as h1 with ``Upgrade: h2c`` +
+                # ``HTTP2-Settings``; if the server replies 101 the
+                # response arrives over h2 on stream id 1, otherwise
+                # the helper returns the plain h1 response.
+                var resp_upg = _send_h2c_via_upgrade(
+                    stream^,
+                    method,
+                    u,
+                    extra_headers,
+                    body,
+                    self._user_agent,
+                    self._auth_header,
+                )
+                return resp_upg^
             var wire_bytes = wire.as_bytes()
             stream.write_all(Span[UInt8, _](wire_bytes))
             if len(body) > 0:
@@ -1417,6 +1456,212 @@ def _send_h2_over_tcp(
         pass
     stream.close()
     return _h2_response_to_http(h2_resp^)
+
+
+def _send_h2c_via_upgrade(
+    var stream: TcpStream,
+    method: String,
+    u: Url,
+    extra_headers: HeaderMap,
+    body: List[UInt8],
+    user_agent: String,
+    auth_header: String,
+) raises -> Response:
+    """Negotiate HTTP/2 cleartext via the RFC 7540 §3.2 ``Upgrade``
+    dance and run the request.
+
+    Wire flow:
+
+    1. Client sends an HTTP/1.1 request decorated with
+       ``Connection: Upgrade, HTTP2-Settings``,
+       ``Upgrade: h2c``, and
+       ``HTTP2-Settings: <base64url(SETTINGS-payload)>``.
+    2. The server either:
+       a. Accepts: replies ``101 Switching Protocols``
+          + ``Connection: Upgrade`` + ``Upgrade: h2c``
+          and treats the original request as stream id 1; or
+       b. Declines: replies as a plain HTTP/1.1 response.
+    3. On 101, the client sends the h2 connection preface
+       (``PRI * HTTP/2.0\\r\\n\\r\\nSM\\r\\n\\r\\n`` + a SETTINGS
+       frame) and reads the response on stream id 1 over the same
+       TCP fd; the original request body has already been delivered
+       on the h1 wire so stream 1 is HALF_CLOSED_LOCAL from the
+       client's perspective.
+    4. On non-101 the helper parses the h1 response and returns it
+       as-is so the caller sees a normal :class:`Response`.
+
+    Used by :meth:`HttpClient._do_request` when the user constructed
+    :class:`HttpClient` with ``h2c_upgrade=True`` and targeted an
+    ``http://`` URL. Orthogonal to ``prefer_h2c`` (prior-knowledge
+    path).
+    """
+    var h2_cfg = Http2ClientConfig()
+    var settings_payload = build_h2c_settings_payload(h2_cfg)
+    var settings_b64 = base64url_encode(settings_payload^)
+    var wire = method + " " + u.request_target() + " HTTP/1.1\r\n"
+    var host_header = u.host
+    if u.port != 80:
+        host_header = host_header + ":" + String(Int(u.port))
+    wire += "Host: " + host_header + "\r\n"
+    wire += "User-Agent: " + user_agent + "\r\n"
+    wire += "Connection: Upgrade, HTTP2-Settings\r\n"
+    wire += "Upgrade: h2c\r\n"
+    wire += "HTTP2-Settings: " + settings_b64 + "\r\n"
+    wire += "Accept: */*\r\n"
+    if auth_header.byte_length() > 0:
+        wire += "Authorization: " + auth_header + "\r\n"
+    for i in range(extra_headers.len()):
+        var k = extra_headers._keys[i]
+        var lk = k.lower()
+        if (
+            lk == "host"
+            or lk == "authorization"
+            or lk == "connection"
+            or lk == "upgrade"
+            or lk == "http2-settings"
+        ):
+            continue
+        wire += k + ": " + extra_headers._values[i] + "\r\n"
+    if len(body) > 0:
+        wire += "Content-Length: " + String(len(body)) + "\r\n"
+    wire += "\r\n"
+
+    var wire_bytes = wire.as_bytes()
+    stream.write_all(Span[UInt8, _](wire_bytes))
+    if len(body) > 0:
+        stream.write_all(Span[UInt8, _](body))
+
+    var raw = List[UInt8]()
+    var hdr_end = -1
+    var buf = List[UInt8](capacity=_H2_READ_BUF_SIZE)
+    buf.resize(_H2_READ_BUF_SIZE, UInt8(0))
+    while hdr_end < 0:
+        var n = stream.read(buf.unsafe_ptr(), _H2_READ_BUF_SIZE)
+        if n == 0:
+            stream.close()
+            raise NetworkError(
+                "HttpClient(h2c-upgrade): peer closed connection before"
+                " response headers"
+            )
+        for i in range(n):
+            raw.append(buf[i])
+        if len(raw) >= 4:
+            var k = 0
+            while k + 3 < len(raw):
+                if (
+                    raw[k] == 0x0D
+                    and raw[k + 1] == 0x0A
+                    and raw[k + 2] == 0x0D
+                    and raw[k + 3] == 0x0A
+                ):
+                    hdr_end = k + 4
+                    break
+                k += 1
+
+    var status = _parse_status_line(raw)
+    if status != 101:
+        var rest = raw.copy()
+        var body_buf = List[UInt8](capacity=_H2_READ_BUF_SIZE)
+        body_buf.resize(_H2_READ_BUF_SIZE, UInt8(0))
+        while True:
+            var n = stream.read(body_buf.unsafe_ptr(), _H2_READ_BUF_SIZE)
+            if n == 0:
+                break
+            for i in range(n):
+                rest.append(body_buf[i])
+        stream.close()
+        return _parse_http_response(rest)
+
+    var h2_conn = Http2ClientConnection.from_h2c_upgrade(h2_cfg^)
+    var preface_bytes = h2_conn.drain()
+    if len(preface_bytes) > 0:
+        stream.write_all(Span[UInt8, _](preface_bytes))
+
+    if hdr_end < len(raw):
+        var leftover = List[UInt8]()
+        for i in range(hdr_end, len(raw)):
+            leftover.append(raw[i])
+        if len(leftover) > 0:
+            h2_conn.feed(Span[UInt8, _](leftover))
+            var ack_bytes = h2_conn.drain()
+            if len(ack_bytes) > 0:
+                stream.write_all(Span[UInt8, _](ack_bytes))
+
+    while not h2_conn.response_ready(1):
+        if h2_conn.goaway_received():
+            stream.close()
+            raise NetworkError(
+                "HttpClient(h2c-upgrade): peer sent GOAWAY before responding"
+                " to stream 1"
+            )
+        var n = stream.read(buf.unsafe_ptr(), _H2_READ_BUF_SIZE)
+        if n == 0:
+            stream.close()
+            raise NetworkError(
+                "HttpClient(h2c-upgrade): peer closed connection mid-response"
+                " on stream 1"
+            )
+        h2_conn.feed(Span[UInt8, _](buf[:n]))
+        var ack_bytes = h2_conn.drain()
+        if len(ack_bytes) > 0:
+            stream.write_all(Span[UInt8, _](ack_bytes))
+
+    var maybe_err = h2_conn.stream_error(1)
+    if Bool(maybe_err):
+        stream.close()
+        raise NetworkError(
+            "HttpClient(h2c-upgrade): peer sent RST_STREAM (error code "
+            + String(maybe_err.value())
+            + ") on stream 1"
+        )
+    var h2_resp = h2_conn.take_response(1)
+    try:
+        h2_conn.send_goaway(1, 0)
+        var goaway_bytes = h2_conn.drain()
+        if len(goaway_bytes) > 0:
+            stream.write_all(Span[UInt8, _](goaway_bytes))
+    except:
+        pass
+    stream.close()
+    return _h2_response_to_http(h2_resp^)
+
+
+def _parse_status_line(raw: List[UInt8]) raises -> Int:
+    """Extract the status code from the leading status-line of a
+    raw HTTP/1.1 response buffer.
+
+    Returns just the numeric status (e.g. ``101`` or ``200``); the
+    caller decides whether to switch protocols or fall through to a
+    full h1 response parse. Used only by the h2c-via-Upgrade
+    helper -- the regular response parser is :func:`_parse_http_response`.
+    """
+    var line_end = 0
+    while line_end + 1 < len(raw):
+        if raw[line_end] == 0x0D and raw[line_end + 1] == 0x0A:
+            break
+        line_end += 1
+    if line_end + 1 >= len(raw):
+        raise NetworkError("HttpClient(h2c-upgrade): no CRLF after status-line")
+    var sl = String("")
+    for i in range(line_end):
+        sl += chr(Int(raw[i]))
+    var sp1 = sl.find(" ")
+    if sp1 < 0:
+        raise NetworkError("HttpClient(h2c-upgrade): malformed status-line")
+    var sp2 = sl.find(" ", start=sp1 + 1)
+    var code_end = sp2
+    if code_end < 0:
+        code_end = sl.byte_length()
+    var code_str = String("")
+    var slp = sl.unsafe_ptr()
+    for i in range(sp1 + 1, code_end):
+        code_str += chr(Int(slp[i]))
+    try:
+        return Int(code_str)
+    except:
+        raise NetworkError(
+            "HttpClient(h2c-upgrade): non-numeric status code in status-line"
+        )
 
 
 # ── Module-level convenience functions ────────────────────────────────────────
