@@ -67,4 +67,4 @@ def main() raises:
     var resp = echo_json(fake^)
     print("status:", resp.status)
     print("Content-Type:", resp.headers.get("Content-Type"))
-    print("body:", String(unsafe_from_utf8=resp.body))
+    print("body:", resp.text())

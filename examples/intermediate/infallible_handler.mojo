@@ -124,42 +124,22 @@ def main() raises:
     var req = Request(method="GET", url="/health", version="HTTP/1.1")
 
     var hr = health(req)
-    print(
-        "health (bare fn):  status=",
-        hr.status,
-        "body=",
-        String(unsafe_from_utf8=hr.body),
-    )
+    print("health (bare fn):  status=", hr.status, "body=", hr.text())
 
     var er = echo_method(req)
-    print(
-        "method (bare fn):  status=",
-        er.status,
-        "body=",
-        String(unsafe_from_utf8=er.body),
-    )
+    print("method (bare fn):  status=", er.status, "body=", er.text())
 
     var probe = GreetingProbe(
         greeting="hello from a stateful infallible handler"
     )
     var pr = probe.serve(req)
-    print(
-        "greet (struct):    status=",
-        pr.status,
-        "body=",
-        String(unsafe_from_utf8=pr.body),
-    )
+    print("greet (struct):    status=", pr.status, "body=", pr.text())
 
     var adapted = WithRaises[GreetingProbe](
         GreetingProbe(greeting="via WithRaises adapter")
     )
     var ar = adapted.serve(req)
-    print(
-        "greet (adapted):   status=",
-        ar.status,
-        "body=",
-        String(unsafe_from_utf8=ar.body),
-    )
+    print("greet (adapted):   status=", ar.status, "body=", ar.text())
 
     # Register the bare-function shapes on a Router to prove the
     # implicit no-raises -> raises upcast at the registration site.
@@ -167,9 +147,4 @@ def main() raises:
     r.get("/health", health)
     r.get("/method", echo_method)
     var hresp = r.serve(req)
-    print(
-        "router /health:    status=",
-        hresp.status,
-        "body=",
-        String(unsafe_from_utf8=hresp.body),
-    )
+    print("router /health:    status=", hresp.status, "body=", hresp.text())

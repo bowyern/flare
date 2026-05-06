@@ -20,7 +20,7 @@ def test_ok_json_value_object_round_trip() raises:
     var resp = ok_json_value(v)
     assert_equal(resp.status, 200)
     assert_equal(resp.headers.get("content-type"), "application/json")
-    var body = String(unsafe_from_utf8=resp.body)
+    var body = resp.text()
     assert_true('"id":42' in body, "body missing id field; got: " + body)
     assert_true(
         '"name":"alice"' in body, "body missing name field; got: " + body
@@ -31,34 +31,31 @@ def test_ok_json_value_array() raises:
     """A JSON array value serialises with elements in order."""
     var arr = loads("[1,2,3]")
     var resp = ok_json_value(arr)
-    var body = String(unsafe_from_utf8=resp.body)
-    assert_equal(body, "[1,2,3]")
+    assert_equal(resp.text(), "[1,2,3]")
 
 
 def test_ok_json_value_primitive_string() raises:
     """A bare JSON string serialises with surrounding quotes."""
     var v = JsonValue("hello")
     var resp = ok_json_value(v)
-    var body = String(unsafe_from_utf8=resp.body)
-    assert_equal(body, '"hello"')
+    assert_equal(resp.text(), '"hello"')
 
 
 def test_ok_json_value_primitive_int() raises:
     """A bare JSON number serialises numerically."""
     var v = JsonValue(123)
     var resp = ok_json_value(v)
-    var body = String(unsafe_from_utf8=resp.body)
-    assert_equal(body, "123")
+    assert_equal(resp.text(), "123")
 
 
 def test_ok_json_value_primitive_bool() raises:
     """A bare JSON bool serialises as ``true`` / ``false``."""
     var t = JsonValue(True)
     var resp = ok_json_value(t)
-    assert_equal(String(unsafe_from_utf8=resp.body), "true")
+    assert_equal(resp.text(), "true")
     var f = JsonValue(False)
     var resp_f = ok_json_value(f)
-    assert_equal(String(unsafe_from_utf8=resp_f.body), "false")
+    assert_equal(resp_f.text(), "false")
 
 
 def test_ok_json_string_overload_still_works() raises:
@@ -67,7 +64,7 @@ def test_ok_json_string_overload_still_works() raises:
     var resp = ok_json('{"ok":true}')
     assert_equal(resp.status, 200)
     assert_equal(resp.headers.get("content-type"), "application/json")
-    assert_equal(String(unsafe_from_utf8=resp.body), '{"ok":true}')
+    assert_equal(resp.text(), '{"ok":true}')
 
 
 def test_ok_json_value_sets_content_type() raises:

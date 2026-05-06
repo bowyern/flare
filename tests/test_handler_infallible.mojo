@@ -59,7 +59,7 @@ def test_handler_infallible_direct_call() raises:
     var req = Request(method="GET", url="/", version="HTTP/1.1")
     var resp = h.serve(req)  # No ``raises`` keyword required at the call.
     assert_equal(resp.status, 200)
-    assert_equal(String(unsafe_from_utf8=resp.body), "hello v0.7")
+    assert_equal(resp.text(), "hello v0.7")
 
 
 def test_with_raises_adapts_infallible_to_handler() raises:
@@ -69,7 +69,7 @@ def test_with_raises_adapts_infallible_to_handler() raises:
     var req = Request(method="GET", url="/health", version="HTTP/1.1")
     var resp = adapted.serve(req)
     assert_equal(resp.status, 200)
-    assert_equal(String(unsafe_from_utf8=resp.body), '{"status":"ok"}')
+    assert_equal(resp.text(), '{"status":"ok"}')
 
 
 def _accept_handler[H: Handler](handler: H) raises -> Int:
