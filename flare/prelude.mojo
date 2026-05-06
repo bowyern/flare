@@ -2,12 +2,12 @@
 
 A typical handler module in flare touches the same handful of names:
 ``Request``, ``Response``, ``Router``, ``HttpServer``, the ``Handler``
-family (``Handler``, ``HandlerInfallible``, ``WithRaises``), the
-``ok`` / ``ok_json`` / ``ok_json_value`` builders + the common 4xx/5xx
-helpers, the ``Method`` / ``Status`` constants, and ``SocketAddr`` for
-binding the listener. ``flare.prelude`` is the wildcard-importable
-shortcut for that exact set, so the canonical import block shrinks
-from 5–8 lines to one::
+family (``Handler``, ``HandlerExtractor``, ``HandlerInfallible``,
+``WithRaises``), the ``ok`` / ``ok_json`` / ``ok_json_value`` builders
++ the common 4xx/5xx helpers, the ``Method`` / ``Status`` constants,
+and ``SocketAddr`` for binding the listener. ``flare.prelude`` is the
+wildcard-importable shortcut for that exact set, so the canonical
+import block shrinks from 5–8 lines to one::
 
     from flare.prelude import *
 
@@ -17,7 +17,7 @@ from 5–8 lines to one::
     def main() raises:
         var r = Router()
         r.get("/", hello)
-        HttpServer.bind(SocketAddr.localhost(8080)).serve(r^, num_workers=4)
+        HttpServer.bind(SocketAddr.localhost(8080)).serve(r^)
 
 Domain-specific surfaces are deliberately *not* re-exported so the
 prelude stays small enough that the import block of a real module
@@ -39,7 +39,12 @@ For those, import the specific names from the matching module
 "first ten lines of code" surface, not the kitchen sink.
 """
 
-from .http.handler import Handler, HandlerInfallible, WithRaises
+from .http.handler import (
+    Handler,
+    HandlerExtractor,
+    HandlerInfallible,
+    WithRaises,
+)
 from .http.request import Method, Request
 from .http.response import Response, Status
 from .http.router import Router

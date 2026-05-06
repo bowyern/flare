@@ -34,7 +34,7 @@ from flare.http import (
     OptionalQueryInt,
     QueryStr,
     HeaderStr,
-    Handler,
+    HandlerExtractor,
     Router,
     Extracted,
 )
@@ -57,11 +57,18 @@ def list_user_posts(req: Request) raises -> Response:
 
 
 @fieldwise_init
-struct GetUser(Copyable, Defaultable, Handler, Movable):
+struct GetUser(HandlerExtractor):
     """All the handler's inputs are declared as fields. The adapter
-    walks the field list via reflection and populates each one from the
-    request before calling ``serve``. With the concrete extractors,
-    each field's ``.value`` is the primitive directly.
+    walks the field list via reflection and populates each one from
+    the request before calling ``serve``. With the concrete
+    extractors, each field's ``.value`` is the primitive directly.
+
+    ``HandlerExtractor`` is sugar for ``(Copyable, Defaultable,
+    Handler, Movable)`` -- the four-trait conformance every
+    ``Extracted[H]``-mounted struct needs. The manual no-arg
+    ``__init__`` body is still required today (Mojo doesn't yet
+    auto-derive a no-arg constructor from per-field ``Defaultable``
+    impls); once that lands, the body collapses to ``pass``.
     """
 
     var id: PathInt["id"]
@@ -109,7 +116,7 @@ def main() raises:
     # path, captures :id, and dispatches into Extracted's serve
     # which fills in each field before invoking GetUser.serve.
     var router = Router()
-    router.get[Extracted[GetUser]]("/users/:id", Extracted[GetUser]())
+    router.get("/users/:id", Extracted[GetUser]())
 
     var r3 = Request.test_get("/users/42?trace=req-abc")
     r3.headers.set("Authorization", "Bearer secret")

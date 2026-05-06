@@ -118,6 +118,61 @@ trait Handler(ImplicitlyDestructible, Movable):
         ...
 
 
+# ── HandlerExtractor: convenience trait composition ──────────────────────────
+
+
+trait HandlerExtractor(Copyable, Defaultable, Handler, Movable):
+    """Convenience trait composition for typed-extractor handler structs.
+
+    Equivalent to declaring ``(Copyable, Defaultable, Handler,
+    Movable)`` directly -- no new methods, no new behaviour.
+    Collapses the four-trait conformance line that every
+    ``Extracted[H]``-mounted handler ends up writing into one
+    name.
+
+    The four conformances are required by :class:`Extracted[H]`:
+
+    * ``Defaultable`` -- ``Extracted`` default-constructs ``H``
+      once per request before walking its fields with the
+      reflection step.
+    * ``Handler`` -- ``H.serve(req)`` is the actual user code
+      that runs after extractor population.
+    * ``Copyable & Movable`` -- the same bound the parametric
+      ``Router.get[H: Handler & Copyable & Movable]`` overload
+      requires for boxed-handler registration.
+
+    Use as the trait-conformance line on any handler struct
+    intended for ``Extracted[H]`` auto-injection::
+
+        @fieldwise_init
+        struct GetUser(HandlerExtractor):
+            var id: PathInt[\"id\"]
+            var trace: QueryStr[\"trace\"]
+            var auth: HeaderStr[\"Authorization\"]
+
+            def __init__(out self):
+                self.id = PathInt[\"id\"]()
+                self.trace = QueryStr[\"trace\"]()
+                self.auth = HeaderStr[\"Authorization\"]()
+
+            def serve(self, req: Request) raises -> Response:
+                ...
+
+        var r = Router()
+        r.get(\"/users/:id\", Extracted[GetUser]())
+
+    Re-exported from :mod:`flare.http` and :mod:`flare.prelude`.
+
+    The manual no-arg ``__init__`` body is still required today
+    because Mojo's ``@fieldwise_init`` doesn't auto-derive a
+    no-arg constructor from per-field ``Defaultable`` impls
+    (tracked as a Mojo language-support item; once it lands,
+    the body collapses to ``pass``).
+    """
+
+    pass
+
+
 trait HandlerInfallible(ImplicitlyDestructible, Movable):
     """A :trait:`Handler` whose ``serve`` is provably infallible.
 

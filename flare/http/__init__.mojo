@@ -134,6 +134,7 @@ from .request import Request, Method
 from .response import Response, Status
 from .response_pool import ResponsePool
 from .handler import (
+    HandlerExtractor,
     HandlerInfallible,
     WithRaises,
     Handler,
