@@ -225,10 +225,35 @@ def _struct_destroy_thunk[H: Handler & Copyable & Movable](addr: Int) -> None:
 # ``destroy_thunks`` list once to free every owned allocation.
 
 
+# ── Arc-style refcount for boxed Handler-struct addresses ───────
+#
+# v0.7 closes the deferred Router-Copyable item with a minimal
+# refcount cell -- only an ``Int`` counter is heap-allocated;
+# every Router copy still carries its own value-typed lists of
+# struct addresses + monomorphised thunks (cheap to clone --
+# they're plain integers and function pointers). Each address
+# points at a heap-allocated boxed Handler struct that's shared
+# by every Router copy. The refcount governs when those boxed
+# structs are destroyed: every ``__copyinit__`` bumps it, every
+# ``__del__`` decrements; only the last drop walks the destroy
+# thunks. We deliberately avoid embedding Lists inside a
+# heap-allocated struct (Mojo's allocator handles that awkwardly
+# today and the in-place List header layout breaks under
+# raw-pointer reconstruction).
+#
+# Lifetime invariant: at most one mutating "owner" exists at a
+# time (the call site that does the ``r.get(...)`` registration
+# before the first ``serve``); copies of the Router that exist
+# only to be moved into worker threads are read-only post-copy.
+# The refcount makes the shared addresses safe under that
+# pattern -- every ``Router.__del__`` decrements once and the
+# destroy thunks run exactly once when the last copy drops.
+
+
 # ── Router ───────────────────────────────────────────────────────────────────
 
 
-struct Router(Handler):
+struct Router(Copyable, Handler, Movable):
     """HTTP router with method dispatch, path parameters, and nesting.
 
     Accepts both plain ``def(Request) raises -> Response`` functions
@@ -256,14 +281,25 @@ struct Router(Handler):
     var _handlers: List[FnHandler]
     var _struct_addrs: List[Int]
     """Heap addresses of boxed ``H: Handler`` structs, one per
-    struct-handler route. Owned by the Router; freed in ``__del__``
-    via the matching ``_struct_destroy_thunks`` entry."""
+    struct-handler route. Each Router copy carries its own
+    deep-copied list of these integer addresses; the underlying
+    boxed structs are shared via the refcount cell below."""
     var _struct_serve_thunks: List[def(Int, Request) raises thin -> Response]
     """Monomorphised serve thunks; ``_struct_serve_thunks[i]`` is
     the thunk for ``_struct_addrs[i]``."""
     var _struct_destroy_thunks: List[def(Int) thin -> None]
     """Monomorphised destroy thunks; ``_struct_destroy_thunks[i]``
-    is the thunk for ``_struct_addrs[i]``. Called from ``__del__``."""
+    is the thunk for ``_struct_addrs[i]``. Called by the LAST
+    Router copy's destructor (refcount transition to 0)."""
+    var _refcount_addr: Int
+    """Heap address of an ``Int`` cell holding the refcount
+    governing when the boxed-handler addresses get freed. ``0``
+    means "no struct handlers yet" -- the cell is allocated
+    lazily on first :meth:`_add_struct` call so plain
+    ``Router()`` stays allocation-free for the def-only common
+    case. :meth:`__copyinit__` bumps the cell;
+    :meth:`__del__` decrements and frees the boxed structs on
+    zero."""
 
     def __init__(out self):
         """Create an empty router (no routes)."""
@@ -274,21 +310,102 @@ struct Router(Handler):
             def(Int, Request) raises thin -> Response
         ]()
         self._struct_destroy_thunks = List[def(Int) thin -> None]()
+        self._refcount_addr = 0
+
+    def copy(self) -> Self:
+        """Return a deep clone that shares the boxed handlers via
+        the refcount cell. Multi-worker
+        :meth:`HttpServer.serve[H: Handler & Copyable]` calls this
+        once per worker; the original drops on the supervisor
+        thread and the last worker drop runs the destroy thunks.
+
+        Built explicitly rather than relying on the trait-default
+        ``copy``: Mojo's auto-generated ``copy`` for ``Copyable``
+        structs does a memberwise copy that bypasses
+        ``__copyinit__`` (the refcount bump never runs and the
+        last drop hits a double free). Routing every clone
+        through this method keeps the refcount honest;
+        ``__copyinit__`` mirrors the same logic for paths that
+        trigger an implicit copy.
+        """
+        var out = Router()
+        out._routes = self._routes.copy()
+        out._handlers = self._handlers.copy()
+        out._struct_addrs = self._struct_addrs.copy()
+        out._struct_serve_thunks = self._struct_serve_thunks.copy()
+        out._struct_destroy_thunks = self._struct_destroy_thunks.copy()
+        out._refcount_addr = self._refcount_addr
+        if out._refcount_addr != 0:
+            var p = UnsafePointer[UInt8, MutExternalOrigin](
+                unsafe_from_address=out._refcount_addr
+            ).bitcast[Int]()
+            p[] = p[] + 1
+        return out^
+
+    def __copyinit__(out self, existing: Self):
+        """Mirror :meth:`copy`: deep-clone the value-typed lists and
+        bump the refcount.
+
+        Used by the multi-worker
+        :meth:`HttpServer.serve[H: Handler & Copyable]` overload:
+        each worker gets its own ``Router`` copy that points at
+        the same boxed Handler structs. When all workers + the
+        original drop, the last destructor runs the destroy
+        thunks once.
+
+        ``_routes`` and ``_handlers`` are deep-copied via Mojo's
+        normal value semantics; ``_struct_addrs`` and the thunk
+        lists are cheap clones too (Ints + function pointers).
+        Registration is expected to happen on the *original*
+        before any copy -- new routes registered on a copy after
+        the fact would only land on that copy. The same convention
+        every multi-worker framework uses.
+        """
+        self._routes = existing._routes.copy()
+        self._handlers = existing._handlers.copy()
+        self._struct_addrs = existing._struct_addrs.copy()
+        self._struct_serve_thunks = existing._struct_serve_thunks.copy()
+        self._struct_destroy_thunks = existing._struct_destroy_thunks.copy()
+        self._refcount_addr = existing._refcount_addr
+        if self._refcount_addr != 0:
+            var p = UnsafePointer[UInt8, MutExternalOrigin](
+                unsafe_from_address=self._refcount_addr
+            ).bitcast[Int]()
+            p[] = p[] + 1
 
     def __del__(deinit self):
-        """Free every boxed ``H: Handler`` the Router owns.
+        """Decrement the refcount; when it hits 0, run every
+        destroy thunk and free the cell.
 
         Each ``_struct_addrs[i]`` was heap-allocated by
         ``_add_struct[H]`` and is freed here via the matching
-        ``_struct_destroy_thunks[i]`` (which runs ``H``'s destructor
-        and then ``free``). Indices that already saw a destroy
-        (e.g. via a Router move) carry a zero ``addr`` so the
-        thunk short-circuits.
+        ``_struct_destroy_thunks[i]`` (which runs ``H``'s
+        destructor and then ``Pool[H].free``). Workers / Router
+        copies that drop without zeroing the refcount leave the
+        boxed structs in place for surviving copies.
         """
+        if self._refcount_addr == 0:
+            return
+        var p = UnsafePointer[UInt8, MutExternalOrigin](
+            unsafe_from_address=self._refcount_addr
+        ).bitcast[Int]()
+        p[] = p[] - 1
+        if p[] > 0:
+            return
         for i in range(len(self._struct_addrs)):
             var addr = self._struct_addrs[i]
             if addr != 0:
                 self._struct_destroy_thunks[i](addr)
+        p.free()
+
+    def _ensure_refcount(mut self) raises:
+        """Allocate the refcount cell on first struct-handler
+        registration. No-op if the cell already exists."""
+        if self._refcount_addr != 0:
+            return
+        var p = alloc[Int](1)
+        p[] = 1
+        self._refcount_addr = Int(p)
 
     # ── Registration per method (def-function overloads) ────────────────────
 
@@ -435,7 +552,7 @@ struct Router(Handler):
         """
         var segs = _compile_segments(path)
         var addr = Pool[H].alloc_move(handler^)
-
+        self._ensure_refcount()
         self._struct_addrs.append(addr)
         self._struct_serve_thunks.append(_struct_serve_thunk[H])
         self._struct_destroy_thunks.append(_struct_destroy_thunk[H])
