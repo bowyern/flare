@@ -146,7 +146,7 @@ for reasons independent of flare; see
 
 ### Tail latencies under sustained load (dev-box smoke)
 
-The wrk2 two-phase harness produces full p50 / p99 / p99.9 /
+The wrk2 calibrated-peak harness produces full p50 / p99 / p99.9 /
 p99.99 columns at 90 %-of-peak sustained load. Numbers below
 are smoke-quality — taken on the maintainer's AWS Ubuntu 22.04
 dev box (6 vCPU, glibc 2.35) at commit
@@ -218,7 +218,7 @@ worker scaling no matter what the server does.
 | Server | Workers | Req/s (median) | stdev% | p50 | p99 | vs flare 1w |
 |---|---:|---:|---:|---:|---:|---:|
 | flare (single-threaded) | 1 | 56,086 | 0.32 | 1.21 ms | 2.70 ms | 1.00x |
-| **flare_mc (shared listener)** | **4** | **170,305** | **0.17** | **1.13 ms** | **2.38 ms** | **3.04x** |
+| **flare_mc (per-worker SO_REUSEPORT, default)** | **4** | **170,305** | **0.17** | **1.13 ms** | **2.38 ms** | **3.04x** |
 
 `flare_mc` scales to **3.04x of flare 1w** on 4 workers — slightly
 super-linear once the single-worker reactor's serialization /
@@ -239,7 +239,7 @@ sustainable-peak (p99 ≤ 50 ms gate, then 90 % of peak across 5x
 | actix_web (tokio, `workers=4`) | 4 | 264,691 | 0.17 | 1.19 | 2.80 | **11.44** | **21.61** | true |
 | hyper (tokio multi-thread) | 4 | 221,349 | 0.17 | 1.24 | 2.82 | 3.28 | 3.67 | true |
 | axum (tokio multi-thread) | 4 | 201,042 | 0.21 | 1.29 | 2.82 | 3.27 | 3.65 | true |
-| **flare_mc (shared listener)** | **4** | **170,305** | **0.17** | **1.13** | **2.38** | **2.73** | **3.11** | true |
+| **flare_mc (per-worker SO_REUSEPORT, default)** | **4** | **170,305** | **0.17** | **1.13** | **2.38** | **2.73** | **3.11** | true |
 | nginx (`worker_processes 1`) | 1 | 63,764 | 0.39 | 1.06 | 2.29 | 2.70 | 3.03 | true |
 | **flare (reactor)** | **1** | **56,086** | **0.32** | **1.21** | **2.70** | **3.16** | **3.54** | true |
 | Go `net/http` (`GOMAXPROCS=1`) | 1 | 35,940 | 0.21 | 1.12 | 2.92 | 4.29 | 5.47 | true |
@@ -247,10 +247,12 @@ sustainable-peak (p99 ≤ 50 ms gate, then 90 % of peak across 5x
 Worker discipline:
 
 - `flare_mc`, `hyper`, `axum`, `actix_web` all run **4 OS worker
-  threads**. flare_mc shares one listener across all four workers
-  via `EPOLLEXCLUSIVE`; hyper / axum share a listener via tokio's
-  multi-thread runtime; actix_web ships its own per-worker
-  `SO_REUSEPORT` listeners by default.
+  threads**. flare_mc and actix_web both default to per-worker
+  `SO_REUSEPORT` listeners; hyper / axum share a listener via
+  tokio's multi-thread runtime. `flare_mc` can be flipped to the
+  shared-listener / `EPOLLEXCLUSIVE` shape via
+  `FLARE_REUSEPORT_WORKERS=0` -- see the
+  [Listener-mode A/B](#listener-mode-ab-flare-only) section.
 - `flare`, `nginx`, `go_nethttp` all run **1 OS worker thread**.
   nginx via `worker_processes 1`, Go via `runtime.GOMAXPROCS(1)`,
   flare via the default single-reactor `serve(handler)` path.
@@ -263,12 +265,15 @@ Reading order:
 1. **flare_mc tail latency is the best of the four 4-worker
    frameworks.** p99 = 2.38 ms vs hyper 2.82 / axum 2.82 /
    actix_web 2.80; p99.99 = 3.11 ms vs hyper 3.67 / axum 3.65 /
-   actix_web 21.61. actix_web's p99.99 spike is the
-   per-worker `SO_REUSEPORT` listener distribution variance
-   wrk2's coordinated-omission correction picks up. flare_mc's
-   `EPOLLEXCLUSIVE` shared listener gives the same fair-accept
-   shape tokio's multi-thread runtime gets, with a tighter
-   tail.
+   actix_web 21.61. This `flare_mc` row was measured in the
+   shared-listener / `EPOLLEXCLUSIVE` mode
+   (`FLARE_REUSEPORT_WORKERS=0`), which trades 7-22 % req/s for
+   the tightest p99.99 σ -- see the
+   [Listener-mode A/B](#listener-mode-ab-flare-only) section
+   for both shapes against the same workload. actix_web's
+   p99.99 spike is the per-worker `SO_REUSEPORT` listener-
+   distribution variance wrk2's coordinated-omission correction
+   picks up.
 2. **Throughput: flare_mc lands at 64 % of the throughput
    leader** (170 K vs actix_web 265 K), 77 % of hyper 221 K, 85 %
    of axum 201 K. The remaining gap is per-request handler /
@@ -310,30 +315,34 @@ connections while the other three sit idle; wrk2's
 coordinated-omission correction surfaces that as p99.99
 amplification.
 
-flare_mc, hyper, and axum all share **a single listener** across
-the four workers:
+hyper and axum share **a single listener** across the four
+workers via tokio's multi-thread runtime; the `flare_mc` row
+in the table above was measured in flare's shared-listener
+shape:
 
-- **flare_mc** uses `EPOLLEXCLUSIVE` (Linux ≥ 4.5) so the kernel
-  wakes exactly one worker per accept event — whichever worker
-  is currently parked in `epoll_wait`. Idle workers absorb
-  spikes; busy workers aren't burdened with extra accepts.
+- **flare_mc** (`FLARE_REUSEPORT_WORKERS=0`) uses
+  `EPOLLEXCLUSIVE` (Linux ≥ 4.5) so the kernel wakes exactly
+  one worker per accept event — whichever worker is currently
+  parked in `epoll_wait`. Idle workers absorb spikes; busy
+  workers aren't burdened with extra accepts.
 - **hyper** + **axum** use tokio's multi-thread runtime which
   shares one accept future across worker tasks.
 
 The shared-listener shape is what gives flare_mc / hyper / axum
 their tight (3.11 / 3.67 / 3.65 ms) p99.99. actix_web's 21.61 ms
 is the reuseport-distribution cost; switching actix_web to a
-shared listener (it's a config knob) would close the gap.
+shared listener (it's a config knob) would close the gap. flare's
+own default (per-worker `SO_REUSEPORT`) sits between the two
+shapes -- see the next section for the head-to-head numbers.
 
 ### Same-host head-to-head (dev-box, current code)
 
 The cross-framework table above is the historical CPU-pinned
-reference run on the v0.6.0 release-tagged baselines (raw run
-data not tracked in the repo; reproduce locally via the harness
-below). The numbers in the README headline come from a fresh
-**same-host head-to-head**
-on the dev-box (also EPYC 7R32, separate AWS instance, no
-CPU pinning) against the current code. Each row is measured
+reference run (raw run data not tracked in the repo; reproduce
+locally via the harness below). The numbers in the README
+headline come from a fresh **same-host head-to-head** on the
+dev-box (also EPYC 7R32, separate AWS instance, no CPU
+pinning) against the current code. Each row is measured
 at its **peak-sustainable rate** -- the harness's calibrated-
 peak finder picks the highest `R=` that holds `p99 ≤ 50 ms`,
 runs five 30s rounds at 90% of that, reports the median.
@@ -359,12 +368,12 @@ these numbers. A small σ (sub-ms on p99.9 / p99.99) means all
 large σ (tens or hundreds of ms) means at least one of the 5
 runs brushed against the saturation cliff and the headline
 rate is sitting at the limit, not comfortably inside it. The
-v0.6.1 harness pass (probe duration 20 s, cliff-fanout gate
-on p99.9 / p99.99, transient-blip retry, absolute-p99 growth
-gate, post-search 0.92× validation back-off) catches the
-cliff at calibration time; what remains in the σ column
-across these 4-worker rows is whatever residual variance
-each framework has at its calibrated rate.
+harness's calibration pass (probe duration 20 s, cliff-fanout
+gate on p99.9 / p99.99, transient-blip retry, absolute-p99
+growth gate, post-search 0.92× validation back-off) catches
+the cliff at calibration time; what remains in the σ column
+across these 4-worker rows is whatever residual variance each
+framework has at its calibrated rate.
 
 | Server | Workers | Req/s | σ%  | p50 (ms) | p99 (ms) | p99.9 (ms) | p99.99 (ms) |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -376,8 +385,8 @@ each framework has at its calibrated rate.
 
 Source data:
 [`benchmark/results/2026-05-11T1846-ehsan-dev-944de73/`](../benchmark/results/2026-05-11T1846-ehsan-dev-944de73/)
-(all 4-worker rows, single multi-worker run with the v0.6.1
-calibration harness).
+(all 4-worker rows, single multi-worker run with the calibration
+harness).
 
 What jumps out:
 
@@ -441,9 +450,9 @@ median is still 1.37 ms tighter than nginx's, but one of
 the 5 runs took a deeper outlier. vs Go `net/http` at the
 same worker count: 1.78× the throughput, with both
 showing tight tails -- Go has historically had wide tails
-under GC pauses, and the v0.6.1 harness's longer probe
-duration (20 s) gives the runtime enough headroom that the
-GC pauses are now amortised across the measurement window.
+under GC pauses, and the harness's longer probe duration
+(20 s) gives the runtime enough headroom that the GC pauses
+are now amortised across the measurement window.
 Source data:
 [`benchmark/results/2026-05-11T1821-ehsan-dev-944de73/`](../benchmark/results/2026-05-11T1821-ehsan-dev-944de73/).
 
@@ -583,9 +592,7 @@ live under [`benchmark/baselines/`](../benchmark/baselines), pinned
 via `Cargo.lock` (Rust frameworks), conda-forge `nginx 1.25` and
 `go 1.24`. Raw run data (env, integrity gate, per-target JSON, raw
 wrk2 stdout) lands under `benchmark/results/<timestamp>-<host>-<commit>/`
-when you reproduce locally; results aren't tracked in the repo
-(except for the v0.6 archived numbers under
-[`benchmark/results/v0.6/`](../benchmark/results/v0.6)).
+when you reproduce locally; results aren't tracked in the repo.
 
 Reproduce on a Linux box with ≥ 8 physical cores:
 
@@ -896,14 +903,14 @@ Measurement rules:
   ad-hoc use; **wrk2** is built from a pinned commit by
   `bench-install-wrk2` (the harness drives wrk2 explicitly via
   `build/wrk2/wrk2`, not whatever `wrk` is on PATH).
-- **Two-phase wrk2:** each (target, config) tuple runs one
-  `warmup_seconds` find-peak phase at `-R 10000000` (saturates
-  any flare-grade server), then five `wrk_duration_seconds`
-  measurement rounds at `-R = peak * sustain_rps_pct%` (default
-  90 %). The headline req/s is the peak from phase 1; the
-  latency distribution is the median of the middle three runs
-  from phase 2. The run **fails the stability gate** if stdev
-  on phase-2 req/s exceeds 3 %.
+- **Calibrated-peak wrk2** (see
+  [Workload + harness shape](#workload--harness-shape) above for
+  the full four-phase description): a 5 s settle, an overdrive
+  probe, a five-step binary search for the highest fixed rate
+  that holds `p99 ≤ 50 ms` AND `achieved ≥ 90 % of requested`,
+  then five 30 s measurement rounds at 90 % of that calibrated
+  peak. Stability gate fires at 3 % stdev on req/s across the
+  measurement rounds.
 - **Load generator:** wrk2 with `--latency` for the headline
   bench (CO-corrected tail percentiles up to p99.999). The
   conda-forge `wrk` package is still on PATH for ad-hoc use.
@@ -977,16 +984,16 @@ and within noise at the L2/L3-resident sizes.
 ```bash
 # Throughput + tail percentiles (the single-worker headline numbers above)
 pixi run --environment bench bench-install-wrk2        # one-time build (pinned wrk2 commit)
-pixi run --environment bench bench-vs-baseline-quick   # flare vs Go on throughput, ~7 min
-pixi run --environment bench bench-vs-baseline         # + nginx + latency_floor, ~20 min
+pixi run --environment bench bench-vs-baseline-quick   # flare vs go_nethttp on throughput, fastest path
+pixi run --environment bench bench-vs-baseline         # full sweep: all baselines x configs the script defaults to
 
-# Mixed-keepalive (80% keep-alive, 20% close)
+# Mixed-keepalive (80% keep-alive, 20% close) — flare vs go_nethttp on the mixed_keepalive config
 pixi run --environment bench bench-mixed-keepalive
 
 # Ad-hoc tail percentile probe (no integrity check, no 5-run gate)
 pixi run --environment bench bench-tail-quick          # wrk2 --latency at fixed rate
 
-# TLS bench setup (self-signed cert under build/)
+# TLS bench setup (self-signed cert under build/tls-bench-certs/)
 pixi run --environment bench bench-tls-setup
 ```
 
@@ -994,9 +1001,9 @@ The TLS bench configs `tls_plaintext.yaml` (steady-state TLS
 throughput, connections kept open) and `tls_handshake.yaml`
 (handshake-per-request, `Connection: close`) are wired into the
 harness and drive a TLS-terminating flare server on
-`127.0.0.1:8443`. The reactor-state-machine TLS handshake that
-ties these configs into the cancel-aware reactor loop is a
-follow-up; the blocking `handshake_fd(fd)` path the configs use
-today is in place.
+`127.0.0.1:8443`. These configs use the blocking
+`handshake_fd(fd)` path; a non-blocking reactor-state-machine TLS
+handshake that ties them into the cancel-aware reactor loop is
+gated on a Mojo improvement.
 
 Results land under `benchmark/results/<timestamp>-<host>-<commit>/`.

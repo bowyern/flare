@@ -40,14 +40,14 @@ basics.
 
 | File | What it shows |
 |---|---|
-| [`extractors.mojo`](../examples/intermediate/extractors.mojo) | Typed extractors: `Path[T, name]`, `Query`, `Header`, `Json`, and reflective `Extracted[H]` auto-injection |
+| [`extractors.mojo`](../examples/intermediate/extractors.mojo) | Typed extractors: `Path[T, name]`, `Query`, `Header`, `Json[T]`, and reflective `Extracted[H]` auto-injection |
 | [`state.mojo`](../examples/intermediate/state.mojo) | `App[Counters]` + typed `State[T]` injected into a middleware handler |
-| [`middleware.mojo`](../examples/intermediate/middleware.mojo) | Middleware composition: `Logger` wraps `RequireAuth` wraps `Router` |
+| [`middleware.mojo`](../examples/intermediate/middleware.mojo) | Middleware composition (outside-in): `RequestID` → `Logger` → `Timing` → `Recover` → `RequireAuth` → `Router` |
 | [`middleware_stack.mojo`](../examples/intermediate/middleware_stack.mojo) | `Logger` + `RequestId` + `Compress` + `CatchPanic` chain |
 | [`multicore.mojo`](../examples/intermediate/multicore.mojo) | `HttpServer.serve(..., num_workers=default_worker_count())` |
 | [`static_response.mojo`](../examples/intermediate/static_response.mojo) | Pre-encoded `StaticResponse` + `HttpServer.serve_static` fast path |
 | [`cancel.mojo`](../examples/intermediate/cancel.mojo) | `CancelHandler` polling `cancel.cancelled()` between expensive steps |
-| [`drain.mojo`](../examples/intermediate/drain.mojo) | `HttpServer.drain(timeout_ms)` + `install_drain_on_sigterm` |
+| [`drain.mojo`](../examples/intermediate/drain.mojo) | `HttpServer.drain(timeout_ms)` per-worker (caller wires SIGTERM today) |
 | [`sse.mojo`](../examples/intermediate/sse.mojo) | Streaming response body via `ChunkSource` (Server-Sent Events shape) |
 | [`request_cookies.mojo`](../examples/intermediate/request_cookies.mojo) | Reading inbound `Cookie:` headers + the `Cookies` extractor |
 | [`forms.mojo`](../examples/intermediate/forms.mojo) | `application/x-www-form-urlencoded` parsing + the `Form` extractor |

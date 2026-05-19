@@ -89,7 +89,9 @@ pixi run tests-tsan             # ~10-20x slower; for multi-worker review
 ```
 
 Per-test binaries land under `target/sanitize/`
-(`.gitignore`d). CI runs all three on every PR.
+(`.gitignore`d). Run the relevant sanitizer locally before
+shipping changes that touch FFI boundaries, lifecycle
+management, or multi-worker paths.
 
 ### Investigating a sanitizer failure
 

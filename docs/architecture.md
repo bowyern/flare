@@ -1,7 +1,8 @@
 # Architecture
 
-flare is a layered library. Each module imports only from the layers
-below it. No circular dependencies, no global state, no hidden runtime.
+flare is a layered library. Higher layers depend on lower layers (peer
+modules at the same layer don't import each other). No global state, no
+hidden runtime.
 
 ```
 flare.io       BufReader (Readable trait, generic buffered reader)
@@ -52,7 +53,7 @@ flare.net      IpAddr, SocketAddr, RawSocket
 flare.runtime  Reactor (kqueue/epoll + EPOLLEXCLUSIVE), TimerWheel,
                Scheduler, HandoffQueue + WorkerHandoffPool,
                num_cpus / default_worker_count, pthread + pinning,
-               install_drain_on_sigterm
+               block_in_pool (per-call pthread escape hatch)
 flare.testing  fork-and-serve helpers (`fork_server` /
                `kill_forked_server`) for cookbook examples and
                integration tests that need a real bound port
@@ -140,10 +141,18 @@ sequenceDiagram
     conn->>kernel: close: unregister, close fd
 ```
 
-The Cancel cell is a single byte (`0` = live, `1..3` = reason) that
-the reactor flips before the handler's next `cancel.cancelled()` poll.
-We do not preempt — Mojo can't, and synchronous preemption would
-defeat the per-thread invariant. Cooperation is the contract.
+Caveat: in the default `HttpServer.serve(handler)` shape the handler runs
+synchronously between the parser and the response serializer, so the
+notes above describe `CancelHandler` callers (and `block_in_pool` work)
+where the flip is observable mid-flight. A plain `Handler` that runs
+quickly will see the cell only between requests.
+
+The Cancel cell is a heap-allocated machine word (`0` = live; `PEER_FIN /
+TIMEOUT / SHUTDOWN` otherwise — see `CancelReason` in
+[`flare/http/cancel.mojo`](../flare/http/cancel.mojo)). The reactor flips
+it before the next `cancel.cancelled()` poll. We do not preempt — Mojo
+can't, and synchronous preemption would defeat the per-thread invariant.
+Cooperation is the contract.
 
 ---
 
@@ -183,7 +192,8 @@ affinity to userspace, so pinning is a no-op there. The upper
 bound on `num_workers` is 256, enforced by `Scheduler.start`.
 
 `Scheduler.shutdown` and `Scheduler.drain(timeout_ms)` coordinate
-across workers. Drain returns one `ShutdownReport` per worker.
+across workers. Drain returns one `ShutdownReport` per worker. SIGTERM
+wiring is left to the caller.
 
 ---
 
@@ -256,9 +266,9 @@ there is no parity table any more -- one type, one shape:
 |---|---|
 | HTTP server (HTTP/1.1 + HTTP/2 via auto-dispatch) | [`flare.http.HttpServer`](../flare/http/server.mojo) |
 | HTTP client (HTTP/1.1 + HTTP/2 via TLS+ALPN or `prefer_h2c=True`) | [`flare.http.HttpClient`](../flare/http/client.mojo) |
-| WebSocket server (HTTP/1.1 Upgrade today; RFC 8441 over h2 wired on the byte driver, tunnel adapter is a follow-up) | [`flare.ws.WsServer`](../flare/ws/server.mojo) |
+| WebSocket server (HTTP/1.1 Upgrade; RFC 8441 over h2 wired on the byte driver) | [`flare.ws.WsServer`](../flare/ws/server.mojo) |
 | WebSocket server (multi-worker via SO_REUSEPORT) | `flare.ws.WsServer.serve(handler, num_workers=N)` |
-| WebSocket client (`ws://` / `wss://` -- HTTP/1.1 Upgrade today; ALPN advertises `http/1.1` on wss:// to lock in the existing path) | [`flare.ws.WsClient`](../flare/ws/client.mojo) |
+| WebSocket client (`ws://` / `wss://` — HTTP/1.1 Upgrade; ALPN advertises `http/1.1` on `wss://` to lock in the Upgrade path) | [`flare.ws.WsClient`](../flare/ws/client.mojo) |
 | Low-level HTTP/2 byte driver (server) | [`flare.http2.H2Connection`](../flare/http2/server.mojo) |
 | Low-level HTTP/2 byte driver (client) | [`flare.http2.Http2ClientConnection`](../flare/http2/client.mojo) |
 
@@ -274,9 +284,10 @@ truth for `idle_timeout_ms`, `write_timeout_ms`,
 `read_body_timeout_ms`, `handler_timeout_ms`, and
 `request_timeout_ms`.
 
-Resolution: 1 ms tick, 1024 slots, fixed memory. Deadlines below
-1 ms round up. This is well below the noise floor of any HTTP
-deadline a real service cares about.
+Resolution: 1 ms tick, 512 slots, fixed memory; deadlines longer than
+the wheel use an overflow list. Deadlines below 1 ms round up. This is
+well below the noise floor of any HTTP deadline a real service cares
+about.
 
 ---
 
@@ -287,10 +298,9 @@ the reactor thread:
 
 - **TLS handshake.** Client handshake is inline on
   `TlsStream.connect`. The server-side `TlsAcceptor` exposes a
-  blocking `handshake_fd(fd)` today; the non-blocking
-  reactor-state-machine variant (advanced via the same
-  `on_readable` / `on_writable` calls as HTTP) is a follow-up
-  gated on a Mojo nightly improvement.
+  blocking `handshake_fd(fd)`; a non-blocking reactor-state-machine
+  variant (advanced via the same `on_readable` / `on_writable` calls
+  as HTTP) is gated on a Mojo improvement.
 - **DNS resolution.** `getaddrinfo` is a blocking call; the
   client uses it pre-connect. The reactor never blocks on it.
 - **Long-running handler work.** The contract is synchronous: a
@@ -315,8 +325,8 @@ the reactor thread:
 | HTTP per-conn state machine | [`flare/http/_server_reactor_impl.mojo`](../flare/http/_server_reactor_impl.mojo) |
 | `Cancel` cell + `CancelHandler` | [`flare/http/cancel.mojo`](../flare/http/cancel.mojo) |
 | Server-side TLS | [`flare/tls/acceptor.mojo`](../flare/tls/acceptor.mojo) |
-| Streaming response bodies | [`flare/http/streaming.mojo`](../flare/http/streaming.mojo) |
-| SIGTERM helper | [`flare/runtime/_signal.mojo`](../flare/runtime/_signal.mojo) |
+| Streaming response bodies | [`flare/http/streaming_response.mojo`](../flare/http/streaming_response.mojo) |
+| `block_in_pool` escape hatch | [`flare/runtime/blocking.mojo`](../flare/runtime/blocking.mojo) |
 
 If you want a one-page tour of each, the layered docstrings on the
 public types (`HttpServer`, `Router`, `Handler`, `App`) are the place

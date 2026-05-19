@@ -26,10 +26,15 @@ Three practical implications you need to design around:
 3. **Use `block_in_pool` for genuinely-blocking C calls.** When
    you have to call a synchronous C library (an old database
    driver, a compute-heavy native function), wrap the call in
-   `flare.runtime.block_in_pool(...)` so it runs on a separate
-   pthread pool. The reactor worker stays unblocked, ready to
-   service the next event. The function returns the result back
-   to the original handler frame on the originating worker.
+   `flare.runtime.block_in_pool(...)` so it runs on a fresh
+   kernel thread (per-call `pthread_create`). The handler frame
+   that called `block_in_pool` still blocks until the work
+   returns — the synchronous signature requires it — but the
+   *other* reactor workers stay free, and a crash inside `work()`
+   only kills its own pthread instead of the reactor's. The
+   submitter polls `cancel` and joins via `pthread_join`. See
+   [`flare/runtime/blocking.mojo`](../flare/runtime/blocking.mojo)
+   for the full cancel + crash-isolation contract.
 
 If you're coming from axum/tokio, fastapi, asyncio, or any other
 async-first framework, the mental shift is: "one in-flight request
@@ -53,18 +58,19 @@ cross-thread primitives (`Cancel`, `HandoffQueue`, `block_in_pool`'s
 heap-handoff) that are explicitly designed for cross-thread use.
 
 The rest of this doc is about the third bucket — the cross-thread
-primitives — and about the closure / `def`-binding rules in Mojo
-`1.0.0b1.dev2026042717` you need to know to use them safely.
+primitives — and about the closure / `def`-binding rules in the
+pinned Mojo release (see [`pixi.toml`](../pixi.toml) for the exact
+version) you need to know to use them safely.
 
 ## The Mojo closure-binding rules flare relies on
 
-The pinned Mojo nightly distinguishes three function-type annotations:
+The pinned Mojo release distinguishes three function-type annotations:
 
 | Annotation | Meaning | What flare uses it for |
 |---|---|---|
 | `thin` | No captures. Function-pointer-shaped. Materialises as a runtime value. | Every public `def(Request) raises thin -> Response` in [`flare/http/handler.mojo`](../flare/http/handler.mojo) — `FnHandler`, `FnHandlerCT[F]`. The work argument to [`block_in_pool`](../flare/runtime/blocking.mojo) (`work: def() raises thin -> T`). The pthread `start_routine` thunk shape in [`flare/runtime/_thread.mojo`](../flare/runtime/_thread.mojo). |
-| `capturing` | Captures local state. **Cannot be materialised as a runtime value on the pinned nightly** (the compiler emits `"TODO: capturing closures cannot be materialized as runtime values"` if you try). Usable only as a comptime parameter (`[F: def(...) capturing -> ...]`), and even then a method body that calls `F(...)` is silently promoted to `capturing`, which can't satisfy a `Handler` trait method declared without that annotation. | Not used by the public surface. Tracked as a re-probe item once the nightly lifts the materialisation restriction. |
-| `unified` | Universal closure type (per [Mojo Closures 2026 forum thread](https://forum.modular.com/t/mojo-closures-2026/3013)). The keyword is accepted in function-type position (`def(Int) raises unified -> Int`), but the conversion machinery is incomplete — `def f(...) raises unified -> Int:` on a declaration site fails with `"use of unknown declaration 'unified'"`. | Not used today; same re-probe item. |
+| `capturing` | Captures local state. **Cannot be materialised as a runtime value on the pinned release** (the compiler emits `"TODO: capturing closures cannot be materialized as runtime values"` if you try). Usable only as a comptime parameter (`[F: def(...) capturing -> ...]`), and even then a method body that calls `F(...)` is silently promoted to `capturing`, which can't satisfy a `Handler` trait method declared without that annotation. | Not used by the public surface. |
+| `unified` | Universal closure type (per [Mojo Closures 2026 forum thread](https://forum.modular.com/t/mojo-closures-2026/3013)). The keyword is accepted in function-type position (`def(Int) raises unified -> Int`), but the conversion machinery is incomplete — `def f(...) raises unified -> Int:` on a declaration site fails with `"use of unknown declaration 'unified'"`. | Not used by the public surface. |
 
 The practical consequence: **every callable flare's public API
 accepts is a `thin` closure or a `Handler`-trait struct.** Inline
@@ -81,8 +87,11 @@ thread proposes signature-level capture annotations
 ## Owned-by-one-thread is the default
 
 Connections are owned by one reactor worker for their entire
-lifetime. There is no work-stealing today. The per-connection state
-machine in [`flare/http/_server_reactor_impl.mojo`](../flare/http/_server_reactor_impl.mojo)
+lifetime. There is no implicit work-stealing on the hot path;
+opt-in cross-worker handoff is available via `WorkerHandoffPool`
+behind `FLARE_SOAK_WORKERS=on` for skewed-keepalive workloads
+(see [`examples/advanced/work_stealing.mojo`](../examples/advanced/work_stealing.mojo)).
+The per-connection state machine in [`flare/http/_server_reactor_impl.mojo`](../flare/http/_server_reactor_impl.mojo)
 mutates without locks because nothing else can reach it. The same
 applies to `Pool[T]` instances and the per-worker scheduler state in
 [`flare/runtime/scheduler.mojo`](../flare/runtime/scheduler.mojo).
@@ -111,7 +120,7 @@ The cross-thread surfaces are an explicit, narrow list:
 
 ## The Send-discipline obligation (pthread-bound work)
 
-Mojo `1.0.0b1.dev2026042717` has no compiler-checked notion of state
+The pinned Mojo release has no compiler-checked notion of state
 that is safe to share across threads (no `Send` / `Sync` traits).
 The same point is called out in the
 [Mojo Closures 2026](https://forum.modular.com/t/mojo-closures-2026/3013)
@@ -143,8 +152,8 @@ What is NOT safe to share, even though Mojo doesn't refuse to compile
 it:
 
 - A `String` / `List[T]` / `Dict[K, V]` value captured by a thin
-  closure — the v0.6 stdlib's reference-count for these types is
-  not multi-thread safe. Pass an `UnsafePointer` and own the
+  closure — the stdlib's reference-count for these types is not
+  multi-thread safe. Pass an `UnsafePointer` and own the
   lifetime explicitly, or convert to `Span[UInt8]` over a
   comptime-stable buffer.
 - A `Pool[T]` instance — pools are explicitly per-worker.
@@ -163,24 +172,10 @@ careful about what *it* captures — and since it is `thin`, the
 language gives you nothing to capture by reference in the first
 place.
 
-## Why this matters: the audit pattern
-
-flare's release discipline is to **probe every "Mojo blocked"
-classification before accepting it, and to write a postmortem in the
-commit body when the probe demonstrates a previous classification
-was wrong**. This pattern caught:
-
-- `block_in_pool` was originally mis-classified as Mojo-blocked
-  (it wasn't — pthread per-call works).
-- macOS `OwnedDLHandle` was framed as a Mojo runtime flake (it
-  wasn't — function-local handle was being reclaimed by ASAP-
-  destruction before its returned function pointer was invoked).
-
-The same audit ran in the other direction for capturing closures:
-the design speculated that capturing closures had landed; the
-probe falsified the claim. The result is the closure-shape
-contract documented above and pinned by
-[`tests/runtime/test_closure_send_contract.mojo`](../tests/runtime/test_closure_send_contract.mojo).
+The closure-shape contract above is pinned by
+[`tests/runtime/test_closure_send_contract.mojo`](../tests/runtime/test_closure_send_contract.mojo)
+so a future Mojo release that lifts the materialisation restriction
+trips the test instead of silently changing behaviour.
 
 ## Recommended patterns today
 

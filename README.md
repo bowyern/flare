@@ -11,12 +11,12 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
 </p>
 
-**Full networking stack for Mojo** 🔥 HTTP/1.1 and HTTP/2 server and client, WebSocket, TLS, TCP, UDP, DNS, all in one library on top of one reactor. Drop to raw sockets when HTTP isn't the right shape.
+**Full networking stack for Mojo** 🔥 HTTP/1.1 and HTTP/2 server and client, WebSocket, TLS, TCP, UDP, Unix sockets, DNS, all in one library on top of one non-blocking reactor. Drop to raw sockets when HTTP isn't the right shape.
 
 ```mojo
-from flare import HttpServer, Router, Request, Response, ok, SocketAddr
+from flare.prelude import *
 
-def hello(req: Request) raises -> Response:
+def hello(req: Request) -> Response:
     return ok("hello")
 
 def main() raises:
@@ -28,12 +28,11 @@ def main() raises:
 
 ## Why flare
 
-- **Batteries included.** HTTP/1.1 + HTTP/2, WebSocket (RFC 6455), TLS 1.2/1.3 with ALPN, signed cookies, sessions, multipart, gzip + brotli, CORS, static files, SSE, mTLS, and the PROXY protocol all live in `flare/`. Full inventory in [`docs/features.md`](docs/features.md).
-- **HTTP/2 and h2c without the dance.** `HttpServer.serve(handler)` peeks every accepted connection for the RFC 9113 preface and dispatches h2c without an `Upgrade` negotiation; over TLS it's plain ALPN. The same `Router`, middleware, and extractors run on both wires.
-- **Composable by types, not callbacks.** `Handler` is a trait. `Router`, `App[S]`, middleware, and typed extractors (`PathInt`, `QueryInt`, `Form[T]`, `Json[T]`, `Cookies`) compose by nesting structs. The compiler monomorphises the handler chain into one direct call sequence per request type — no virtual dispatch through the chain.
-- **Hard to misuse under load.** Per-request `Cancel` tokens, graceful drain, sanitized 4xx/5xx, TLS cert reload, structured logging, Prometheus metrics.
-- **Fast, with a tight tail.** Thread-per-core reactor (`kqueue` / `epoll`, opt-in `io_uring`). On a 4-worker plaintext bench, flare's handler path posts the cleanest tail of the pack at p99.9 / p99.99 across 5 runs. [Numbers below.](#performance)
-- **Fuzzed.** 24 fuzz harnesses, 5.4M+ runs, zero known crashes. ASan and assert-mode coverage on every FFI boundary.
+- **Batteries included:** HTTP/1.1 + HTTP/2, WebSocket (RFC 6455), TLS 1.2/1.3 with ALPN, signed cookies, sessions, multipart, gzip + brotli, CORS, static files, SSE, mTLS, and the PROXY protocol all live in `flare/`. Full inventory in [`docs/features.md`](docs/features.md).
+- **Composable by types, not callbacks:** `Handler` is a trait. `Router`, `App[S]`, middleware, and typed extractors (`PathInt`, `QueryInt`, `Form[T]`, `Json[T]`, `Cookies`) compose by nesting structs. The compiler monomorphises the handler chain into one direct call sequence per request type — no virtual dispatch through the chain.
+- **Hard to misuse under load:** Per-request `Cancel` tokens, graceful drain, sanitized 4xx/5xx, TLS cert reload, structured logging, Prometheus metrics.
+- **Fast, with a tight tail:** Thread-per-core reactor (`kqueue` / `epoll`, opt-in `io_uring`). On a 4-worker plaintext bench, flare's handler path posts the cleanest tail of the pack at p99.9 / p99.99 across 5 runs. [Numbers below.](#performance)
+- **Fuzzed:** 34 fuzz harnesses, 8M+ runs, zero known crashes. ASan and assert-mode coverage on every FFI boundary.
 
 ## Install
 
@@ -61,11 +60,11 @@ flare = { git = "https://github.com/ehsanmok/flare.git", branch = "main" }
 
 ## Quick start
 
-The tour below elaborates on the snippet at the top of this README, one persona at a time. Each level adds roughly one concept; everything compiles, and the runnable equivalents live under [`examples/`](examples/) (every one is part of `pixi run tests`). [`docs/cookbook.md`](docs/cookbook.md) maps "I want to..." to the right example, and the rendered package docstring is at <https://ehsanmok.github.io/flare/>.
+The tour below walks the snippet at the top of this README from beginner to advanced. Each level adds roughly one concept; everything compiles, and the runnable equivalents live under [`examples/`](examples/) (every one is part of `pixi run tests`). [`docs/cookbook.md`](docs/cookbook.md) maps "I want to..." to the right example, and the rendered package docstring is at <https://ehsanmok.github.io/flare/>.
 
 ### Beginner: your first router
 
-Three routes — two infallible, one that may fail — a path parameter, a JSON response. This is where most apps start: `def` handlers, a `Router`, `HttpServer.bind`, `num_workers`. No traits, no generics, no extractors yet.
+Three routes (two infallible, one that may fail), a path parameter, and a JSON response. Plain `def` handlers, a `Router`, `HttpServer.bind`, `num_workers`. No traits, no generics, no extractors yet.
 
 ```mojo
 from flare.prelude import *  # Request, Response, Router, HttpServer, ok, ok_json, SocketAddr, ...
@@ -89,15 +88,15 @@ def main() raises:
     srv.serve(r^)
 ```
 
-The single-worker `srv.serve(r^)` shape works with any `Handler`. For multi-worker mode (`num_workers=N`) the handler must be `Copyable` because each worker gets its own `H.copy()`. `Router` is `Copyable` — its routes are held behind an Arc-style refcount so each worker copy shares the same boxed handlers without re-allocating. Bare-function handlers (`srv.serve(my_fn, num_workers=4)`) and `ComptimeRouter[ROUTES]` work the same way.
+The single-worker `srv.serve(r^)` shape works with any `Handler`. For multi-worker mode (`num_workers=N`) the handler must be `Copyable` because each worker gets its own `H.copy()`. `Router` is `Copyable` because its routes are held behind an Arc-style refcount, so each worker copy shares the same boxed handlers without re-allocating. Bare-function handlers (`srv.serve(my_fn, num_workers=4)`) and `ComptimeRouter[ROUTES]` work the same way.
 
-`flare.prelude` re-exports the everyday handler surface — `Request`, `Response`, `Router`, `HttpServer`, `ok` / `ok_json` / `ok_json_value` / `not_found` / `bad_request` / `internal_error` / `redirect`, `Method` / `Status`, the `Handler` family, `SocketAddr`. Anything outside that set (typed extractors, middleware, sessions, cookies, forms, comptime routing, HTTP/2 internals, lower-level transports) stays as an explicit `from flare.http import ...` so the import block continues to document what each module reaches for. For the very first hello-world up at the top of this README we kept the explicit import to show which names are in play; everywhere else the prelude is enough.
+`flare.prelude` re-exports the everyday handler surface: `Request`, `Response`, `Router`, `HttpServer`, `ok` / `ok_json` / `ok_json_value` / `not_found` / `bad_request` / `internal_error` / `redirect`, `Method` / `Status`, the `Handler` family, and `SocketAddr`. Anything outside that set (typed extractors, middleware, sessions, cookies, forms, comptime routing, HTTP/2 internals, lower-level transports) stays as an explicit `from flare.http import ...` so the import block continues to document what each module reaches for. Everywhere in this Quick start uses the prelude; the Intermediate example below is the exception because it reaches for `Extracted` and `PathInt`, which sit outside the prelude. Spelling out the imports there keeps it obvious which names are in play.
 
-`raises` is optional and tracks the body. If the handler genuinely cannot fail (`home`, `health` above) drop the annotation; if it parses input or talks to a DB (`greet`'s `req.param` raises when `:name` is missing) keep it and let the server's catch-converts-to-500 contract take over. Mojo's function-type subtyping accepts both shapes at the same `Router.get(...)` call site. For *stateful* infallible handlers (the body still cannot fail but needs to carry struct fields) see [`HandlerInfallible`](examples/intermediate/infallible_handler.mojo).
+`raises` is optional and tracks the body. If the handler cannot fail (`home`, `health` above) drop the annotation; if it parses input or talks to a DB (`greet`'s `req.param` raises when `:name` is missing) keep it and let the server's catch-converts-to-500 contract take over. Mojo's function-type subtyping accepts both shapes at the same `Router.get(...)` call site. For *stateful* infallible handlers (the body still cannot fail but needs to carry struct fields) see [`HandlerInfallible`](examples/intermediate/infallible_handler.mojo).
 
-What you get for free: 404 on unknown paths, 405 with `Allow` on wrong method, sanitized 4xx / 5xx bodies, peer-FIN cancellation, RFC 7230 size limits, the per-worker reactor with `kqueue` / `epoll`.
+What you get for free: 404 on unknown paths, 405 with `Allow` on wrong method, sanitized 4xx / 5xx bodies, peer-FIN cancellation, RFC 7230 size limits, the per-worker reactor with `kqueue` / `epoll` (opt-in `io_uring`).
 
-For request bodies, query strings, cookies, sessions, multipart forms, gzip / brotli, TLS, HTTP/2, and WebSocket: all under [`examples/`](examples/) (`basic/http_get`, `basic/cookies`, `intermediate/forms`, `intermediate/multipart_upload`, `intermediate/sessions`, `intermediate/brotli`, `basic/tls`, `advanced/http2`, `basic/websocket_echo`).
+For request bodies, query strings, cookies, sessions, multipart forms, gzip / brotli, TLS, HTTP/2, and WebSocket, see [`examples/`](examples/) (one per topic, indexed in [`docs/cookbook.md`](docs/cookbook.md)).
 
 ### Intermediate: typed extractors
 
@@ -130,13 +129,13 @@ def main() raises:
     HttpServer.bind(SocketAddr.localhost(8080)).serve(r^, num_workers=4)
 ```
 
-Middleware is the same shape: a `Handler` that wraps another `Handler`. The stock layers (`Logger`, `RequestId`, `Compress`, `CatchPanic`, `Cors`, `FileServer`) all compose by nesting structs, no callback chain. `examples/intermediate/middleware.mojo` walks through the production-shaped pipeline (`RequestID → Logger → Timing → Recover → RequireAuth → Router`).
+Middleware is the same shape: a `Handler` that wraps another `Handler`. The stock middleware (`Logger`, `RequestId`, `Compress`, `CatchPanic`, `Cors`) and stock leaf handlers (`FileServer`) all compose by nesting structs, no callback chain. `examples/intermediate/middleware.mojo` walks through a typical production stack (`RequestID → Logger → Timing → Recover → RequireAuth → Router`).
 
 ### Advanced: compile-time dispatch, shared state, cancel awareness
 
-Three patterns the production server leans on. Each is independent; pick the one your workload needs.
+Three independent patterns. Pick the ones your workload needs.
 
-**Cancel-aware handlers.** `CancelHandler.serve(req, cancel)` gets a token the reactor flips on peer FIN, deadline elapse, or graceful drain. Long-running handlers poll between expensive steps and return early; plain `Handler`s ignore the token and run to completion. The reactor still tears down the connection if the peer goes away; the token just lets your handler do partial work cleanly.
+**Cancel-aware handlers:** `CancelHandler.serve(req, cancel)` gets a token the reactor flips on peer FIN, deadline elapse, or graceful drain. Long-running handlers poll between expensive steps and return early; plain `Handler`s ignore the token and run to completion. The reactor still tears down the connection if the peer goes away; the token just lets your handler do partial work cleanly.
 
 ```mojo
 from flare.http import CancelHandler, Cancel, Request, Response, ok
@@ -151,7 +150,7 @@ struct SlowHandler(CancelHandler, Copyable, Movable):
         return ok("done")
 ```
 
-**Compile-time route tables.** When the route table is known at build time, `ComptimeRouter[ROUTES]` parses the path patterns at compile time and unrolls the dispatch loop per route. No runtime trie walk, no per-request handler-table indirection. Same path-param + wildcard syntax as the runtime `Router`, same 404 / 405-with-`Allow` semantics; the only difference is *when* the dispatch is decided.
+**Compile-time route tables:** When the route table is known at build time, `ComptimeRouter[ROUTES]` parses the path patterns at compile time and unrolls the dispatch loop per route. No runtime trie walk, no per-request handler-table indirection. Same path-param + wildcard syntax as the runtime `Router`, same 404 / 405-with-`Allow` semantics; the only difference is *when* the dispatch is decided.
 
 ```mojo
 from flare.http import (
@@ -180,7 +179,7 @@ def main() raises:
     HttpServer.bind(SocketAddr.localhost(8080)).serve(r^, num_workers=4)
 ```
 
-**App state + middleware composition.** `App[S]` carries shared state alongside an inner handler; `state_view()` hands out a borrow that middleware can read or mutate. The compiler monomorphises the whole nested chain into one direct call sequence per request type, with no virtual dispatch and no per-request allocation.
+**App state + middleware composition:** `App[S]` carries shared state alongside an inner handler; `state_view()` hands out a borrow that middleware can read or mutate. The compiler monomorphises the whole nested chain into one direct call sequence per request type, with no virtual dispatch and no per-request allocation.
 
 ```mojo
 from flare.http import App, Router, Request, Response, Handler, State, ok, HttpServer
@@ -302,7 +301,7 @@ Each layer imports only from layers below it. No circular dependencies. The full
 
 ## Security
 
-Per-layer security posture and the sanitised-error-response policy live in [`docs/security.md`](docs/security.md). Highlights: RFC 7230 token validation, configurable size limits, sanitised 4xx/5xx bodies, TLS 1.2+ only, WebSocket frame masking + UTF-8 validation, 24 fuzz harnesses with 5.4M+ runs and zero known crashes.
+Per-layer security posture and the sanitised-error-response policy live in [`docs/security.md`](docs/security.md). Highlights: RFC 7230 token validation, configurable size limits, sanitised 4xx/5xx bodies, TLS 1.2+ only, WebSocket frame masking + UTF-8 validation, 34 fuzz harnesses with 8M+ runs and zero known crashes.
 
 For security issues, please open a private security advisory on GitHub or email the maintainer directly.
 
@@ -330,7 +329,7 @@ Common tasks (run with `pixi run [--environment <env>] <task>`):
 | `tests` | `default` | Full unit + integration suite plus every example under [`examples/`](examples/) |
 | `format-check` / `format` | `default` / `dev` | `mojo format` over `flare`, `tests`, `benchmark`, `examples`, `fuzz` |
 | `docs` / `docs-build` | `dev` | mojodoc-rendered package docstring (live or static) |
-| `fuzz-all` | `fuzz` | Every harness in [`fuzz/`](fuzz/) (24 harnesses, 5.4M+ runs combined) |
+| `fuzz-all` | `fuzz` | Every harness in [`fuzz/`](fuzz/) (34 harnesses, 8M+ runs combined) |
 | `fuzz-<name>` / `prop-<name>` | `fuzz` | Single harness — see [`pixi.toml`](pixi.toml) for the full list |
 | `bench-vs-baseline-quick` | `bench` | flare vs Go `net/http`, throughput config (~7 min) |
 | `bench-vs-baseline` | `bench` | flare vs all baselines (Go, nginx, hyper, axum, actix_web), all configs |
@@ -341,7 +340,7 @@ Common tasks (run with `pixi run [--environment <env>] <task>`):
 
 ```bash
 pixi run tests                                          # full suite + every example under examples/
-pixi run --environment fuzz fuzz-all                    # 24 harnesses
+pixi run --environment fuzz fuzz-all                    # 34 harnesses
 pixi run --environment bench bench-vs-baseline-quick    # ~7 min
 ```
 

@@ -12,7 +12,7 @@ directory carry the detail.
 | [`build.md`](build.md) | Build modes (`-D ASSERT=none/safe/all/warn`), the sanitizer harness (`tests-asan` / `tests-tsan` / `tests-asserts-all`), production-build guidance, and contributor pattern for `debug_assert` on new FFI wrappers. |
 | [`security.md`](security.md) | Per-layer security posture (including `flare.http2`'s `SETTINGS_ENABLE_PUSH=0`, RFC 9113 §9.1.1 same-origin enforcement, and ALPN refusal-to-downgrade), the sanitised-error-response policy, fuzz / soak budget. |
 | [`concurrency.md`](concurrency.md) | The Mojo closure-binding rules flare relies on, the cross-thread primitive surface (`Cancel`, `HandoffQueue`, `block_in_pool`), and the owned-by-one-thread invariant. |
-| [`cookbook.md`](cookbook.md) | Index of `examples/NN_*.mojo` mapped to use cases. |
+| [`cookbook.md`](cookbook.md) | Index of files under `examples/{basic,intermediate,advanced}/` mapped to use cases. |
 
 The public Mojo API is stable within a minor: patch releases never
 break source for the same minor. Breaking changes only land at minor
