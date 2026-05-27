@@ -740,9 +740,7 @@ def _render_nodes(
 # ── Inheritance helpers ───────────────────────────────────────────
 
 
-def _detect_extends(
-    src: String, mut pos: Int
-) raises TemplateError -> String:
+def _detect_extends(src: String, mut pos: Int) raises TemplateError -> String:
     """Look for a leading ``{% extends "<name>" %}`` tag. If
     found, advance ``pos`` past it and return the parent
     template name (the bare token without quotes). If absent,

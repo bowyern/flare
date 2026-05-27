@@ -121,9 +121,7 @@ def main() raises:
         "constructed: CatchPanic -> StructuredLogger -> RequestId -> AppHandler"
     )
     print("routes: GET /healthz, GET /users")
-    print(
-        "timeouts: read_body=30s handler=30s request=60s (see ServerConfig)"
-    )
+    print("timeouts: read_body=30s handler=30s request=60s (see ServerConfig)")
     print()
     print("Wire up to bind+serve in your real deployment;")
     print("see docs/operations.md for the SIGTERM contract.")

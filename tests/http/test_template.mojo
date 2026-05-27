@@ -383,10 +383,7 @@ def test_child_overrides_parent_block_via_render_extending() raises:
         )
     )
     var child = Template.compile(
-        String(
-            '{% extends "base" %}'
-            "{% block title %}Custom{% endblock %}"
-        )
+        String('{% extends "base" %}{% block title %}Custom{% endblock %}')
     )
     var ctx = TemplateContext()
     assert_equal(
@@ -400,10 +397,7 @@ def test_render_without_extending_returns_block_defaults_only() raises:
     block defaults; the parent's surrounding markup is not
     consulted (the renderer never sees the parent)."""
     var child = Template.compile(
-        String(
-            '{% extends "base" %}'
-            "{% block title %}Custom{% endblock %}"
-        )
+        String('{% extends "base" %}{% block title %}Custom{% endblock %}')
     )
     var ctx = TemplateContext()
     # The child's own ``nodes`` contains the literal ``{% block title %}``

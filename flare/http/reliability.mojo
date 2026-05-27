@@ -91,7 +91,9 @@ struct Retry[Inner: Handler & Copyable & Defaultable](
         self.inner = Self.Inner()
         self.policy = RetryPolicy()
 
-    def __init__(out self, var inner: Self.Inner, var policy: RetryPolicy = RetryPolicy()):
+    def __init__(
+        out self, var inner: Self.Inner, var policy: RetryPolicy = RetryPolicy()
+    ):
         self.inner = inner^
         self.policy = policy^
 

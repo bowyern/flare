@@ -361,9 +361,9 @@ def _do_pmd_compressor_new(
 ) raises -> Int:
     """Allocate a persistent deflate z_stream via FFI. Returns the
     opaque handle (an ``intptr_t``-encoded ``z_stream*``)."""
-    var fn_new = lib.get_function[
-        def(c_int, c_int) thin abi("C") -> Int
-    ]("flare_pmd_compressor_new")
+    var fn_new = lib.get_function[def(c_int, c_int) thin abi("C") -> Int](
+        "flare_pmd_compressor_new"
+    )
     return fn_new(level, window_bits)
 
 
@@ -386,9 +386,9 @@ def _do_pmd_compressor_free(
     read lib: OwnedDLHandle, handle: Int
 ) raises -> None:
     """Release a persistent deflate context."""
-    var fn_free = lib.get_function[
-        def(Int) thin abi("C") -> None
-    ]("flare_pmd_compressor_free")
+    var fn_free = lib.get_function[def(Int) thin abi("C") -> None](
+        "flare_pmd_compressor_free"
+    )
     fn_free(handle)
 
 
@@ -396,9 +396,9 @@ def _do_pmd_decompressor_new(
     read lib: OwnedDLHandle, window_bits: c_int
 ) raises -> Int:
     """Allocate a persistent inflate z_stream via FFI."""
-    var fn_new = lib.get_function[
-        def(c_int) thin abi("C") -> Int
-    ]("flare_pmd_decompressor_new")
+    var fn_new = lib.get_function[def(c_int) thin abi("C") -> Int](
+        "flare_pmd_decompressor_new"
+    )
     return fn_new(window_bits)
 
 
@@ -419,9 +419,9 @@ def _do_pmd_decompress_chunk(
 def _do_pmd_decompressor_free(
     read lib: OwnedDLHandle, handle: Int
 ) raises -> None:
-    var fn_free = lib.get_function[
-        def(Int) thin abi("C") -> None
-    ]("flare_pmd_decompressor_free")
+    var fn_free = lib.get_function[def(Int) thin abi("C") -> None](
+        "flare_pmd_decompressor_free"
+    )
     fn_free(handle)
 
 
@@ -494,9 +494,7 @@ struct PermessageDeflateContext(Movable):
                 error code, or the heap allocation fails.
         """
         var lib = OwnedDLHandle(_find_flare_zlib_lib())
-        var c = _do_pmd_compressor_new(
-            lib, c_int(level), c_int(window_bits)
-        )
+        var c = _do_pmd_compressor_new(lib, c_int(level), c_int(window_bits))
         if c == 0:
             raise Error(
                 "permessage-deflate: flare_pmd_compressor_new"
@@ -508,8 +506,8 @@ struct PermessageDeflateContext(Movable):
         # as an init failure.
         if c < 0:
             raise Error(
-                "permessage-deflate: deflateInit2 returned zlib"
-                " error " + String(c)
+                "permessage-deflate: deflateInit2 returned zlib error "
+                + String(c)
             )
         var d = _do_pmd_decompressor_new(lib, c_int(window_bits))
         if d == 0:
@@ -521,8 +519,8 @@ struct PermessageDeflateContext(Movable):
         if d < 0:
             _do_pmd_compressor_free(lib, c)
             raise Error(
-                "permessage-deflate: inflateInit2 returned zlib"
-                " error " + String(d)
+                "permessage-deflate: inflateInit2 returned zlib error "
+                + String(d)
             )
         self._comp_handle = c
         self._decomp_handle = d
@@ -555,9 +553,7 @@ struct PermessageDeflateContext(Movable):
         except:
             pass
 
-    def compress(
-        mut self, data: Span[UInt8, _]
-    ) raises -> List[UInt8]:
+    def compress(mut self, data: Span[UInt8, _]) raises -> List[UInt8]:
         """Compress one message fragment with context-takeover.
 
         The LZ77 dictionary built up by prior calls is preserved,
@@ -575,8 +571,7 @@ struct PermessageDeflateContext(Movable):
             Error: If zlib returns a negative error code.
         """
         if self._comp_handle == 0:
-            raise Error("permessage-deflate: compress on a"
-                        " released context")
+            raise Error("permessage-deflate: compress on a released context")
         if len(data) == 0:
             # RFC 7692 §7.2.3.6: empty payload encodes to a single
             # 0x00 byte. Don't touch zlib; emit directly so the
@@ -603,8 +598,8 @@ struct PermessageDeflateContext(Movable):
             )
             if Int(written) < 0:
                 raise Error(
-                    "permessage-deflate: deflate chunk returned"
-                    " zlib error " + String(written)
+                    "permessage-deflate: deflate chunk returned zlib error "
+                    + String(written)
                 )
             if Int(written) < cap:
                 # Fits; strip the sync marker (RFC 7692 §7.2.1).
@@ -632,9 +627,7 @@ struct PermessageDeflateContext(Movable):
             # above is correct; the loop is defensive.
             cap *= 2
 
-    def decompress(
-        mut self, data: Span[UInt8, _]
-    ) raises -> List[UInt8]:
+    def decompress(mut self, data: Span[UInt8, _]) raises -> List[UInt8]:
         """Decompress one message fragment with context-takeover.
 
         Re-appends the ``0x00 0x00 0xff 0xff`` sync marker the
@@ -655,8 +648,7 @@ struct PermessageDeflateContext(Movable):
                 non-recoverable error.
         """
         if self._decomp_handle == 0:
-            raise Error("permessage-deflate: decompress on a"
-                        " released context")
+            raise Error("permessage-deflate: decompress on a released context")
         if len(data) == 0:
             raise Error(
                 "permessage-deflate: empty payload (RFC 7692"
@@ -688,8 +680,8 @@ struct PermessageDeflateContext(Movable):
             )
             if Int(written) < 0:
                 raise Error(
-                    "permessage-deflate: inflate chunk returned"
-                    " zlib error " + String(written)
+                    "permessage-deflate: inflate chunk returned zlib error "
+                    + String(written)
                 )
             if Int(written) < cap:
                 out.resize(Int(written), 0)

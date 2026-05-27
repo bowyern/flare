@@ -94,10 +94,7 @@ def target_three_message_chain(data: List[UInt8]) raises:
             return
         for i in range(len(data)):
             if back[i] != data[i]:
-                print(
-                    "[BUG] pmd-chain byte mismatch at index "
-                    + String(i)
-                )
+                print("[BUG] pmd-chain byte mismatch at index " + String(i))
                 return
 
 

@@ -53,4 +53,7 @@ def main() raises:
     print("rendered:")
     print(html)
     print()
-    print("note: header used parent default; title + content used child overrides.")
+    print(
+        "note: header used parent default; title + content used child"
+        " overrides."
+    )

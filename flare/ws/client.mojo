@@ -603,16 +603,14 @@ struct WsClient(Movable):
                 " for the full RFC 8441 Extended CONNECT path."
                 " The TLS handshake selected h2 because the server"
                 " advertised it -- pin TlsConfig.alpn to"
-                " [\"http/1.1\"] to force the H1 fallback."
+                ' ["http/1.1"] to force the H1 fallback.'
             )
         # H1 (or empty / non-h2 ALPN): perform the existing
         # Upgrade handshake on the already-connected TLS stream.
         return WsClient._handshake_h1_over_tls(tls^, u)
 
     @staticmethod
-    def _handshake_h1_over_tls(
-        var tls: TlsStream, u: Url
-    ) raises -> WsClient:
+    def _handshake_h1_over_tls(var tls: TlsStream, u: Url) raises -> WsClient:
         """Perform the HTTP/1.1 Upgrade handshake on an already-
         established TLS stream and return a live :class:`WsClient`.
 
@@ -668,9 +666,7 @@ struct WsClient(Movable):
                 )
                 var hv = String(
                     String(
-                        String(
-                            unsafe_from_utf8=line.as_bytes()[colon + 1 :]
-                        )
+                        String(unsafe_from_utf8=line.as_bytes()[colon + 1 :])
                     ).strip()
                 )
                 if hk == "sec-websocket-accept":

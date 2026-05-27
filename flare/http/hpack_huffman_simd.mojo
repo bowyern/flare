@@ -165,8 +165,7 @@ def huffman_decode_simd(
                 if nbits < clen2:
                     break
                 var code = Int(
-                    (bits >> UInt64(nbits - clen2))
-                    & UInt64((1 << clen2) - 1)
+                    (bits >> UInt64(nbits - clen2)) & UInt64((1 << clen2) - 1)
                 )
                 var sym = _build_decode_lookup(code, clen2)
                 if sym >= 0:
@@ -175,9 +174,7 @@ def huffman_decode_simd(
                     output.append(UInt8(sym))
                     nbits -= clen2
                     if nbits > 0:
-                        bits = bits & (
-                            (UInt64(1) << UInt64(nbits)) - UInt64(1)
-                        )
+                        bits = bits & ((UInt64(1) << UInt64(nbits)) - UInt64(1))
                     else:
                         bits = UInt64(0)
                     matched = True
@@ -199,8 +196,7 @@ def huffman_decode_simd(
             if nbits < clen:
                 break
             var code = Int(
-                (bits >> UInt64(nbits - clen))
-                & UInt64((1 << clen) - 1)
+                (bits >> UInt64(nbits - clen)) & UInt64((1 << clen) - 1)
             )
             var sym = _build_decode_lookup(code, clen)
             if sym >= 0:
@@ -209,9 +205,7 @@ def huffman_decode_simd(
                 output.append(UInt8(sym))
                 nbits -= clen
                 if nbits > 0:
-                    bits = bits & (
-                        (UInt64(1) << UInt64(nbits)) - UInt64(1)
-                    )
+                    bits = bits & ((UInt64(1) << UInt64(nbits)) - UInt64(1))
                 else:
                     bits = UInt64(0)
                 matched = True
