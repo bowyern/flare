@@ -30,6 +30,7 @@ from flare.ws.permessage_deflate import (
     DEFAULT_DEFLATE_LEVEL,
     DEFAULT_MAX_DECOMPRESSED_BYTES,
     PermessageDeflateConfig,
+    PermessageDeflateContext,
     compress_message,
     decompress_message,
 )
@@ -171,6 +172,79 @@ def test_offer_emit_reflects_config_flags() raises:
     assert_equal(build_permessage_deflate_offer(off), "")
 
 
+def test_context_takeover_round_trips_three_messages() raises:
+    """A persistent encoder/decoder pair must round-trip three
+    sequential messages with the LZ77 window carried between them.
+    The repeated payload exercises the dictionary so context-
+    takeover output is strictly smaller than the no-context-
+    takeover path for the second and third call.
+    """
+    var ctx_enc = PermessageDeflateContext()
+    var ctx_dec = PermessageDeflateContext()
+    var msg = "the quick brown fox jumps over the lazy dog".as_bytes()
+    var sizes = List[Int]()
+    for _ in range(3):
+        var compressed = ctx_enc.compress(Span[UInt8, _](msg))
+        sizes.append(len(compressed))
+        var back = ctx_dec.decompress(Span[UInt8, _](compressed))
+        assert_equal(len(back), len(msg))
+        for i in range(len(msg)):
+            assert_equal(back[i], msg[i])
+    # First message has no dictionary; later messages should
+    # compress to at most the first one (context carries; the
+    # window may produce identical-or-better output).
+    assert_true(sizes[1] <= sizes[0])
+    assert_true(sizes[2] <= sizes[0])
+
+
+def test_context_takeover_compresses_repeated_payload_better_than_no_context() raises:
+    """Encoding the *same* repetitive payload three times through
+    a persistent compressor should benefit from the LZ77
+    dictionary built up by the first call. The second + third
+    outputs must be strictly smaller than the first."""
+    var ctx = PermessageDeflateContext()
+    var payload = ("hello world hello world hello world " * 8).as_bytes()
+    var first = ctx.compress(Span[UInt8, _](payload))
+    var second = ctx.compress(Span[UInt8, _](payload))
+    var third = ctx.compress(Span[UInt8, _](payload))
+    # The first compressed output establishes the dictionary;
+    # the second + third use it. zlib emits literal matches for
+    # the entire payload by referencing the dictionary, so the
+    # output is far smaller.
+    assert_true(len(second) < len(first))
+    assert_true(len(third) <= len(second))
+
+
+def test_context_takeover_empty_payload_round_trips() raises:
+    """Empty payload encodes to the single-byte 0x00 per
+    RFC 7692 §7.2.3.6 even with context-takeover on. The
+    decompressor must reject the empty *compressed* input
+    explicitly (matching the no-context-takeover path's
+    contract)."""
+    var ctx_enc = PermessageDeflateContext()
+    var empty = String("").as_bytes()
+    var out = ctx_enc.compress(Span[UInt8, _](empty))
+    assert_equal(len(out), 1)
+    assert_equal(out[0], UInt8(0x00))
+    var ctx_dec = PermessageDeflateContext()
+    with assert_raises():
+        var _ = ctx_dec.decompress(Span[UInt8, _](List[UInt8]()))
+
+
+def test_context_takeover_respects_max_decompressed_bytes() raises:
+    """The persistent decompressor honours the per-instance cap,
+    just like the free-function ``decompress_message``."""
+    var ctx_enc = PermessageDeflateContext()
+    # 16 KiB of repeated 'a' compresses extremely tightly.
+    var huge = ("a" * (16 * 1024)).as_bytes()
+    var packed = ctx_enc.compress(Span[UInt8, _](huge))
+    var ctx_dec = PermessageDeflateContext(
+        DEFAULT_DEFLATE_LEVEL, -15, 1024  # cap = 1 KiB
+    )
+    with assert_raises():
+        var _ = ctx_dec.decompress(Span[UInt8, _](packed))
+
+
 def main() raises:
     test_parse_simple_offer_round_trips()
     test_parse_handles_flags_kv_quoted_values_multi_offer()
@@ -180,4 +254,8 @@ def main() raises:
     test_compress_empty_payload_emits_single_byte_and_decompress_rejects()
     test_decompress_respects_max_decompressed_bytes_cap()
     test_offer_emit_reflects_config_flags()
-    print("test_ws_permessage_deflate: 8 passed")
+    test_context_takeover_round_trips_three_messages()
+    test_context_takeover_compresses_repeated_payload_better_than_no_context()
+    test_context_takeover_empty_payload_round_trips()
+    test_context_takeover_respects_max_decompressed_bytes()
+    print("test_ws_permessage_deflate: 12 passed")

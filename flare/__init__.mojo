@@ -884,6 +884,7 @@ from .ws.frame import WsFrame, WsOpcode, WsCloseCode, WsProtocolError
 from .ws.client_h2 import WsOverH2Stream, bootstrap_ws_over_h2
 from .ws.permessage_deflate import (
     PermessageDeflateConfig,
+    PermessageDeflateContext,
     compress_message,
     decompress_message,
 )

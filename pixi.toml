@@ -169,6 +169,7 @@ bench-soak-extended       = "bash benchmark/scripts/_run_soak_extended.sh"
 # mozz.mojopkg into $PREFIX/lib/mojo/ — no -I flag needed.
 # Run with: pixi run --environment fuzz <task>
 fuzz-ws            = "mojo -I . fuzz/fuzz_ws_frame.mojo"
+fuzz-pmd-context   = "mojo -I . fuzz/fuzz_permessage_deflate_context.mojo"  # v0.8 — persistent z_stream lifecycle
 fuzz-url           = "mojo -I . fuzz/fuzz_url.mojo"
 fuzz-headers       = "mojo -I . fuzz/fuzz_http_headers.mojo"
 fuzz-http-response = "mojo -I . fuzz/fuzz_http_response.mojo"

@@ -75,6 +75,7 @@ from .extensions import (
 )
 from .permessage_deflate import (
     PermessageDeflateConfig,
+    PermessageDeflateContext,
     compress_message,
     decompress_message,
 )
