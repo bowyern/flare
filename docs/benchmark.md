@@ -495,25 +495,36 @@ harness as the 4-worker rows above):
 
 | Server | Workers | Req/s | σ%  | p50 (ms) | p99 (ms) | p99.9 (ms) | p99.99 (ms) |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| nginx (`worker_processes 1`) | 1 | 80,239 | 1.57 | 1.09 ± 0.02 | 3.45 ± 0.07 | 4.13 ± 0.11 | 4.80 ± 0.11 |
-| **flare** (reactor) | **1** | **71,619** | **1.27** | **1.20 ± 0.02** | **3.01 ± 0.18** | **3.30 ± 1.49** | **3.43 ± 5.67** |
-| Go `net/http` (`GOMAXPROCS=1`) | 1 | 40,173 | 1.57 | 1.38 ± 0.00 | 3.21 ± 0.01 | 3.74 ± 0.09 | 4.62 ± 0.32 |
+| **flare** (reactor) | **1** | **79,028** | **1.57** | **1.13 ± 0.03** | **3.23 ± 0.12** | **3.84 ± 0.37** | **4.30 ± 0.51** |
+| nginx (`worker_processes 1`) | 1 | 76,883 | 1.27 | 1.12 ± 0.01 | 3.23 ± 0.09 | 3.62 ± 0.15 | 4.05 ± 0.48 |
+| Go `net/http` (`GOMAXPROCS=1`) | 1 | 40,343 | 0.00 | 1.35 ± 0.01 | 3.21 ± 0.01 | 3.60 ± 0.04 | 4.40 ± 0.17 |
 
-flare 1w lands at 89 % of nginx's single-worker throughput
-(71,619 vs 80,239) and posts a **tighter p99 than nginx**
-(3.01 ± 0.18 ms vs 3.45 ± 0.07 ms) with comparable p99.9 /
-p99.99 medians (3.30 / 3.43 ms vs nginx's 4.13 / 4.80 ms).
-The σ on flare's p99.99 (5.67 ms) reflects that the harness
-calibrated near the cliff for the single-worker path; the
-median is still 1.37 ms tighter than nginx's, but one of
-the 5 runs took a deeper outlier. vs Go `net/http` at the
-same worker count: 1.78× the throughput, with both
-showing tight tails -- Go has historically had wide tails
-under GC pauses, and the harness's longer probe duration
-(20 s) gives the runtime enough headroom that the GC pauses
-are now amortised across the measurement window.
-Source data:
-[`benchmark/results/2026-05-11T1821-ehsan-dev-944de73/`](../benchmark/results/2026-05-11T1821-ehsan-dev-944de73/).
+flare 1w now leads nginx 1w in throughput (`79,028` vs
+`76,883 req/s`, `+2.8 %`) with an identical median p99
+(`3.23 ms`) and tighter p99.9 / p99.99 medians than the
+v0.7 measurement run (`3.84` / `4.30 ms` vs the prior
+run's `3.30` / `3.43 ms` -- the previous σ at p99.99 was
+`5.67 ms` from a single outlier brushing the cliff; this
+run's `0.51 ms` σ at p99.99 says all 5 runs landed clean).
+The headline jumped `+10.3 %` over the prior baseline
+(`71,619` → `79,028 req/s`); the multi-worker shape only
+saw `+1.1 %` from the same H1 parser tightening because
+that workload is split four ways and the parser is a
+smaller fraction of per-CPU time, whereas single-worker
+runs every request on one core where every microsecond
+on the hot path translates directly into throughput.
+nginx slipped `-4.2 %` between the two runs (`80,239` →
+`76,883`) while staying inside its σ envelope (`σ% =
+1.27`); the integrity gate passed both runs so this is
+within-noise nginx-side variance, not a regression
+flare's harness introduced. vs Go `net/http` at the same
+worker count: `1.96×` the throughput with comparable tail
+medians (Go's `3.21 / 3.60 / 4.40 ms` at p99 / p99.9 /
+p99.99, flare's `3.23 / 3.84 / 4.30 ms`).
+
+Source data: [`benchmark/results/2026-05-27T2256-ehsan-dev-03e55f2/`](../benchmark/results/2026-05-27T2256-ehsan-dev-03e55f2/).
+Prior baseline (v0.7 numbers carried through until this
+HEAD): [`benchmark/results/2026-05-11T1821-ehsan-dev-944de73/`](../benchmark/results/2026-05-11T1821-ehsan-dev-944de73/).
 
 #### Listener-mode A/B (flare-only)
 

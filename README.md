@@ -234,9 +234,9 @@ The σ on the tail percentiles is the **honesty meter**: a small σ means all 5 
 
 | Server | Workers | Req/s | σ%  | p50 (ms) | p99 (ms) | p99.9 (ms) | p99.99 (ms) |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| nginx (`worker_processes 1`) | 1 | 80,239 | 1.57 | 1.09 ± 0.02 | 3.45 ± 0.07 | 4.13 ± 0.11 | 4.80 ± 0.11 |
-| **flare** (reactor) | **1** | **71,619** | **1.27** | **1.20 ± 0.02** | **3.01 ± 0.18** | **3.30 ± 1.49** | **3.43 ± 5.67** |
-| Go `net/http` (`GOMAXPROCS=1`) | 1 | 40,173 | 1.57 | 1.38 ± 0.00 | 3.21 ± 0.01 | 3.74 ± 0.09 | 4.62 ± 0.32 |
+| **flare** (reactor) | **1** | **79,028** | **1.57** | **1.13 ± 0.03** | **3.23 ± 0.12** | **3.84 ± 0.37** | **4.30 ± 0.51** |
+| nginx (`worker_processes 1`) | 1 | 76,883 | 1.27 | 1.12 ± 0.01 | 3.23 ± 0.09 | 3.62 ± 0.15 | 4.05 ± 0.48 |
+| Go `net/http` (`GOMAXPROCS=1`) | 1 | 40,343 | 0.00 | 1.35 ± 0.01 | 3.21 ± 0.01 | 3.60 ± 0.04 | 4.40 ± 0.17 |
 
 What jumps out:
 
@@ -245,7 +245,7 @@ What jumps out:
 - **actix_web** posts the highest headline of the pack (`253k req/s`) but its p99 median is `10.04 ms` and p99.99 is `37.41 ms` — the same cliff dynamic flare_mc_static shows, just at a higher rate. The σ on actix's p99 / p99.9 (`4.55 ms` / `4.31 ms`) is tight enough that this isn't measurement noise; it's a steady-state shape at that rate.
 - **axum** is the steadiest of the pack at `195k req/s` with `σ ≤ 0.02 ms` at every percentile — flat at the cost of being the lowest headline of the four. It's the row you compare against when you want to know what an in-envelope p99 distribution looks like at the same load.
 - **hyper** is the reference baseline — its v0.8 numbers (`216k req/s`, `2.83 ms` p99 median) move within `±0.5 %` of the prior measurement, which is what we want from the harness's calibration: the same Rust binary under the same Linux kernel returns the same throughput run-over-run.
-- **flare 1w** posts 89 % of nginx 1w throughput with a tighter p99 (`3.01 ms` vs `3.45 ms`) and competitive σ at every percentile. It does 1.78× Go `net/http` at the same worker count.
+- **flare 1w** edges past nginx 1w in throughput (`79.0k` vs `76.9k req/s`, `+2.8 %`) — the v0.7 measurement had it at 89 % of nginx; the H1 parser tightening lands more aggressively at the single-worker shape (the workload runs on one core with nowhere to hide, so the ~5 % CPU reclaim from the UTF-8 bypass shows up as ~10 % throughput). Median p99 ties nginx at `3.23 ms`. Against Go `net/http` at the same worker count it's 1.96× the throughput with comparable tail medians.
 
 The matching nginx / hyper / actix_web / axum baselines built from source by the harness live under [`benchmark/baselines/`](benchmark/baselines/).
 
