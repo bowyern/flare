@@ -768,6 +768,16 @@ from .http2 import (
     decode_integer as h2_decode_integer,
 )
 
+# flare.quic — sans-I/O QUIC v1 codec primitives (RFC 9000).
+# Codecs only: no reactor / TLS / congestion-controller wiring.
+from .quic import (
+    VARINT_MAX as QUIC_VARINT_MAX,
+    Varint as QuicVarint,
+    decode_varint as quic_decode_varint,
+    encode_varint as quic_encode_varint,
+    varint_encoded_length as quic_varint_encoded_length,
+)
+
 # flare.ws
 from .ws.client import WsClient, WsHandshakeError, WsMessage
 from .ws.server import WsServer
