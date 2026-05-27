@@ -912,6 +912,12 @@ from .runtime.io_uring import (
     is_io_uring_available,
 )
 
+# flare.testing — in-process testing helpers. The TestClient[H]
+# wrapper is the FastAPI-style fast tester (handler-level, no
+# socket); fork_server / kill_forked_server stay around for the
+# cookbook integration tests that need a real bound port.
+from .testing import TestClient, fork_server, kill_forked_server
+
 # flare.utils -- cross-cutting helpers (POSIX FFI thunks for now).
 # Not re-exported at the top level: bare names like ``fork`` /
 # ``exit`` / ``kill`` would collide with builtins and other
