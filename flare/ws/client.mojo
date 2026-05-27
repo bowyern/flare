@@ -520,6 +520,173 @@ struct WsClient(Movable):
         return WsClient._connect_impl(url, config)
 
     @staticmethod
+    def connect_prefer_h2(url: String, config: TlsConfig) raises -> WsClient:
+        """Connect with ALPN advertising both ``h2`` and ``http/1.1``.
+
+        Auto-dispatches based on the server's ALPN selection (RFC 7301):
+
+        - If the peer selects ``http/1.1`` (or leaves ALPN empty), the
+          handshake proceeds via HTTP/1.1 Upgrade exactly like
+          :meth:`connect` and returns a regular :class:`WsClient`.
+        - If the peer selects ``h2``, this factory raises a
+          :class:`WsHandshakeError`. The full WebSocket-over-HTTP/2
+          tunnel runtime (RFC 8441 Extended CONNECT, 200-response
+          wait, DATA-frame WS adapter) wires through
+          ``WsAutoClient.connect`` -- this method only ships the
+          ALPN-offer + dispatch skeleton.
+
+        ``ws://`` URLs ignore ALPN (no TLS layer) and proceed
+        through the plaintext H1 Upgrade path.
+
+        Args:
+            url: WebSocket URL (``ws://`` or ``wss://``).
+            config: TLS configuration. If ``config.alpn`` is empty,
+                this factory sets it to ``["h2", "http/1.1"]``; a
+                caller-provided non-empty list is honoured verbatim
+                so users can pin the order.
+
+        Returns:
+            A regular :class:`WsClient` when the H1 path is selected.
+
+        Raises:
+            NetworkError: If the TCP/TLS connection fails.
+            WsHandshakeError: If the server selects ``h2`` (use
+                ``WsAutoClient.connect`` for the full
+                H2-tunnel-runtime path) or the H1 Upgrade response
+                is invalid.
+        """
+        return WsClient._connect_impl_prefer_h2(url, config)
+
+    @staticmethod
+    def _connect_impl_prefer_h2(
+        url: String, config: TlsConfig
+    ) raises -> WsClient:
+        """ALPN-aware connector. Advertises ``["h2", "http/1.1"]``
+        (unless the caller already pinned ``config.alpn``), opens
+        the TLS stream, and dispatches off the negotiated protocol.
+
+        - ``http/1.1`` (or unset) -> proceed via the existing H1
+          Upgrade handshake. Returns a regular :class:`WsClient`.
+        - ``h2`` -> raise :class:`WsHandshakeError` with a message
+          pointing at the H2-tunnel-runtime path. The full RFC 8441
+          Extended-CONNECT loop lives in ``WsAutoClient.connect``
+          (next sub-commit).
+
+        ``ws://`` URLs do not negotiate ALPN, so this method falls
+        through to :meth:`_connect_impl` verbatim.
+        """
+        var http_url = _ws_url_to_http(url)
+        var u = Url.parse(http_url)
+        if not u.is_tls():
+            # Plaintext ws:// has no TLS layer; ALPN cannot
+            # negotiate anything, so use the existing H1 path
+            # unchanged. The user opted in to "prefer_h2" but the
+            # transport simply cannot honour it.
+            return WsClient._connect_impl(url, config)
+        var tls_cfg = config.copy()
+        if len(tls_cfg.alpn) == 0:
+            tls_cfg.alpn = List[String]()
+            tls_cfg.alpn.append("h2")
+            tls_cfg.alpn.append("http/1.1")
+        var tls = TlsStream.connect(u.host, u.port, tls_cfg^)
+        # Inspect the negotiated ALPN before sending anything on
+        # the connection. The empty string ("" returned by
+        # alpn_selected() when the peer did not negotiate) is
+        # treated as "fall back to H1" -- many HTTPS servers do
+        # not enable ALPN at all on the WS endpoint and still
+        # accept the Upgrade dance on the very same socket.
+        var selected = tls.alpn_selected()
+        if selected == "h2":
+            raise WsHandshakeError(
+                "WS-over-H2 tunnel runtime not yet wired through"
+                " WsClient.connect_prefer_h2; use WsAutoClient.connect"
+                " for the full RFC 8441 Extended CONNECT path."
+                " The TLS handshake selected h2 because the server"
+                " advertised it -- pin TlsConfig.alpn to"
+                " [\"http/1.1\"] to force the H1 fallback."
+            )
+        # H1 (or empty / non-h2 ALPN): perform the existing
+        # Upgrade handshake on the already-connected TLS stream.
+        return WsClient._handshake_h1_over_tls(tls^, u)
+
+    @staticmethod
+    def _handshake_h1_over_tls(
+        var tls: TlsStream, u: Url
+    ) raises -> WsClient:
+        """Perform the HTTP/1.1 Upgrade handshake on an already-
+        established TLS stream and return a live :class:`WsClient`.
+
+        Factored out so the ``connect_prefer_h2`` dispatcher can
+        run its ALPN check between :meth:`TlsStream.connect` and
+        the HTTP-request write without duplicating the parsing
+        body.
+        """
+        var key = _generate_ws_key()
+        var expected_accept = _compute_accept(key)
+        var host_header = u.host
+        if (u.scheme == "http" and u.port != 80) or (
+            u.scheme == "https" and u.port != 443
+        ):
+            host_header = host_header + ":" + String(Int(u.port))
+        var req = (
+            "GET "
+            + u.request_target()
+            + " HTTP/1.1\r\n"
+            + "Host: "
+            + host_header
+            + "\r\n"
+            + "Upgrade: websocket\r\n"
+            + "Connection: Upgrade\r\n"
+            + "Sec-WebSocket-Key: "
+            + key
+            + "\r\n"
+            + "Sec-WebSocket-Version: 13\r\n"
+            + "\r\n"
+        )
+        var req_bytes = req.as_bytes()
+        tls.write_all(Span[UInt8, _](req_bytes))
+        var scratch = List[UInt8](capacity=1)
+        scratch.append(UInt8(0))
+        var status_line = _read_line_tls(tls, scratch)
+        if not status_line.startswith("HTTP/1.1 101"):
+            raise WsHandshakeError(
+                "Expected 101 Switching Protocols, got: " + status_line
+            )
+        var accept_header = String("")
+        while True:
+            var line = _read_line_tls(tls, scratch)
+            if line.byte_length() == 0:
+                break
+            var colon = _str_find_local(line, ":")
+            if colon >= 0:
+                var hk = _lower_local(
+                    String(
+                        String(
+                            String(unsafe_from_utf8=line.as_bytes()[:colon])
+                        ).strip()
+                    )
+                )
+                var hv = String(
+                    String(
+                        String(
+                            unsafe_from_utf8=line.as_bytes()[colon + 1 :]
+                        )
+                    ).strip()
+                )
+                if hk == "sec-websocket-accept":
+                    accept_header = hv
+        if accept_header != expected_accept:
+            raise WsHandshakeError(
+                "Sec-WebSocket-Accept mismatch: got '"
+                + accept_header
+                + "', expected '"
+                + expected_accept
+                + "'"
+            )
+        var ws_stream = _WsStream(tls^)
+        return WsClient(ws_stream^, key)
+
+    @staticmethod
     def _connect_impl(url: String, config: TlsConfig) raises -> WsClient:
         """Internal implementation shared by both ``connect`` overloads.
 
