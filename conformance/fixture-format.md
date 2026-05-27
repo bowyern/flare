@@ -48,3 +48,34 @@ Each fixture is a JSON file. Naming convention:
 
 The runner loads every `*.json` in `conformance/h1/` automatically;
 new fixtures need no test-code change.
+
+## WebSocket schema (`conformance/ws/`)
+
+WebSocket fixtures live in `conformance/ws/` and follow the same
+`accept`/`reject` shape with WS-specific expected-* fields. The
+runner is `tests/conformance/test_conformance_ws.mojo`; new
+fixtures are picked up automatically.
+
+```
+{
+  "name":           String,     // Autobahn-style id, e.g. "1.1.1_*"
+  "spec":           String,     // RFC 6455 section anchor
+  "input_hex":      String,     // raw on-the-wire frame bytes
+  "expect":         "accept" | "reject",
+  "expect_reason":  String,
+  "expected_opcode":      Int,  // 0..0xF, accept only
+  "expected_fin":         Bool, // accept only
+  "expected_masked":      Bool, // accept only, optional
+  "expected_payload_hex": String, // accept only, optional
+  "expected_payload_len": Int,  // accept only, optional
+  "expected_close_code":  Int   // accept + opcode == 0x8 only
+}
+```
+
+The Autobahn case-number prefix (e.g. `1.1.1`, `5.4.1`, `7.7.1`)
+is preserved in the `name` field as an anchor back to the
+upstream test suite. The corpus is a hand-rolled subset, not a
+full Autobahn run; the categorisation mirrors the upstream
+section numbers (1.x framing, 2.x ping/pong, 3.x reserved bits,
+5.x fragmentation, 7.x close handshake) so future fixtures slot
+into the same naming scheme.
