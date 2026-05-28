@@ -70,6 +70,14 @@ struct ServerConfig(Copyable, Movable):
             ``handler_timeout_ms`` and >=
             ``read_body_timeout_ms`` (checked at compile time in
             ``serve_comptime``).
+        use_bufring: Opt into the io_uring buffer-ring single-worker
+            reactor (HTTP/1.1-only, single-listener-only) on Linux
+            ``>= 6.0``. When ``False`` (default), every entry point
+            consults the ``FLARE_BUFRING_HANDLER=1`` env var **once
+            at startup** and OR-equals the result into this field;
+            subsequent dispatch decisions read this field directly.
+            That guarantees a runtime flip of the env var mid-flight
+            cannot reroute live connections.
     """
 
     var read_buffer_size: Int
@@ -101,6 +109,17 @@ struct ServerConfig(Copyable, Movable):
     Default ``False`` -- the standard full-parse behaviour.
     Set ``True`` on production servers whose handler shape
     doesn't depend on headers."""
+    var use_bufring: Bool
+    """Opt into the io_uring buffer-ring single-worker reactor.
+
+    Defaults to ``False``. ``HttpServer.serve`` and
+    ``Scheduler.start`` consult ``FLARE_BUFRING_HANDLER=1``
+    once at startup and ``or``-equal the result into this
+    field; downstream dispatch reads this field directly so
+    a mid-flight env-var flip cannot reroute live connections.
+    Linux-only, HTTP/1.1-only, single-listener-only -- the
+    field is silently ignored on macOS / for HTTP/2 / for
+    ``HttpServer.bind_many``."""
 
     def __init__(
         out self,
@@ -118,6 +137,7 @@ struct ServerConfig(Copyable, Movable):
         handler_timeout_ms: Int = 30_000,
         request_timeout_ms: Int = 60_000,
         skip_header_decode_for_short_requests: Bool = False,
+        use_bufring: Bool = False,
     ):
         self.read_buffer_size = read_buffer_size
         self.max_header_size = max_header_size
@@ -135,6 +155,20 @@ struct ServerConfig(Copyable, Movable):
         self.skip_header_decode_for_short_requests = (
             skip_header_decode_for_short_requests
         )
+        self.use_bufring = use_bufring
+
+
+def _resolve_bufring_handler_env() -> Bool:
+    """Read ``FLARE_BUFRING_HANDLER`` once at startup.
+
+    The env-var read lives at the entry point of every reactor
+    loop overload; consumers (the reactor loops, the scheduler
+    workers) then read ``ServerConfig.use_bufring`` directly so
+    a mid-flight ``setenv`` cannot reroute live connections.
+    """
+    from std.os import getenv
+
+    return getenv("FLARE_BUFRING_HANDLER") == "1"
 
 
 # Comptime-friendly default config. Used as the default for
@@ -438,7 +472,6 @@ struct HttpServer(Movable):
         from ._unified_reactor_impl import run_unified_reactor_loop
         from .handler import FnHandler
         from flare.runtime.uring_reactor import use_uring_backend
-        from std.os import getenv
         from std.sys.info import CompilationTarget
 
         from ._unified_reactor_impl import run_unified_reactor_loop_multi
@@ -446,18 +479,23 @@ struct HttpServer(Movable):
         var h = FnHandler(handler)
         if num_workers <= 1:
             self._stopping = False
-            # OPT-IN via FLARE_BUFRING_HANDLER=1; the bufring
-            # path is HTTP/1.1-only by design and crashes under
-            # sustained 64-conn wrk2 load -- see the matching
-            # comment in the generic ``serve[H]`` overload below.
-            # Bufring is also single-listener-only; we fall
-            # through to the unified loop when extras are
-            # attached so multi-listener users get the proper
-            # accept demux.
+            # OPT-IN via FLARE_BUFRING_HANDLER=1 OR
+            # ServerConfig.use_bufring=True; the env var is read
+            # once at startup and OR-equalled into the field so
+            # later dispatch reads only the field.
+            if not self.config.use_bufring:
+                self.config.use_bufring = _resolve_bufring_handler_env()
+            # The bufring path is HTTP/1.1-only by design and
+            # crashes under sustained 64-conn wrk2 load -- see
+            # the matching comment in the generic ``serve[H]``
+            # overload below. Bufring is also single-listener-
+            # only; we fall through to the unified loop when
+            # extras are attached so multi-listener users get
+            # the proper accept demux.
             comptime if CompilationTarget.is_linux():
                 if (
                     use_uring_backend()
-                    and getenv("FLARE_BUFRING_HANDLER") == "1"
+                    and self.config.use_bufring
                     and len(self._extra_listener_fds) == 0
                 ):
                     run_uring_bufring_reactor_loop(
@@ -526,14 +564,15 @@ struct HttpServer(Movable):
             run_unified_reactor_loop_multi,
         )
         from flare.runtime.uring_reactor import use_uring_backend
-        from std.os import getenv
         from std.sys.info import CompilationTarget
 
         self._stopping = False
+        if not self.config.use_bufring:
+            self.config.use_bufring = _resolve_bufring_handler_env()
         comptime if CompilationTarget.is_linux():
             if (
                 use_uring_backend()
-                and getenv("FLARE_BUFRING_HANDLER") == "1"
+                and self.config.use_bufring
                 and len(self._extra_listener_fds) == 0
             ):
                 run_uring_bufring_reactor_loop[H](
@@ -597,22 +636,25 @@ struct HttpServer(Movable):
         from ._server_reactor_impl import run_uring_bufring_reactor_loop
         from ._unified_reactor_impl import run_unified_reactor_loop
         from flare.runtime.uring_reactor import use_uring_backend
-        from std.os import getenv
         from std.sys.info import CompilationTarget
 
         from ._unified_reactor_impl import run_unified_reactor_loop_multi
 
         if num_workers <= 1:
             self._stopping = False
+            if not self.config.use_bufring:
+                self.config.use_bufring = _resolve_bufring_handler_env()
             # io_uring buffer-ring path is OPT-IN via
-            # ``FLARE_BUFRING_HANDLER=1``. HTTP/1.1-only by
-            # design and single-listener-only. See the matching
-            # comment in the plain-def overload above for the
-            # load-crash status that keeps it default-off.
+            # ``ServerConfig.use_bufring`` (or the
+            # ``FLARE_BUFRING_HANDLER=1`` env var resolved at
+            # startup). HTTP/1.1-only by design and
+            # single-listener-only. See the matching comment in
+            # the plain-def overload above for the load-crash
+            # status that keeps it default-off.
             comptime if CompilationTarget.is_linux():
                 if (
                     use_uring_backend()
-                    and getenv("FLARE_BUFRING_HANDLER") == "1"
+                    and self.config.use_bufring
                     and len(self._extra_listener_fds) == 0
                 ):
                     run_uring_bufring_reactor_loop[H](
@@ -665,6 +707,12 @@ struct HttpServer(Movable):
 
         var addr = self._listener.local_addr()
         self._listener.close()
+
+        # Read FLARE_BUFRING_HANDLER once at startup before
+        # passing the config off to per-worker scheduler threads.
+        # See `_resolve_bufring_handler_env` for the rationale.
+        if not self.config.use_bufring:
+            self.config.use_bufring = _resolve_bufring_handler_env()
 
         var scheduler = Scheduler[H].start(
             addr=addr,

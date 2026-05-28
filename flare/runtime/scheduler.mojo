@@ -235,15 +235,15 @@ def _worker_entry[H: Handler & Copyable](arg: _OpaquePtr) -> _OpaquePtr:
         # ``Scheduler.start`` time and stays valid until
         # ``Scheduler.shutdown`` joins every worker.
         #
-        # Multi-worker buffer-ring path (FLARE_BUFRING_HANDLER=1):
-        # opt-in via ``FLARE_BUFRING_HANDLER=1`` (see the
-        # HttpServer.serve wire-in for the rationale on why this
-        # is opt-in rather than default). Each pthread worker
+        # Multi-worker buffer-ring path: opt-in via
+        # ``ServerConfig.use_bufring`` (which the HttpServer
+        # entry point resolves once at startup from
+        # ``FLARE_BUFRING_HANDLER=1``). Each pthread worker
         # owns its own UringReactor + per-worker recv buffer
         # pool; multishot accept on the shared listener fd
         # distributes new conns to one worker each.
         comptime if CompilationTarget.is_linux():
-            if use_uring_backend() and getenv("FLARE_BUFRING_HANDLER") == "1":
+            if use_uring_backend() and ctx_ptr[].config.use_bufring:
                 # SO_REUSEPORT per-worker bind: each worker has
                 # its OWN pre-bound listener fd (bound on the
                 # Scheduler thread before pthread spawn so binds
@@ -469,7 +469,7 @@ struct Scheduler[H: Handler & Copyable](Movable):
         #   SO_REUSEPORT's 4-tuple hash. Workers borrow the fd
         #   via ``ctx.listener_fd``.
         #
-        # * **io_uring buffer-ring path** (FLARE_BUFRING_HANDLER=1):
+        # * **io_uring buffer-ring path** (`config.use_bufring=True`):
         #   the Scheduler does NOT bind its own listener -- if it
         #   did, the kernel's SO_REUSEPORT group would route some
         #   incoming connections to the Scheduler's listener
@@ -485,7 +485,7 @@ struct Scheduler[H: Handler & Copyable](Movable):
         # an opaque pthread.
         var use_io_uring_handler = False
         comptime if CompilationTarget.is_linux():
-            if use_uring_backend() and getenv("FLARE_BUFRING_HANDLER") == "1":
+            if use_uring_backend() and config.use_bufring:
                 use_io_uring_handler = True
 
         # Per-worker ``SO_REUSEPORT`` listeners (each worker
