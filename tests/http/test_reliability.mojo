@@ -1,4 +1,4 @@
-"""Unit tests for the reliability middleware (Retry, Timeout)."""
+"""Unit tests for the reliability middleware (Retry, PostHocDeadline)."""
 
 from std.memory import UnsafePointer, alloc
 from std.testing import assert_equal, assert_true
@@ -8,7 +8,7 @@ from flare.http.handler import Handler
 from flare.http.reliability import (
     Retry,
     RetryPolicy,
-    Timeout,
+    PostHocDeadline,
 )
 from flare.http.request import Request
 from flare.http.response import Response
@@ -282,7 +282,7 @@ def test_retry_backoff_sleeps_between_attempts() raises:
 def test_timeout_passes_through_fast_handler() raises:
     """A handler that returns within budget surfaces unchanged."""
     var inner = AlwaysOkHandler()
-    var t = Timeout(inner^, budget_ms=5_000)
+    var t = PostHocDeadline(inner^, budget_ms=5_000)
     var req = Request(method=String("GET"), url=String("/"))
     var resp = t.serve(req)
     assert_equal(resp.status, 200)
@@ -292,7 +292,7 @@ def test_timeout_returns_504_on_zero_budget() raises:
     """A 0ms budget is impossible to honour; any handler runtime
     > 0 ms surfaces as 504."""
     var inner = AlwaysOkHandler()
-    var t = Timeout(inner^, budget_ms=0)
+    var t = PostHocDeadline(inner^, budget_ms=0)
     var req = Request(method=String("GET"), url=String("/"))
     var resp = t.serve(req)
     # AlwaysOkHandler runs in some > 0 ns time, so the timeout

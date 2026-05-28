@@ -1,4 +1,4 @@
-"""Reliability middleware — Retry[Inner] + TimeoutMiddleware[Inner].
+"""Reliability middleware — Retry[Inner] + PostHocDeadline[Inner].
 
 Shows how to wrap a handler with two production-grade reliability
 primitives:
@@ -12,13 +12,17 @@ primitives:
   Optional binary exponential backoff with full jitter
   (``initial_backoff_ms`` > 0) spaces attempts.
 
-- ``TimeoutMiddleware[Inner]`` (exported as ``Timeout`` from the
-  ``flare.http`` namespace; re-exported as
-  ``TimeoutMiddleware`` from the top-level ``flare`` package to
-  avoid colliding with ``flare.net.error.Timeout`` — the I/O
-  timeout error type) bounds the inner handler's wall-clock
-  time. If the budget is exhausted, the response is replaced
-  with a sanitised 504 Gateway Timeout.
+- ``PostHocDeadline[Inner]`` runs the inner handler **to
+  completion**, measures the elapsed wall-clock time after it
+  returns, and replaces the response with a sanitised 504
+  Gateway Timeout when the budget was exceeded. The middleware
+  does **not** preempt the inner handler -- a runaway handler
+  ties up the worker for its full natural duration and the
+  504 only suppresses the response. The reactor-cooperative
+  cancel-cell flip lands in a later commit. Available at the
+  package root as ``PostHocDeadline``; the ``Timeout`` symbol
+  remains bound to ``flare.net.error.Timeout`` (the I/O timeout
+  error type).
 
 Pure construction — no live network. Run:
 
@@ -26,7 +30,7 @@ Pure construction — no live network. Run:
 """
 
 from flare.http import Handler, Request, Response
-from flare.http.reliability import Retry, RetryPolicy, Timeout
+from flare.http.reliability import Retry, RetryPolicy, PostHocDeadline
 
 
 @fieldwise_init
@@ -113,15 +117,15 @@ def main() raises:
     var resp_jit = jittered.serve(req)
     print("Retry / jittered    status:", resp_jit.status)
 
-    # 4. Timeout disabled-by-zero-budget sentinel: a budget of 0
-    # ms is the explicit "no time allowed" knob — every call
+    # 4. PostHocDeadline disabled-by-zero-budget sentinel: a budget
+    # of 0 ms is the explicit "no time allowed" knob — every call
     # surfaces as a 504 without invoking the inner handler.
-    var bounded = Timeout(OkHandler(), budget_ms=0)
+    var bounded = PostHocDeadline(OkHandler(), budget_ms=0)
     var resp3 = bounded.serve(req)
-    print("Timeout / 0ms       status:", resp3.status)
+    print("PostHocDeadline / 0ms       status:", resp3.status)
 
-    # 5. Timeout with a generous budget: the inner runs and the
-    # 200 passes through unchanged.
-    var bounded_ok = Timeout(OkHandler(), budget_ms=30_000)
+    # 5. PostHocDeadline with a generous budget: the inner runs and
+    # the 200 passes through unchanged.
+    var bounded_ok = PostHocDeadline(OkHandler(), budget_ms=30_000)
     var resp4 = bounded_ok.serve(req)
-    print("Timeout / 30s       status:", resp4.status)
+    print("PostHocDeadline / 30s       status:", resp4.status)

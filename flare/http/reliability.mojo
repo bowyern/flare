@@ -1,4 +1,4 @@
-"""Reliability middleware: ``Retry`` + ``Timeout`` policies.
+"""Reliability middleware: ``Retry`` + ``PostHocDeadline`` policies.
 
 A reliability middleware wraps an inner ``Handler`` and adds a
 policy that improves the chance the call succeeds in the face of
@@ -14,12 +14,16 @@ this cycle.
   HEAD / OPTIONS / TRACE / PUT / DELETE -- the RFC 9110 §9.2.2
   idempotent set -- by passing ``retry_only_idempotent=True``).
   Optional exponential backoff with full jitter spaces attempts.
-- :class:`Timeout[Inner]` — bound the wall-clock time the inner
-  handler may consume. Returns ``Response.with_status(504)`` if
-  the deadline elapses before serve() completes. (The timeout
-  is observed via ``perf_counter_ns`` against the request's
-  arrival time; integration with the reactor's ``Cancel`` cell
-  flip is the v0.7-style enhancement in a later commit.)
+- :class:`PostHocDeadline[Inner]` — bound the wall-clock time the
+  inner handler may consume **measured after it returns**: the
+  middleware records the entry timestamp, runs the inner handler
+  to completion, then compares elapsed time against the budget
+  and replaces the response with a 504 if the budget was
+  exceeded. **It does not preempt the inner handler.** That
+  reactor-cooperative cancel-cell flip lands in a later commit;
+  until then this primitive is enough for handlers that complete
+  promptly (cleanup that must observe the deadline drift through
+  the inner handler return path).
 
 Each middleware is generic over its inner ``Handler`` so the
 chain stays monomorphised -- no virtual dispatch.
@@ -212,24 +216,33 @@ struct Retry[Inner: Handler & Copyable & Defaultable](
         return self.inner.serve(req)
 
 
-struct Timeout[Inner: Handler & Copyable & Defaultable](
+struct PostHocDeadline[Inner: Handler & Copyable & Defaultable](
     Copyable, Defaultable, Handler, Movable
 ):
-    """Bound the inner handler's wall-clock time.
+    """Post-hoc wall-clock deadline check.
 
-    The middleware records the entry timestamp and ALSO invokes
-    the inner handler; on return, if elapsed wall time exceeds
-    the configured budget, the response is replaced with a 504
-    Gateway Timeout. This is the simple integration point; tight
-    cancel-cell wiring (preempt the inner handler mid-serve)
-    requires reactor cooperation and lands in a later commit.
+    The middleware records the entry timestamp, runs the inner
+    handler **to completion**, and compares elapsed time against
+    ``budget_ms`` after serve() returns. If the budget was
+    exceeded, the response is replaced with a 504 Gateway
+    Timeout; otherwise the inner response passes through
+    unchanged.
 
-    For the codec-style sans-I/O test surface this commit
-    establishes today, the simple post-hoc check is the right
-    primitive: handlers that genuinely block longer than the
-    budget surface as 504, and those that just barely overrun
-    get truncated. The reactor cell-flip integration is the
-    enhancement.
+    The check is post-hoc by design -- it does **not** preempt
+    the inner handler. A genuinely runaway handler still ties
+    up the worker for the full natural duration; the 504 only
+    suppresses its response. Tight cancel-cell wiring (the
+    reactor flips a Cancel cell that the inner handler observes
+    and short-circuits on) requires reactor cooperation and
+    lands in a later commit.
+
+    For codec-style sans-I/O handlers and the common case where
+    misbehaving inners simply return slightly late, this
+    primitive is enough: handlers that genuinely overrun
+    surface as 504 to the client, and an external operator
+    monitor sees both the elapsed time and the substituted
+    status. ``budget_ms <= 0`` is the explicit "always trip"
+    sentinel and bypasses the inner handler entirely.
     """
 
     var inner: Self.Inner

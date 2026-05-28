@@ -73,7 +73,7 @@ flare.http2    - HTTP/2 frame codec + HPACK (with table-driven Huffman
                  fast decoder) + h2c upgrade (RFC 9113 / 7541)
 flare.http     - HTTP/1.1 client + reactor server + Router /
                  extractors + middleware (Logger / RequestId / Compress /
-                 Cors / Retry / Timeout / Conditional) + FileServer +
+                 Cors / Retry / PostHocDeadline / Conditional) + FileServer +
                  forms + cookies + sessions + content-encoding + SSE
                  + template engine with {% block %} / {% extends %}
                  inheritance + sans-I/O parser sublayer under
@@ -770,14 +770,15 @@ from .openapi import (
 from .http.cors import Cors, CorsConfig
 from .http.fs import ByteRange, FileServer, parse_range
 
-# Reliability middleware. ``Timeout`` is renamed to
-# ``TimeoutMiddleware`` at the top level to avoid colliding with
-# ``flare.net.error.Timeout`` (an I/O error type re-exported
-# higher up in this file).
+# Reliability middleware. ``PostHocDeadline`` is the explicit
+# replacement for the v0.7-era ``Timeout`` middleware, and is
+# re-exported under that name from the top-level ``flare``
+# package; the ``Timeout`` symbol stays bound to the I/O error
+# type re-exported above (``flare.net.error.Timeout``).
 from .http.reliability import (
     Retry,
     RetryPolicy,
-    Timeout as TimeoutMiddleware,
+    PostHocDeadline,
 )
 from .http.error import HttpError, TooManyRedirects
 from .http.static_response import StaticResponse, precompute_response

@@ -295,5 +295,5 @@ from .redirect_policy import (
 from .reliability import (
     Retry,
     RetryPolicy,
-    Timeout as TimeoutMiddleware,
+    PostHocDeadline,
 )

@@ -276,7 +276,7 @@ test-grpc-metadata   = "mojo -I . tests/grpc/test_metadata.mojo"         # gRPC 
 test-cache           = "mojo -I . tests/http/test_cache.mojo"            # RFC 9111 Cache-Control parser + InMemoryCacheStore (~12 cases)
 test-openapi         = "mojo -I . tests/openapi/test_openapi.mojo"       # OpenAPI 3.1 spec model + JSON emitter (~4 cases)
 test-test-client     = "mojo -I . tests/testing/test_test_client.mojo"   # in-process TestClient[H] handler tester (~5 cases)
-test-reliability     = "mojo -I . tests/http/test_reliability.mojo"      # Retry[Inner] + Timeout[Inner] middleware (~7 cases)
+test-reliability     = "mojo -I . tests/http/test_reliability.mojo"      # Retry[Inner] + PostHocDeadline[Inner] middleware (~10 cases)
 test-conformance-ws  = "mojo -I . tests/conformance/test_conformance_ws.mojo"  # RFC 6455 §5 wire-shape fixture runner (~13 fixtures)
 test-net         = "mojo -I . tests/net/test_net.mojo"          # Phase 1 — 57 tests
 test-dns         = "mojo -I . tests/dns/test_dns.mojo"          # Phase 2 — 17 tests
@@ -475,7 +475,7 @@ example-ws-over-h2   = "mojo -I . examples/advanced/ws_over_h2.mojo"         # v
 example-ws-permessage-deflate = "mojo -I . examples/advanced/ws_permessage_deflate.mojo"  # v0.7 — RFC 7692 permessage-deflate codec + offer/negotiate demo
 example-production-setup = "mojo -I . examples/advanced/production_setup.mojo"          # production-shaped server: RequestId + StructuredLogger + CatchPanic + /healthz
 example-template-inheritance = "mojo -I . examples/intermediate/template_inheritance.mojo"  # v0.8 Track J — {% block %} / {% extends %} demo
-example-reliability  = "mojo -I . examples/intermediate/reliability.mojo"  # Retry[Inner] + TimeoutMiddleware[Inner] reliability primitives
+example-reliability  = "mojo -I . examples/intermediate/reliability.mojo"  # Retry[Inner] + PostHocDeadline[Inner] reliability primitives
 
 # ── Microbenchmarks (mojo-only, no external load generators) ─────────────────
 # bench-parse:   IP parsing + DNS resolution throughput (confirms SIMD NOT useful here)
