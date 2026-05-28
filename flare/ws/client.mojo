@@ -8,8 +8,13 @@ Opening handshake (§4.1):
   5. Parse the 101 Switching Protocols response.
   6. Verify ``Sec-WebSocket-Accept = base64(SHA-1(key + GUID))``.
 
-SHA-1 is computed via libcrypto (OpenSSL) FFI — the same library already
-bundled by the TLS FFI build step. Base64 is a pure Mojo implementation.
+SHA-1 is computed via libcrypto (OpenSSL) FFI -- the same library
+already bundled by the TLS FFI build step. Base64 (RFC 4648 §4
+standard alphabet) is the canonical helper at
+:mod:`flare.crypto.base64`; the local ``_base64_encode`` alias
+keeps the call sites readable while routing through one source
+of truth (closes critique register §C1: this used to ship as
+three near-identical private encoders).
 """
 
 from std.ffi import OwnedDLHandle, c_int
@@ -20,6 +25,7 @@ from .frame import (
     WsProtocolError,
     _DecodeResult,
 )
+from ..crypto.base64 import base64_encode as _base64_encode
 from ..http.url import Url
 from ..tls import TlsStream, TlsConfig
 from ..tcp import TcpStream
@@ -47,50 +53,6 @@ struct WsHandshakeError(Copyable, Movable, Writable):
 
     def write_to[W: Writer, //](self, mut writer: W):
         writer.write("WsHandshakeError: ", self.message)
-
-
-# ── Base64 encoder ────────────────────────────────────────────────────────────
-
-comptime _B64_TABLE: String = (
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-)
-
-
-def _base64_encode(data: Span[UInt8, _]) -> String:
-    """Encode ``data`` to standard RFC 4648 base64.
-
-    Args:
-        data: Input bytes.
-
-    Returns:
-        Base64-encoded string (with ``=`` padding).
-    """
-    var n = len(data)
-    var out = String(capacity=((n + 2) // 3) * 4 + 1)
-    var tbl = _B64_TABLE.unsafe_ptr()
-    var i = 0
-    while i + 3 <= n:
-        var a = Int(data[i])
-        var b = Int(data[i + 1])
-        var c = Int(data[i + 2])
-        out += chr(Int(tbl[a >> 2]))
-        out += chr(Int(tbl[((a & 3) << 4) | (b >> 4)]))
-        out += chr(Int(tbl[((b & 0xF) << 2) | (c >> 6)]))
-        out += chr(Int(tbl[c & 0x3F]))
-        i += 3
-    if n - i == 1:
-        var a = Int(data[i])
-        out += chr(Int(tbl[a >> 2]))
-        out += chr(Int(tbl[(a & 3) << 4]))
-        out += "=="
-    elif n - i == 2:
-        var a = Int(data[i])
-        var b = Int(data[i + 1])
-        out += chr(Int(tbl[a >> 2]))
-        out += chr(Int(tbl[((a & 3) << 4) | (b >> 4)]))
-        out += chr(Int(tbl[(b & 0xF) << 2]))
-        out += "="
-    return out^
 
 
 # ── SHA-1 via libcrypto FFI ───────────────────────────────────────────────────

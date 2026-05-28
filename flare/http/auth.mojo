@@ -23,51 +23,20 @@ Example:
 """
 
 from std.format import Writable, Writer
+
+from flare.crypto.base64 import base64_encode as _b64_encode
+
 from .headers import HeaderMap
 
 
-# ── Base64 encoder (RFC 4648) ─────────────────────────────────────────────────
-
-comptime _B64_TABLE: String = (
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-)
-
-
-def _b64_encode(data: Span[UInt8, _]) -> String:
-    """Encode ``data`` to standard RFC 4648 base64.
-
-    Args:
-        data: Input bytes.
-
-    Returns:
-        Base64-encoded string with ``=`` padding.
-    """
-    var n = len(data)
-    var out = String(capacity=((n + 2) // 3) * 4 + 1)
-    var tbl = _B64_TABLE.unsafe_ptr()
-    var i = 0
-    while i + 3 <= n:
-        var a = Int(data[i])
-        var b = Int(data[i + 1])
-        var c = Int(data[i + 2])
-        out += chr(Int(tbl[a >> 2]))
-        out += chr(Int(tbl[((a & 3) << 4) | (b >> 4)]))
-        out += chr(Int(tbl[((b & 0xF) << 2) | (c >> 6)]))
-        out += chr(Int(tbl[c & 0x3F]))
-        i += 3
-    if n - i == 1:
-        var a = Int(data[i])
-        out += chr(Int(tbl[a >> 2]))
-        out += chr(Int(tbl[(a & 3) << 4]))
-        out += "=="
-    elif n - i == 2:
-        var a = Int(data[i])
-        var b = Int(data[i + 1])
-        out += chr(Int(tbl[a >> 2]))
-        out += chr(Int(tbl[((a & 3) << 4) | (b >> 4)]))
-        out += chr(Int(tbl[(b & 0xF) << 2]))
-        out += "="
-    return out^
+# ── BasicAuth uses RFC 4648 §4 base64 from flare.crypto.base64 ────────────────
+#
+# The standard-alphabet base64 implementation lives in
+# :mod:`flare.crypto.base64`; the local ``_b64_encode`` alias keeps
+# call-site readability while routing through the canonical
+# helper. (Closes critique register §C1: the previous private
+# table + chunk-of-3 loop is gone in favour of the single source
+# of truth shared with the WS handshake helpers.)
 
 
 # ── Auth trait ────────────────────────────────────────────────────────────────

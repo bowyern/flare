@@ -17,6 +17,7 @@ from std.ffi import OwnedDLHandle, c_int
 from std.memory import UnsafePointer
 
 from .frame import WsFrame, WsOpcode, WsCloseCode, WsProtocolError
+from ..crypto.base64 import base64_encode as _b64_encode_srv
 from ..http.response import Status
 from ..tcp import TcpListener, TcpStream
 from ..net import SocketAddr, NetworkError, _find_flare_lib
@@ -79,48 +80,14 @@ def _sha1_srv(data: String) raises -> List[UInt8]:
     return _do_sha1_srv(lib, data.as_bytes())
 
 
-# ── Base64 encoder (same implementation as ws/client.mojo) ───────────────────
-
-comptime _B64: String = (
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-)
-
-
-def _b64_encode_srv(data: Span[UInt8, _]) -> String:
-    """Encode bytes to standard RFC 4648 base64.
-
-    Args:
-        data: Input bytes.
-
-    Returns:
-        Base64-encoded string.
-    """
-    var n = len(data)
-    var out = String(capacity=((n + 2) // 3) * 4 + 1)
-    var tbl = _B64.unsafe_ptr()
-    var i = 0
-    while i + 3 <= n:
-        var a = Int(data[i])
-        var b = Int(data[i + 1])
-        var c = Int(data[i + 2])
-        out += chr(Int(tbl[a >> 2]))
-        out += chr(Int(tbl[((a & 3) << 4) | (b >> 4)]))
-        out += chr(Int(tbl[((b & 0xF) << 2) | (c >> 6)]))
-        out += chr(Int(tbl[c & 0x3F]))
-        i += 3
-    if n - i == 1:
-        var a = Int(data[i])
-        out += chr(Int(tbl[a >> 2]))
-        out += chr(Int(tbl[(a & 3) << 4]))
-        out += "=="
-    elif n - i == 2:
-        var a = Int(data[i])
-        var b = Int(data[i + 1])
-        out += chr(Int(tbl[a >> 2]))
-        out += chr(Int(tbl[((a & 3) << 4) | (b >> 4)]))
-        out += chr(Int(tbl[(b & 0xF) << 2]))
-        out += "="
-    return out^
+# ── Sec-WebSocket-Accept derivation uses RFC 4648 §4 base64 from
+#    flare.crypto.base64 (closes critique register §C1) ────────────────────────
+#
+# The standard-alphabet base64 encoder lives in
+# :mod:`flare.crypto.base64`; the local ``_b64_encode_srv`` alias
+# above keeps the call sites readable while routing through the
+# canonical implementation shared with the client (and the
+# ``Basic`` auth helper).
 
 
 def _compute_accept_srv(key: String) raises -> String:
