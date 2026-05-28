@@ -410,12 +410,15 @@ struct UringReactor(Movable):
     var _wake_buf: UnsafePointer[UInt8, MutExternalOrigin]
     var _io: FlareRawIO
     var _wake_armed: Bool
-    var _wakeup_disabled: Bool
-    """If True, ``poll`` skips the lazy-arm of the wakeup
-    ``IORING_OP_READ`` SQE and ``wakeup()`` becomes a no-op.
-    Eliminates one always-pending SQE on the hot path for
+    var _cross_thread_wakeup: Bool
+    """If True, ``poll`` lazy-arms the wakeup ``IORING_OP_READ``
+    SQE and ``wakeup()`` writes the eventfd to nudge the
+    poll-loop owner. If False, both paths short-circuit; this
+    eliminates one always-pending SQE on the hot path for
     single-issuer bufring rings that don't need cross-thread
-    wakeup."""
+    wakeup. The positive name keeps the call-site logic
+    direct (``if self._cross_thread_wakeup`` rather than the
+    earlier ``not _wakeup_disabled`` double negative)."""
 
     def __init__(
         out self,
@@ -478,7 +481,7 @@ struct UringReactor(Movable):
             sq_thread_cpu=sq_thread_cpu,
             sq_thread_idle=sq_thread_idle,
         )
-        self._wakeup_disabled = not enable_wakeup
+        self._cross_thread_wakeup = enable_wakeup
         if enable_wakeup:
             # NOTE: deliberately *blocking* eventfd (no EFD_NONBLOCK).
             # io_uring's IORING_OP_RECV against a non-blocking eventfd
@@ -994,7 +997,7 @@ struct UringReactor(Movable):
                 ``max_events``).
         """
         out.clear()
-        if (not self._wakeup_disabled) and (not self._wake_armed):
+        if self._cross_thread_wakeup and (not self._wake_armed):
             # Lazy-arm the wakeup recv on first poll so the
             # eventfd surfaces wakeups via the same drain loop.
             # Skipped entirely when ``enable_wakeup=False`` was
@@ -1120,7 +1123,7 @@ struct UringReactor(Movable):
         ``enable_wakeup=False`` -- single-issuer bufring rings
         opt out because they don't need cross-thread signalling.
         """
-        if self._wakeup_disabled:
+        if not self._cross_thread_wakeup:
             return
         var one = stack_allocation[8, UInt8]()
         (one + 0).init_pointee_copy(UInt8(1))
