@@ -95,10 +95,10 @@ def test_acceptor_alpn_empty_skips_set_alpn_call() raises:
 def test_tls_info_default_fields_for_pre_handshake() raises:
     """Per the C7 contract, ``acceptor.info_placeholder()``
     returns a default ``TlsInfo`` with empty strings — used by
-    code paths that need a TlsInfo before the handshake (e.g.
-    ``Request.tls_info`` for plain-HTTP connections is None,
-    but if a code path needs a default TlsInfo for fallback
-    semantics this is the source).
+    code paths that need a TlsInfo before the handshake fires
+    (the live ``handshake_fd`` path returns a populated value;
+    ``info_placeholder`` is the default-constructed source for
+    fallback semantics).
     """
     var cfg = TlsServerConfig(cert_file=_CERT, key_file=_KEY)
     var acc = TlsAcceptor(cfg^)

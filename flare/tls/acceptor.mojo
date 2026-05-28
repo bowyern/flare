@@ -19,8 +19,9 @@ the existing ``flare/tls/ffi/openssl_wrapper.cpp``.
 Why split: the C-side handshake state machine is ~150 lines of
 ``SSL_accept`` + ``SSL_get_error`` + ``BIO`` plumbing, plus
 matching reactor surgery. Landing the API surface in this commit
-lets S3.2 (``Request.tls_info``), S3.3 (cert reload), and S3.4
-(mTLS) all plug into the public surface; the actual cipher-on-
+lets S3.2 (per-request ``TlsInfo`` plumbing), S3.3 (cert reload),
+and S3.4 (mTLS) all plug into the public surface; the actual
+cipher-on-
 the-wire bits land together in a single follow-up the user can
 review in one shot.
 
@@ -213,12 +214,12 @@ comptime TLS_PROTOCOL_TLS13: Int = 0x0304
 
 
 struct TlsInfo(Copyable, Movable):
-    """Per-request TLS metadata threaded onto ``Request`` via
-    ``Request.tls_info``.
+    """Per-connection TLS metadata returned by
+    :meth:`TlsAcceptor.handshake_fd`.
 
     Available when the connection terminated TLS at flare's
-    ``TlsAcceptor``. Plain-HTTP connections see ``Request.tls_info
-    = None`` (this struct is not threaded onto them).
+    ``TlsAcceptor``. Plain-HTTP connections never see this struct
+    (the reactor only constructs it on the TLS handshake path).
 
     Fields:
         protocol: Negotiated protocol version

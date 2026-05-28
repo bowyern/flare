@@ -7,7 +7,7 @@ DNS. The HTTP server and client are version-aware:
 accepted connection and dispatches HTTP/1.1 or HTTP/2 to the
 same handler. ``HttpClient.get("https://...")`` advertises ALPN
 ``["h2", "http/1.1"]`` and switches wires from what the server
-picks. The application surface (``Router``, ``App[S]``,
+picks. The application surface (``Router``,
 middleware, typed extractors, ``Auth``, ``Session[T]``) doesn't
 know which wire is talking to it.
 
@@ -54,8 +54,8 @@ streaming response primitives (``Body`` / ``ChunkSource`` /
 ``StreamingResponse[B]``), and server-side TLS (``TlsAcceptor``
 over OpenSSL).
 
-The application layer: ``Router`` with path params, ``App[S]`` for
-shared state, typed extractors (``PathInt`` / ``QueryInt`` /
+The application layer: ``Router`` with path params, typed
+extractors (``PathInt`` / ``QueryInt`` /
 ``HeaderStr`` / ``Form`` / ``Multipart`` / ``Cookies`` / ...),
 generic middleware (``Logger`` / ``RequestId`` / ``Compress`` /
 ``CatchPanic``), ``Cors``, ``FileServer`` with HEAD + Range,
@@ -71,7 +71,7 @@ flare.ws       - WebSocket client + server (RFC 6455, permessage-deflate
                  Extended CONNECT)
 flare.http2    - HTTP/2 frame codec + HPACK (with table-driven Huffman
                  fast decoder) + h2c upgrade (RFC 9113 / 7541)
-flare.http     - HTTP/1.1 client + reactor server + Router / App /
+flare.http     - HTTP/1.1 client + reactor server + Router /
                  extractors + middleware (Logger / RequestId / Compress /
                  Cors / Retry / Timeout / Conditional) + FileServer +
                  forms + cookies + sessions + content-encoding + SSE
@@ -236,16 +236,16 @@ def main() raises:
     srv.serve(r^)
 ```
 
-## Shared state and middleware: ``App[S]``
+## Shared state via captured handlers
 
-``App[S, H]`` bundles application-scoped state onto a handler. A
-wrapping middleware holds the state snapshot and decorates every
-response. Middleware is itself a ``Handler`` that holds another
-``Handler``, so you stack layers by nesting constructors, no callback
-chain to thread through.
+When a handler needs application-scoped state, build a wrapping
+``Handler`` struct that captures the state by value. Middleware
+itself is a ``Handler`` that holds another ``Handler``, so you
+stack layers by nesting constructors, no callback chain to
+thread through.
 
 ```mojo
-from flare.http import App, Router, Request, Response, Handler, State, ok, HttpServer
+from flare.http import Router, Request, Response, Handler, ok, HttpServer
 from flare.net import SocketAddr
 
 @fieldwise_init
@@ -258,21 +258,19 @@ def home(req: Request) raises -> Response:
 @fieldwise_init
 struct WithHits[Inner: Handler](Handler):
     var inner: Self.Inner
-    var snapshot: State[Counters]
+    var counters: Counters
 
     def serve(self, req: Request) raises -> Response:
         var resp = self.inner.serve(req)
-        resp.headers.set("X-Hits", String(self.snapshot.get().hits))
+        resp.headers.set("X-Hits", String(self.counters.hits))
         return resp^
 
 def main() raises:
     var router = Router()
     router.get("/", home)
-    var app = App(state=Counters(hits=37), handler=router^)
-    var view = app.state_view()
 
     var srv = HttpServer.bind(SocketAddr.localhost(8080))
-    srv.serve(WithHits(inner=app^, snapshot=view^))
+    srv.serve(WithHits(inner=router^, counters=Counters(hits=37)))
 ```
 
 ## Scale knob: ``num_workers``
@@ -596,7 +594,6 @@ from .http.handler import (
     WithViewCancel,
 )
 from .http.router import Router
-from .http.app import App, State
 from .http.client import HttpClient, get, post, put, patch, delete, head
 from .http.auth import Auth, BasicAuth, BearerAuth
 from .runtime._thread import num_cpus

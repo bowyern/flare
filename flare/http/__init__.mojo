@@ -147,7 +147,6 @@ from .handler import (
 )
 from .router import Router
 from .routes import ComptimeRoute, ComptimeRouter
-from .app import App, State
 from .extract import (
     ParamParser,
     ParamInt,

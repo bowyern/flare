@@ -103,7 +103,7 @@ def fork_server[
     """Fork-and-serve overload for ``Handler``-struct shapes.
 
     Identical semantics to the bare-function overload; this one
-    exists so ``Router``, ``App[S]``, middleware wrappers, and
+    exists so ``Router``, middleware wrappers, and
     user-defined ``Handler`` structs can flow through the helper
     without an ``FnHandler`` shim. ``Copyable`` is *not* required
     -- the child process runs the single-worker ``HttpServer.serve``

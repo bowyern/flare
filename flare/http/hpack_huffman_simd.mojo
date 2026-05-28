@@ -224,15 +224,19 @@ def huffman_decode_simd(
 def huffman_decode_dispatch(
     input: Span[UInt8, _],
     mut output: List[UInt8],
-    prefer_simd: Bool = False,
+    use_table: Bool = False,
 ) raises HuffmanError:
-    """Pick fast-table vs scalar based on ``prefer_simd`` and
-    input length.
+    """Pick fast-table vs scalar based on ``use_table`` and input length.
+
+    The "fast table" path is :func:`huffman_decode_simd`, a 256-entry
+    lookup-table decoder; despite the historical module name, the
+    implementation is scalar (no SIMD intrinsics). The flag selects
+    table-driven dispatch above ``SIMD_HUFFMAN_THRESHOLD_BYTES``.
 
     Args:
         input: The Huffman-encoded byte stream.
         output: The byte list to append the decoded form to.
-        prefer_simd: When ``True`` and ``len(input) >=
+        use_table: When ``True`` and ``len(input) >=
             SIMD_HUFFMAN_THRESHOLD_BYTES``, dispatch to
             :func:`huffman_decode_simd`. Otherwise dispatch to
             the scalar codec.
@@ -240,7 +244,7 @@ def huffman_decode_dispatch(
     Raises:
         HuffmanError: Forwarded from the underlying decoder.
     """
-    if prefer_simd and len(input) >= SIMD_HUFFMAN_THRESHOLD_BYTES:
+    if use_table and len(input) >= SIMD_HUFFMAN_THRESHOLD_BYTES:
         huffman_decode_simd(input, output)
     else:
         huffman_decode(input, output)

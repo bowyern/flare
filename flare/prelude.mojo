@@ -27,7 +27,7 @@ still documents which features it actually uses:
   ``Multipart``, ``Cookies``, ``Json[T]``, ``Extracted[H]``).
 * Middleware (``Logger``, ``RequestId``, ``Compress``, ``CatchPanic``).
 * ``Cors``, ``FileServer``, ``Conditional``, ``StaticResponse``.
-* ``App[S]`` / ``State[T]``, ``Cancel`` / ``CancelHandler``,
+* ``Cancel`` / ``CancelHandler``,
   ``ViewHandler``, ``ComptimeRouter`` / ``ComptimeRoute``.
 * Cookies, sessions, forms, multipart, SSE, content-encoding.
 * Lower-level transports (``flare.tcp``, ``flare.tls``,

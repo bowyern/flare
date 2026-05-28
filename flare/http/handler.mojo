@@ -2,7 +2,7 @@
 
 A ``Handler`` is anything that can turn a ``Request`` into a ``Response``.
 Structs with state implement it directly, functions adapt via ``FnHandler``,
-and higher-level types (``Router``, ``App[S]``, middleware wrappers) all
+and higher-level types (``Router``, middleware wrappers) all
 nest by wrapping another ``Handler``.
 
 ## Writing a handler as a struct
@@ -80,9 +80,9 @@ trait Handler(ImplicitlyDestructible, Movable):
       ``not_found``, ``bad_request``, etc.).
 
     Concrete implementations live at all layers: ``FnHandler`` wraps a
-    plain function, ``Router`` dispatches by method + path, ``App[S]``
-    injects state, and any user struct can implement the trait for its
-    own routing / middleware / adapter needs.
+    plain function, ``Router`` dispatches by method + path, and any
+    user struct can implement the trait for its own routing /
+    middleware / adapter needs.
 
     The bare-function ``def(Request) -> Response`` (no ``raises``)
     shape is also accepted at every ``Router.get`` / ``Router.post``

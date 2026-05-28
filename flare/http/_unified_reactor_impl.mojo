@@ -22,8 +22,8 @@ Per-connection lifecycle:
 
 Both terminal handles dispatch through the same
 :meth:`flare.http.Handler.serve` callback, so the user's
-application code is unchanged: a :class:`flare.http.Router`, an
-:class:`flare.http.App[S]`, a middleware-wrapped chain -- they
+application code is unchanged: a :class:`flare.http.Router`,
+a middleware-wrapped chain -- they
 all serve identically over both wire protocols. The unified loop
 exists so the user never has to choose: every accepted
 connection auto-dispatches to the right per-conn state machine.

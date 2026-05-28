@@ -1,18 +1,16 @@
-"""Example 16 - App[S] with typed ``State[T]``.
+"""Example 16 - shared application state via a captured handler.
 
-Shows how to wrap a Router in an ``App`` that carries application-
-scoped state, and how a middleware handler reads that state through
-a ``State[T]`` view. Exact same pattern ``test_app_state.mojo``
-uses in the unit tests, deliberately: the Example is the living
-version of the unit test.
+Shows how a handler reads request-independent state without globals
+or a framework-provided injection layer. The pattern is a wrapping
+``Handler`` struct that captures state by value; ``flare.http``
+treats middleware-style wrappers as first-class because they
+implement the same ``Handler`` trait the leaf handlers do.
 
 Run:
     pixi run example-state
 """
 
 from flare.http import (
-    App,
-    State,
     Router,
     Handler,
     Request,
@@ -21,8 +19,8 @@ from flare.http import (
 )
 
 
-# Application state - a tiny counter, Copyable so the App can hand a
-# snapshot to each handler / middleware layer.
+# Application state - a tiny counter, Copyable so the wrapping
+# handler can hand a snapshot to each layer.
 @fieldwise_init
 struct Counters(Copyable, Movable):
     var hits: Int
@@ -39,33 +37,33 @@ def details(req: Request) raises -> Response:
 
 @fieldwise_init
 struct _ObserveHits[Inner: Handler](Handler):
-    """Middleware that tags the response with the current state snapshot."""
+    """Middleware that tags the response with the captured snapshot."""
 
     var inner: Self.Inner
-    var snapshot: State[Counters]
+    var counters: Counters
 
     def serve(self, req: Request) raises -> Response:
         var resp = self.inner.serve(req)
-        resp.headers.set("X-Hits", String(self.snapshot.get().hits))
-        resp.headers.set("X-Misses", String(self.snapshot.get().misses))
+        resp.headers.set("X-Hits", String(self.counters.hits))
+        resp.headers.set("X-Misses", String(self.counters.misses))
         return resp^
 
 
 def main() raises:
     print("=" * 60)
-    print("flare example 16 - App[Counters] + State[T]")
+    print("flare example 16 - shared state via a captured handler")
     print("=" * 60)
 
     var router = Router()
     router.get("/", home)
     router.get("/details", details)
 
-    var app = App(state=Counters(hits=7, misses=2), handler=router^)
-    var view = app.state_view()
-
-    # Wrap App in the observing middleware. The wrapper captures a
-    # state snapshot and injects it into every response.
-    var serve_tree = _ObserveHits(app^, view^)
+    # The wrapper holds the state and is itself a Handler; serve it
+    # directly. Mutable shared state would store atomics or use an
+    # interior-mutability type instead of a plain ``Counters``.
+    var serve_tree = _ObserveHits(
+        inner=router^, counters=Counters(hits=7, misses=2)
+    )
 
     var resp = serve_tree.serve(Request.test_get("/"))
     print("GET / →", resp.status, resp.text())

@@ -6,7 +6,6 @@ from json import loads, Value
 from .headers import HeaderMap
 from .cookie import Cookie, CookieJar, parse_cookie_header
 from ..net import IpAddr, SocketAddr
-from ..tls.acceptor import TlsInfo
 
 
 struct Method:
@@ -82,22 +81,6 @@ struct Request(Movable):
     Default False; the reactor copies
     ``ServerConfig.expose_error_messages`` onto every parsed request.
     See struct docstring."""
-    var tls_info: Optional[TlsInfo]
-    """Per-request TLS metadata.
-
-    ``Some(TlsInfo)`` when the connection terminated TLS at flare's
-    ``TlsAcceptor`` (set at handshake time, threaded onto every
-    request on that connection). ``None`` for plain-HTTP
-    connections. Handlers can inspect ``tls_info.alpn_protocol``,
-    ``tls_info.sni_host``, ``tls_info.client_cert_subject``
-    (mTLS), etc. to make per-request decisions.
-
-    The reactor-side handshake state machine that populates this
-    field with live values lands as a follow-up to S3.1; until
-    then ``tls_info`` is always ``None`` (the field is in place
-    so handlers can write production-shape code today against
-    the stable shape).
-    """
     var _params: Optional[
         UnsafePointer[Dict[String, String], MutExternalOrigin]
     ]
@@ -125,7 +108,6 @@ struct Request(Movable):
         version: String = "HTTP/1.1",
         peer: SocketAddr = SocketAddr(IpAddr("127.0.0.1", False), UInt16(0)),
         expose_errors: Bool = False,
-        tls_info: Optional[TlsInfo] = Optional[TlsInfo](),
     ):
         """Create a new HTTP request.
 
@@ -143,14 +125,6 @@ struct Request(Movable):
                            ``False`` (production-safe). The reactor
                            copies this from
                            ``ServerConfig.expose_error_messages``.
-            tls_info: Per-request TLS metadata (Track 5.2).
-                           ``Some(TlsInfo)`` when the connection
-                           terminated TLS at flare's ``TlsAcceptor``;
-                           ``None`` (default) for plain HTTP. Direct
-                           Request constructions in tests / clients
-                           default to ``None``; the reactor populates
-                           it from the ``TlsAcceptor`` handshake when
-                           that lands.
         """
         self.method = method
         self.url = url
@@ -159,7 +133,6 @@ struct Request(Movable):
         self.version = version
         self.peer = peer
         self.expose_errors = expose_errors
-        self.tls_info = tls_info.copy()
         self._params = None
 
     def __del__(deinit self):

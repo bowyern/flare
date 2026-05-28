@@ -15,9 +15,9 @@ raises (mTLS without trust anchors is meaningless; the verify
 callback would have nothing to check against).
 
 The handshake selection callback that pulls the verified client
-cert subject onto ``Request.tls_info.client_cert_subject``
-lands with the reactor follow-up; this example demonstrates the
-config shape and the validation behaviour that ships today.
+cert subject through to handlers lands with the reactor
+follow-up; this example demonstrates the config shape and the
+validation behaviour that ships today.
 
 Run:
     pixi run example-mtls
@@ -75,13 +75,7 @@ def main() raises:
     # 3. Per-request access to the client cert subject (deferred
     # until reactor follow-up):
     print("[3] Per-request access to the client cert subject")
-    print(" (lands with the reactor handshake follow-up):")
-    print()
-    print(" def handler(req: Request) raises -> Response:")
-    print(" if req.tls_info:")
-    print(" var info = req.tls_info.value()")
-    print(" print('client subject:', info.client_cert_subject)")
-    print(" return ok('hello')")
+    print(" (lands with the reactor handshake follow-up).")
     print()
 
     print("=== Example 26 complete ===")

@@ -10,7 +10,7 @@ Verifies parity with the scalar codec from
   invalid-padding all raise the same ``HuffmanError`` variants on
   both code paths.
 * Dispatcher honours the threshold: small inputs go scalar, larger
-  inputs go fast-path when ``prefer_simd=True``.
+  inputs go fast-path when ``use_table=True``.
 * Fast-table covers every Huffman code of length <= 8 (the
   property that makes the lookup loop hit on common ASCII bytes
   in O(1) instead of O(26 * 257)).
@@ -105,7 +105,7 @@ def test_simd_eos_in_input_raises_same_as_scalar() raises:
 
 def test_dispatch_threshold_picks_scalar_below_threshold() raises:
     """Inputs shorter than :comptime:`SIMD_HUFFMAN_THRESHOLD_BYTES`
-    must go scalar even with ``prefer_simd=True``. Outputs are
+    must go scalar even with ``use_table=True``. Outputs are
     byte-identical regardless of which path runs, so this is a
     behavioural assertion: the dispatcher does not raise or
     mis-route the small-input path."""
@@ -113,7 +113,7 @@ def test_dispatch_threshold_picks_scalar_below_threshold() raises:
     huffman_encode(Span[UInt8, _](_bytes("hi")), enc)
     assert_true(len(enc) < SIMD_HUFFMAN_THRESHOLD_BYTES)
     var dec = List[UInt8]()
-    huffman_decode_dispatch(Span[UInt8, _](enc), dec, prefer_simd=True)
+    huffman_decode_dispatch(Span[UInt8, _](enc), dec, use_table=True)
     var got = String(capacity=len(dec) + 1)
     for b in dec:
         got += chr(Int(b))
@@ -154,7 +154,7 @@ def test_fast_path_handles_repeated_short_code_tail() raises:
 
 
 def test_dispatch_above_threshold_routes_simd() raises:
-    """Inputs at / above the threshold and ``prefer_simd=True``
+    """Inputs at / above the threshold and ``use_table=True``
     take the SIMD path. Output parity with scalar is the same
     invariant the fuzz harness asserts on every input."""
     var s = "x" * 128
@@ -162,7 +162,7 @@ def test_dispatch_above_threshold_routes_simd() raises:
     huffman_encode(Span[UInt8, _](_bytes(s)), enc)
     assert_true(len(enc) >= SIMD_HUFFMAN_THRESHOLD_BYTES)
     var simd_out = List[UInt8]()
-    huffman_decode_dispatch(Span[UInt8, _](enc), simd_out, prefer_simd=True)
+    huffman_decode_dispatch(Span[UInt8, _](enc), simd_out, use_table=True)
     var scalar_out = List[UInt8]()
     huffman_decode(Span[UInt8, _](enc), scalar_out)
     assert_equal(len(simd_out), len(scalar_out))
