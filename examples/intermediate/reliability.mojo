@@ -5,10 +5,12 @@ primitives:
 
 - ``Retry[Inner]`` re-invokes the inner handler up to
   ``RetryPolicy.max_attempts`` times when it returns a 5xx
-  response. Idempotent methods (GET / HEAD / PUT / DELETE /
-  OPTIONS) retry by default; non-idempotent methods (POST /
-  PATCH) are passed through once unless
+  response. Idempotent methods (GET / HEAD / OPTIONS / TRACE /
+  PUT / DELETE — RFC 9110 §9.2.2) retry by default; non-idempotent
+  methods (POST / PATCH / CONNECT) pass through once unless
   ``RetryPolicy.retry_only_idempotent`` is set to ``False``.
+  Optional binary exponential backoff with full jitter
+  (``initial_backoff_ms`` > 0) spaces attempts.
 
 - ``TimeoutMiddleware[Inner]`` (exported as ``Timeout`` from the
   ``flare.http`` namespace; re-exported as
@@ -61,35 +63,65 @@ def main() raises:
     print()
 
     # 1. Fast path through Retry: the inner returns 200 on the
-    #    first attempt, so Retry never re-invokes it.
+    # first attempt, so Retry never re-invokes it.
     var fast = Retry(
         OkHandler(),
-        RetryPolicy(max_attempts=3, retry_only_idempotent=True),
+        RetryPolicy(
+            max_attempts=3,
+            retry_only_idempotent=True,
+            initial_backoff_ms=0,
+            backoff_multiplier=2,
+            max_backoff_ms=2_000,
+        ),
     )
     var req = Request(method=String("GET"), url=String("/"))
     var resp = fast.serve(req)
     print("Retry / fast path  status:", resp.status)
 
     # 2. Retry exhausts max_attempts on a perpetually-flaky inner
-    #    and surfaces the last 5xx. POSTs would *not* retry under
-    #    the default policy; we flip retry_only_idempotent off to
-    #    force a retry here just for illustration.
+    # and surfaces the last 5xx. POSTs would *not* retry under
+    # the default policy; we flip retry_only_idempotent off to
+    # force a retry here just for illustration.
     var flaky = Retry(
         FlakyHandler(),
-        RetryPolicy(max_attempts=2, retry_only_idempotent=False),
+        RetryPolicy(
+            max_attempts=2,
+            retry_only_idempotent=False,
+            initial_backoff_ms=0,
+            backoff_multiplier=2,
+            max_backoff_ms=2_000,
+        ),
     )
     var resp2 = flaky.serve(req)
     print("Retry / exhausted   status:", resp2.status)
 
-    # 3. Timeout disabled-by-zero-budget sentinel: a budget of 0
-    #    ms is the explicit "no time allowed" knob — every call
-    #    surfaces as a 504 without invoking the inner handler.
+    # 3. Retry with binary exponential backoff + full jitter:
+    # 5 ms initial, 2x multiplier, 20 ms cap. The actual sleep
+    # is drawn from [0, capped] before each retry. Three GETs
+    # against a flaky inner will sleep at most 5+10 = 15 ms total
+    # before surfacing the 503.
+    var jittered = Retry(
+        FlakyHandler(),
+        RetryPolicy(
+            max_attempts=3,
+            retry_only_idempotent=True,
+            initial_backoff_ms=5,
+            backoff_multiplier=2,
+            max_backoff_ms=20,
+        ),
+    )
+    var resp_jit = jittered.serve(req)
+    print("Retry / jittered    status:", resp_jit.status)
+
+    # 4. Timeout disabled-by-zero-budget sentinel: a budget of 0
+    # ms is the explicit "no time allowed" knob — every call
+    # surfaces as a 504 without invoking the inner handler.
     var bounded = Timeout(OkHandler(), budget_ms=0)
     var resp3 = bounded.serve(req)
     print("Timeout / 0ms       status:", resp3.status)
 
-    # 4. Timeout with a generous budget: the inner runs and the
-    #    200 passes through unchanged.
+    # 5. Timeout with a generous budget: the inner runs and the
+    # 200 passes through unchanged.
     var bounded_ok = Timeout(OkHandler(), budget_ms=30_000)
     var resp4 = bounded_ok.serve(req)
     print("Timeout / 30s       status:", resp4.status)

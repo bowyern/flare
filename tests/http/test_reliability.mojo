@@ -2,6 +2,7 @@
 
 from std.memory import UnsafePointer, alloc
 from std.testing import assert_equal, assert_true
+from std.time import perf_counter_ns
 
 from flare.http.handler import Handler
 from flare.http.reliability import (
@@ -101,7 +102,14 @@ def test_retry_succeeds_on_first_attempt() raises:
     var addr = _new_counter()
     var inner = EventuallyOkHandler(ptr=addr, fail_count=0)
     var retry = Retry(
-        inner^, RetryPolicy(max_attempts=3, retry_only_idempotent=True)
+        inner^,
+        RetryPolicy(
+            max_attempts=3,
+            retry_only_idempotent=True,
+            initial_backoff_ms=0,
+            backoff_multiplier=2,
+            max_backoff_ms=2_000,
+        ),
     )
     var req = Request(method=String("GET"), url=String("/"))
     var resp = retry.serve(req)
@@ -116,7 +124,14 @@ def test_retry_recovers_after_transient_failures() raises:
     var addr = _new_counter()
     var inner = EventuallyOkHandler(ptr=addr, fail_count=2)
     var retry = Retry(
-        inner^, RetryPolicy(max_attempts=3, retry_only_idempotent=True)
+        inner^,
+        RetryPolicy(
+            max_attempts=3,
+            retry_only_idempotent=True,
+            initial_backoff_ms=0,
+            backoff_multiplier=2,
+            max_backoff_ms=2_000,
+        ),
     )
     var req = Request(method=String("GET"), url=String("/"))
     var resp = retry.serve(req)
@@ -131,7 +146,14 @@ def test_retry_gives_up_after_max_attempts() raises:
     var addr = _new_counter()
     var inner = AlwaysFiveHundredHandler(ptr=addr)
     var retry = Retry(
-        inner^, RetryPolicy(max_attempts=3, retry_only_idempotent=True)
+        inner^,
+        RetryPolicy(
+            max_attempts=3,
+            retry_only_idempotent=True,
+            initial_backoff_ms=0,
+            backoff_multiplier=2,
+            max_backoff_ms=2_000,
+        ),
     )
     var req = Request(method=String("GET"), url=String("/"))
     var resp = retry.serve(req)
@@ -146,7 +168,14 @@ def test_retry_skips_non_idempotent_methods_by_default() raises:
     var addr = _new_counter()
     var inner = AlwaysFiveHundredHandler(ptr=addr)
     var retry = Retry(
-        inner^, RetryPolicy(max_attempts=3, retry_only_idempotent=True)
+        inner^,
+        RetryPolicy(
+            max_attempts=3,
+            retry_only_idempotent=True,
+            initial_backoff_ms=0,
+            backoff_multiplier=2,
+            max_backoff_ms=2_000,
+        ),
     )
     var req = Request(method=String("POST"), url=String("/"))
     var resp = retry.serve(req)
@@ -162,11 +191,91 @@ def test_retry_with_idempotent_off_retries_post() raises:
     var inner = AlwaysFiveHundredHandler(ptr=addr)
     var retry = Retry(
         inner^,
-        RetryPolicy(max_attempts=2, retry_only_idempotent=False),
+        RetryPolicy(
+            max_attempts=2,
+            retry_only_idempotent=False,
+            initial_backoff_ms=0,
+            backoff_multiplier=2,
+            max_backoff_ms=2_000,
+        ),
     )
     var req = Request(method=String("POST"), url=String("/"))
     _ = retry.serve(req)
     assert_equal(_read_counter(addr), 2)
+    _free_counter(addr)
+
+
+def test_retry_treats_put_as_idempotent() raises:
+    """RFC 9110 §9.2.2 -- PUT is idempotent. The default policy
+    must retry on transient failure even though earlier flare
+    behaviour gated retries to the read-only set."""
+    var addr = _new_counter()
+    var inner = AlwaysFiveHundredHandler(ptr=addr)
+    var retry = Retry(
+        inner^,
+        RetryPolicy(
+            max_attempts=3,
+            retry_only_idempotent=True,
+            initial_backoff_ms=0,
+            backoff_multiplier=2,
+            max_backoff_ms=2_000,
+        ),
+    )
+    var req = Request(method=String("PUT"), url=String("/"))
+    _ = retry.serve(req)
+    assert_equal(_read_counter(addr), 3)
+    _free_counter(addr)
+
+
+def test_retry_treats_delete_as_idempotent() raises:
+    """RFC 9110 §9.2.2 -- DELETE is idempotent. Same expectation
+    as PUT: the default policy retries the transient failure."""
+    var addr = _new_counter()
+    var inner = AlwaysFiveHundredHandler(ptr=addr)
+    var retry = Retry(
+        inner^,
+        RetryPolicy(
+            max_attempts=3,
+            retry_only_idempotent=True,
+            initial_backoff_ms=0,
+            backoff_multiplier=2,
+            max_backoff_ms=2_000,
+        ),
+    )
+    var req = Request(method=String("DELETE"), url=String("/"))
+    _ = retry.serve(req)
+    assert_equal(_read_counter(addr), 3)
+    _free_counter(addr)
+
+
+def test_retry_backoff_sleeps_between_attempts() raises:
+    """When ``initial_backoff_ms > 0`` the middleware naps before
+    the next attempt. We assert the wall-clock elapsed time is at
+    least the floor of the un-jittered schedule (full jitter draws
+    from ``[0, capped]`` so the *minimum* is 0 -- the upper bound
+    is what survives any jitter draw). To keep the test fast we
+    cap aggressively."""
+    var addr = _new_counter()
+    var inner = AlwaysFiveHundredHandler(ptr=addr)
+    var retry = Retry(
+        inner^,
+        RetryPolicy(
+            max_attempts=3,
+            retry_only_idempotent=True,
+            initial_backoff_ms=5,
+            backoff_multiplier=2,
+            max_backoff_ms=10,
+        ),
+    )
+    var req = Request(method=String("GET"), url=String("/"))
+    var t0 = perf_counter_ns()
+    _ = retry.serve(req)
+    var elapsed_ms = (perf_counter_ns() - t0) // 1_000_000
+    assert_equal(_read_counter(addr), 3)
+    # No assertion on a strict lower bound -- jitter can be 0 --
+    # but the upper bound must be sane: 3 attempts * 10 ms cap +
+    # generous noise.
+    assert_true(elapsed_ms < UInt(2_000))
     _free_counter(addr)
 
 
@@ -197,6 +306,9 @@ def main() raises:
     test_retry_gives_up_after_max_attempts()
     test_retry_skips_non_idempotent_methods_by_default()
     test_retry_with_idempotent_off_retries_post()
+    test_retry_treats_put_as_idempotent()
+    test_retry_treats_delete_as_idempotent()
+    test_retry_backoff_sleeps_between_attempts()
     test_timeout_passes_through_fast_handler()
     test_timeout_returns_504_on_zero_budget()
     print("test_reliability: OK")
