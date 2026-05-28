@@ -28,6 +28,8 @@ References:
 from std.collections import List
 from std.collections import Optional
 
+from ..http.proto.ascii import ascii_unchecked_string
+
 
 @fieldwise_init
 struct GrpcMetadataEntry(Copyable, Movable):
@@ -143,7 +145,9 @@ struct GrpcMetadata(Copyable, Defaultable, Movable):
             if self._entries[i].key == key:
                 if self._entries[i].is_binary:
                     raise Error("grpc metadata: key '" + key + "' is binary")
-                var s = String(unsafe_from_utf8=self._entries[i].value.copy())
+                var s = ascii_unchecked_string(
+                    Span[UInt8, _](self._entries[i].value)
+                )
                 return Optional[String](s)
         return Optional[String]()
 

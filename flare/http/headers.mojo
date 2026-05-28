@@ -6,6 +6,8 @@ lowercase mirror). Original casing is preserved for wire serialisation.
 
 from std.format import Writable, Writer
 
+from .proto.ascii import ascii_unchecked_string
+
 
 @always_inline
 def _eq_icase(a: String, b: String) -> Bool:
@@ -47,7 +49,7 @@ def _lower(s: String) -> String:
             dst[i] = c + 32
         else:
             dst[i] = c
-    return String(unsafe_from_utf8=Span[UInt8, _](buf))
+    return ascii_unchecked_string(Span[UInt8, _](buf))
 
 
 struct HeaderInjectionError(Copyable, Movable, Writable):

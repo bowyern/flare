@@ -55,6 +55,7 @@ from std.collections import Dict
 
 from .handler import Handler
 from .headers import HeaderMap
+from .proto.ascii import ascii_unchecked_string
 from .request import Request, Method
 from .response import Response, Status
 
@@ -108,11 +109,11 @@ def _split_static(path: StaticString) -> List[String]:
     while i < n:
         if p[i] == _SLASH:
             if i > start:
-                out.append(String(unsafe_from_utf8=s.as_bytes()[start:i]))
+                out.append(ascii_unchecked_string(s.as_bytes()[start:i]))
             start = i + 1
         i += 1
     if start < n:
-        out.append(String(unsafe_from_utf8=s.as_bytes()[start:n]))
+        out.append(ascii_unchecked_string(s.as_bytes()[start:n]))
     return out^
 
 
@@ -123,7 +124,7 @@ def _path_only(url: String) -> String:
     var p = url.unsafe_ptr()
     for i in range(n):
         if p[i] == _QMARK:
-            return String(unsafe_from_utf8=url.as_bytes()[0:i])
+            return ascii_unchecked_string(url.as_bytes()[0:i])
     return url
 
 
@@ -142,11 +143,11 @@ def _split_path(path: String) -> List[String]:
     while i < n:
         if p[i] == _SLASH:
             if i > start:
-                out.append(String(unsafe_from_utf8=path.as_bytes()[start:i]))
+                out.append(ascii_unchecked_string(path.as_bytes()[start:i]))
             start = i + 1
         i += 1
     if start < n:
-        out.append(String(unsafe_from_utf8=path.as_bytes()[start:n]))
+        out.append(ascii_unchecked_string(path.as_bytes()[start:n]))
     return out^
 
 
@@ -168,7 +169,7 @@ def _seg_is_wildcard(seg: String) -> Bool:
 @always_inline
 def _param_name(seg: String) -> String:
     """Strip the leading ``:`` from a param segment."""
-    return String(unsafe_from_utf8=seg.as_bytes()[1 : seg.byte_length()])
+    return ascii_unchecked_string(seg.as_bytes()[1 : seg.byte_length()])
 
 
 # ── ComptimeRouter ──────────────────────────────────────────────────────────

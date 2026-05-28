@@ -69,6 +69,8 @@ from flare.http.proto import (
     H2Connection,
     H2Stream,
     H2StreamState,
+    _ExperimentalH1LeniencyConfig,
+    ascii_unchecked_string,
 )
 
 
@@ -201,6 +203,21 @@ def test_simd_memmem_smoke() raises:
     assert_equal(hit, 4)
 
 
+def test_h1_leniency_default_is_strict() raises:
+    var cfg = _ExperimentalH1LeniencyConfig()
+    assert_true(not cfg.allow_lf_only_line_endings)
+    assert_true(not cfg.allow_obs_fold)
+
+
+def test_ascii_unchecked_string_reexport() raises:
+    var bytes = List[UInt8]()
+    for b in String("GET").as_bytes():
+        bytes.append(b)
+    var got = ascii_unchecked_string(Span[UInt8, _](bytes))
+    assert_equal(got, "GET")
+    assert_equal(ascii_unchecked_string(Span[UInt8, _](List[UInt8]())), "")
+
+
 def main() raises:
     test_cookie_roundtrip()
     test_form_urlencoded()
@@ -212,4 +229,6 @@ def main() raises:
     test_huffman_codec_smoke()
     test_h2_state_smoke()
     test_simd_memmem_smoke()
+    test_h1_leniency_default_is_strict()
+    test_ascii_unchecked_string_reexport()
     print("test_proto_reexports: OK")

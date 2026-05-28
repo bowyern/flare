@@ -21,6 +21,7 @@ from .intern import intern_method_bytes
 from .request import Request, Method
 from .response import Response, Status
 from .headers import HeaderMap
+from .proto.ascii import ascii_unchecked_string
 from .static_response import StaticResponse
 from ..http2.server import Http2Config
 from ..net import IpAddr, SocketAddr, NetworkError, BrokenPipe, Timeout
@@ -1866,27 +1867,19 @@ def _append_int(mut buf: List[UInt8], var n: Int):
 def _ascii_unchecked_string(span: Span[UInt8, _]) -> String:
     """Construct a ``String`` from ASCII bytes without UTF-8 validation.
 
-    ``String(unsafe_from_utf8=span)`` in Mojo 1.0.0b1 unconditionally
-    runs ``_is_valid_utf8_runtime`` even though the constructor name
-    suggests it skips validation -- a ``perf record`` on the H1
-    plaintext bench surfaced ``_is_valid_utf8_runtime`` as the single
-    hottest user-space symbol (~5% of CPU). This helper allocates an
-    uninitialised ``String`` of the exact length and memcpy's the
-    bytes directly into its buffer, sidestepping the validator
-    entirely.
+    Thin wrapper over the canonical
+    :func:`flare.http.proto.ascii.ascii_unchecked_string` helper,
+    kept under this module's namespace because the H1 reactor
+    code throughout :mod:`flare.http._server_reactor_impl` and
+    this file imports it locally; the canonical helper lives in
+    the sans-I/O parser layer (closes critique register §C4).
 
-    Caller contract: the bytes MUST already be valid ASCII (< 0x80).
-    HTTP/1.1 wire artefacts -- method, URL, version, header name,
-    header value -- all satisfy this via the RFC 7230 token / VCHAR
-    checks the parser already runs upstream; we never get here with
-    a non-ASCII byte.
+    Caller contract: the bytes MUST already be valid ASCII
+    (< 0x80). HTTP/1.1 wire artefacts -- method, URL, version,
+    header name, header value -- all satisfy this via the RFC
+    7230 token / VCHAR checks the parser already runs upstream.
     """
-    var n = len(span)
-    if n == 0:
-        return String("")
-    var s = String(unsafe_uninit_length=n)
-    memcpy(dest=s.unsafe_ptr_mut(), src=span.unsafe_ptr(), count=n)
-    return s^
+    return ascii_unchecked_string(span)
 
 
 @always_inline

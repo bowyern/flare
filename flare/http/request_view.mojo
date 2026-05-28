@@ -57,6 +57,7 @@ from std.memory import memcpy
 
 from .header_view import HeaderMapView, parse_header_view
 from .headers import HeaderMap
+from .proto.ascii import ascii_unchecked_string
 from .request import Request
 from ..net import IpAddr, SocketAddr
 
@@ -301,14 +302,14 @@ def parse_request_view[
     else:
         url_start = sp1 + 1
         url_len = sp2 - url_start
-        version = String(unsafe_from_utf8=data[sp2 + 1 : line_end_excl])
+        version = ascii_unchecked_string(data[sp2 + 1 : line_end_excl])
 
     if url_len > max_uri_length:
         raise Error(
             "request URI exceeds limit of " + String(max_uri_length) + " bytes"
         )
 
-    var method = String(unsafe_from_utf8=data[0:sp1])
+    var method = ascii_unchecked_string(data[0:sp1])
 
     # Headers: from after the request line's CRLF to the empty
     # CRLF that terminates the header block.

@@ -5,6 +5,7 @@ from std.memory import UnsafePointer, alloc
 from json import loads, Value
 from .headers import HeaderMap
 from .cookie import Cookie, CookieJar, parse_cookie_header
+from .proto.ascii import ascii_unchecked_string
 from ..net import IpAddr, SocketAddr
 
 
@@ -300,10 +301,8 @@ struct Request(Movable):
                         break
                 if matched:
                     if eq < pair_end:
-                        return String(
-                            unsafe_from_utf8=self.url.as_bytes()[
-                                eq + 1 : pair_end
-                            ]
+                        return ascii_unchecked_string(
+                            self.url.as_bytes()[eq + 1 : pair_end]
                         )
                     return ""
             cursor = pair_end + 1

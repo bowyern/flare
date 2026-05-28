@@ -49,6 +49,7 @@ from std.memory import ArcPointer
 from ..runtime import Pool
 from .handler import Handler, FnHandler
 from .headers import HeaderMap
+from .proto.ascii import ascii_unchecked_string
 from .request import Request, Method
 from .response import Response, Status
 from .server import not_found
@@ -97,11 +98,11 @@ def _split_path(path: String) -> List[String]:
     while i < n:
         if p[i] == _SLASH:
             if i > start:
-                out.append(String(unsafe_from_utf8=path.as_bytes()[start:i]))
+                out.append(ascii_unchecked_string(path.as_bytes()[start:i]))
             start = i + 1
         i += 1
     if start < n:
-        out.append(String(unsafe_from_utf8=path.as_bytes()[start:n]))
+        out.append(ascii_unchecked_string(path.as_bytes()[start:n]))
     return out^
 
 
@@ -122,9 +123,7 @@ def _compile_segments(path: String) raises -> List[_Segment]:
                 raise Error("wildcard '*' must be the last segment in a route")
             segs.append(_Segment(2, "*"))
         elif sn >= 2 and sp[0] == _COLON:
-            segs.append(
-                _Segment(1, String(unsafe_from_utf8=s.as_bytes()[1:sn]))
-            )
+            segs.append(_Segment(1, ascii_unchecked_string(s.as_bytes()[1:sn])))
         else:
             segs.append(_Segment(0, s))
     return segs^
@@ -641,7 +640,7 @@ def _path_only(url: String) -> String:
     var p = url.unsafe_ptr()
     for i in range(n):
         if p[i] == _QMARK:
-            return String(unsafe_from_utf8=url.as_bytes()[0:i])
+            return ascii_unchecked_string(url.as_bytes()[0:i])
     return url
 
 

@@ -40,6 +40,7 @@ holding 4 * 12 ints.
 """
 
 from .headers import HeaderMap, _eq_icase
+from .proto.ascii import ascii_unchecked_string
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -205,8 +206,8 @@ struct HeaderMapView[origin: Origin](Movable):
             var nlen = self._offsets[i * 4 + 1]
             var vstart = self._offsets[i * 4 + 2]
             var vlen = self._offsets[i * 4 + 3]
-            var k = String(unsafe_from_utf8=self.buf[nstart : nstart + nlen])
-            var v = String(unsafe_from_utf8=self.buf[vstart : vstart + vlen])
+            var k = ascii_unchecked_string(self.buf[nstart : nstart + nlen])
+            var v = ascii_unchecked_string(self.buf[vstart : vstart + vlen])
             out.set(k, v)
         return out^
 
