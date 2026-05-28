@@ -60,7 +60,8 @@ basics.
 | [`infallible_handler.mojo`](../examples/intermediate/infallible_handler.mojo) | `HandlerInfallible` + `WithRaises` adapter for provably no-`raises` paths |
 | [`trailers.mojo`](../examples/intermediate/trailers.mojo) | HTTP/1.1 trailer fields (gRPC-style status trailer): `Response.trailers`, `Trailer:` header, smuggling guard |
 | [`multi_listener.mojo`](../examples/intermediate/multi_listener.mojo) | `HttpServer.bind_many` over multiple distinct addresses, single accept loop |
-| [`reliability.mojo`](../examples/intermediate/reliability.mojo) | `Retry[Inner]` + `TimeoutMiddleware[Inner]` + `RetryPolicy` -- idempotent-method gate, exponential backoff, sanitised 504 |
+| [`reliability.mojo`](../examples/intermediate/reliability.mojo) | `Retry[Inner]` + `PostHocDeadline[Inner]` + `RetryPolicy` -- RFC 9110 §9.2.2 idempotent-method gate (GET / HEAD / PUT / DELETE / OPTIONS), opt-in exponential backoff with jitter (`backoff_base_ms` / `backoff_max_ms` / `backoff_jitter_ms`), post-hoc 504 wall-clock guard |
+| [`http_cache.mojo`](../examples/intermediate/http_cache.mojo) | `Cache[Inner, S]` middleware over an `InMemoryCacheStore` -- RFC 9111 freshness check on `CacheEntry.is_fresh`, `Vary`-aware secondary key, conditional revalidation (`If-None-Match` / `If-Modified-Since` + 304 folding back into the cached entry) |
 | [`template_inheritance.mojo`](../examples/intermediate/template_inheritance.mojo) | Single-level template inheritance: parent layout + child overrides via `{% block %}` / `{% extends %}` / `Template.render_extending` |
 
 ## Advanced — comptime, low-level reactor, HTTP/2, mTLS, work-stealing
@@ -137,6 +138,7 @@ natural.
 | Stand up a production-shaped server (RequestId + structured logs + graceful shutdown + healthz) | [`production_setup.mojo`](../examples/advanced/production_setup.mojo) |
 | Reuse markup via template inheritance (`{% block %}` / `{% extends %}`) | [`template_inheritance.mojo`](../examples/intermediate/template_inheritance.mojo) |
 | Retry idempotent requests + bound handler latency | [`reliability.mojo`](../examples/intermediate/reliability.mojo) |
+| Cache GET responses with RFC 9111 freshness + revalidation | [`http_cache.mojo`](../examples/intermediate/http_cache.mojo) |
 
 ## Reading data from a `Request`
 

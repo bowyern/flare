@@ -1,3 +1,11 @@
+# TODO(v0.9): decompose into _reactor/*.mojo + collapse the three loop
+# variants (run_unified_reactor_loop / _multi / _shared) via comptime
+# config flags. v0.8 §B3 already extracted the per-tick body into the
+# shared _unified_poll_once core; the three outer wrappers remain
+# separate because they differ in listener ownership (single fd vs.
+# per-worker SO_REUSEPORT vs. shared EPOLLEXCLUSIVE). v0.9 folds those
+# into one comptime-parametric `run_unified_reactor_loop[listener_policy]`.
+
 """Unified reactor loop: HTTP/1.1 + HTTP/2 on the same listener.
 
 Wires :class:`flare.http._server_reactor_impl.ConnHandle` (HTTP/1.1)

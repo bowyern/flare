@@ -103,7 +103,13 @@ flare.utils    - POSIX FFI thunks (fork / waitpid / kill / usleep /
                  exit / getpid) the Mojo stdlib doesn't expose yet
 ```
 
-Each layer only imports from layers below it. No circular dependencies.
+Each layer mostly imports from layers below it. Two known cross-layer
+dependencies are tracked as v0.9 refactor debt: ``flare.runtime``'s
+scheduler imports ``flare.http`` to construct workers, and
+``flare.http`` re-imports ``flare.http2`` for the unified reactor
+dispatch. See the ``TODO(v0.9)`` / ``NOTE(v0.9)`` headers in
+``flare/http/_server_reactor_impl.mojo`` and
+``flare/http/_unified_reactor_impl.mojo`` for the breakup plan.
 
 ## HTTP requests
 

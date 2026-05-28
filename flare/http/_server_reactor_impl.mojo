@@ -1,3 +1,9 @@
+# TODO(v0.9): decompose into _reactor/*.mojo (per-conn state machine, accept
+# loop, write queue, idle-timer wiring) + collapse the three poll variants
+# (run_unified_reactor_loop / _multi / _shared) via comptime config flags.
+# This 3700-line file is the v0.9 reactor-decomposition headline track per
+# the .cursor/rules/critisize-0.8.mdc register §1.
+
 """Per-connection state machine for the reactor-backed HTTP server.
 
 Owns the per-connection buffer and walks a small state machine driven by
@@ -55,6 +61,11 @@ from flare.http.server import (
 from flare.http.static_response import StaticResponse
 
 
+# NOTE(v0.9): break the http <-> http2 import cycle by extracting the
+# shared wire types (HeaderMap field discipline, h2c upgrade detection,
+# preface peek) into a new flare.http.wire module. The local _inline
+# helper below exists solely to avoid the http -> http2 -> http cycle;
+# the cleanup is tracked in the v0.9 design register §2.
 @always_inline
 def _detect_h2c_upgrade_inline(headers: HeaderMap) -> Bool:
     """Inline copy of :func:`flare.http2.server.detect_h2c_upgrade`.

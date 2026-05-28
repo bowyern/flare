@@ -1,8 +1,13 @@
 # Architecture
 
-flare is a layered library. Higher layers depend on lower layers (peer
-modules at the same layer don't import each other). No global state, no
-hidden runtime.
+flare is a layered library. Higher layers depend on lower layers and peer
+modules at the same layer don't import each other — with two known
+cross-layer dependencies tracked as v0.9 refactor debt: `flare.runtime`'s
+scheduler module imports `flare.http` to construct workers, and `flare.http`
+re-imports `flare.http2` for the unified reactor dispatch (the cycle is
+broken by extracting wire types to `flare.http.wire` in v0.9; see the
+`TODO(v0.9)` headers in `flare/http/_server_reactor_impl.mojo` and
+`flare/http/_unified_reactor_impl.mojo`). No global state, no hidden runtime.
 
 ```
 flare.io       BufReader (Readable trait, generic buffered reader)
@@ -38,36 +43,39 @@ flare.http2    Low-level HTTP/2 byte drivers (RFC 9113 +
                h2c upgrade detection (preface peek + Upgrade
                dance), per-stream RST_STREAM Cancel
                propagation, ALPN dispatch helper.
-flare.http     HTTP/1.1 client + reactor server + Handler / Router / App
+flare.http     HTTP/1.1 client + reactor server + Handler / Router
                + extractors (incl. Form / Multipart / Cookies)
                + ComptimeRouter + StaticResponse + Cancel / CancelHandler
                + middleware stack (Logger / RequestId / Compress
-               / CatchPanic / Retry / Timeout)
+               / CatchPanic / Retry / PostHocDeadline)
                + Cors + FileServer (with HEAD + Range)
+               + Cache[Inner, S] (RFC 9111 wrapping middleware --
+               freshness check, conditional revalidation, Vary-
+               aware secondary keying)
                + content-encoding (gzip + brotli)
                + signed cookies + typed Session[T] stores
                + HTTP/1.1 trailers (parse + emit) + multi-listener
                HttpServer.bind_many + HttpClient.with_pool
                connection pool + h2c-via-Upgrade client.
                Sans-I/O parser sublayer under flare.http.proto.*
-               with H1LeniencyConfig knobs; conformance corpora
-               under conformance/h1/ + conformance/ws/.
-               Template engine with single-level inheritance via
-               {% block %} + {% extends %}. RFC 9111 cache
-               primitives -- CacheControl directive parser,
-               CacheKey + Vary-aware keying, bounded LRU
-               InMemoryCacheStore (the unified Cache[Inner, S]
-               middleware wrapper + FilesystemCacheStore land
-               on top of these primitives later). Router is Copyable
-               (refcounted struct-handler list) and resolves the
-               multi-worker overload directly.
-flare.grpc     gRPC primitives on the flare.http2 reactor:
-               length-prefixed message framing, canonical
-               Status codes, Metadata carrier (binary / text
-               key discipline).  Service / stub generation +
-               streaming call shapes + grpc-go interop subset
-               ship in a later release on top of these
-               primitives.
+               with _ExperimentalH1LeniencyConfig (future-policy
+               knobs; strict default is the only wire shape
+               v0.8 enforces); conformance corpora under
+               conformance/h1/ + conformance/ws/. Template
+               engine with single-level inheritance via {% block %}
+               + {% extends %}. RFC 9111 cache primitives --
+               CacheControl directive parser, CacheKey + Vary-
+               aware keying, bounded FIFO InMemoryCacheStore
+               with parsed freshness on CacheEntry.is_fresh.
+               Router is Copyable (refcounted struct-handler list)
+               and resolves the multi-worker overload directly.
+flare.grpc     Sans-I/O gRPC codec primitives: length-prefixed
+               message framing (LPM), canonical Status codes,
+               Metadata carrier (binary / text key discipline).
+               The HTTP/2 server adapter (request dispatch into
+               unary / server-streaming / client-streaming /
+               bidi shapes, grpc-go interop) ships in v0.9 on
+               top of these wire primitives.
 flare.openapi  OpenAPI 3.1 spec model + deterministic JSON
                emitter (stable key order for diffable specs).
                Auto-derivation from ComptimeRouter +

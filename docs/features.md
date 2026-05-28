@@ -67,8 +67,7 @@ an example file. For layering and the request lifecycle, see
 |---|---|
 | `Router` — runtime trie with path parameters (`:name`), wildcards (`*`), method dispatch, 404 / 405-with-`Allow`. `Handler & Copyable & Movable` so `srv.serve(router^, num_workers=N)` resolves to the multi-worker overload; boxed struct handlers shared across worker copies via an Arc-style refcount | [`router.mojo`](../examples/basic/router.mojo), [`tests/http/test_router_copy.mojo`](../tests/http/test_router_copy.mojo) |
 | `ComptimeRouter[ROUTES]`, `ComptimeRoute(method, path, handler)` — segments parsed at compile time, dispatch loop unrolled per route | [`comptime_router.mojo`](../examples/advanced/comptime_router.mojo) |
-| `App[S, H]` — application-scoped state bundled with a handler; `state_view()` hands out a `State[S]` borrow that middleware can read or mutate | [`state.mojo`](../examples/intermediate/state.mojo) |
-| `State[S]` typed handle, `state.get()` borrow | [`state.mojo`](../examples/intermediate/state.mojo) |
+| Application-scoped state via captured handlers — wrap your handler in a struct that holds shared state by value; for shared mutation, use a `flare.runtime.Pool` heap-address handle | [`state.mojo`](../examples/intermediate/state.mojo) |
 
 ## Handlers and extractors
 
@@ -128,24 +127,24 @@ by nesting structs:
 | `Cors[Inner]` + `CorsConfig` | WHATWG Fetch CORS protocol; permissive / allowlist / preflight short-circuit / credentials echo / exposed-headers / max-age | [`cors.mojo`](../examples/intermediate/cors.mojo) |
 | `Conditional[Inner]` | RFC 9110 §13 preconditions: `If-Match` / `If-None-Match` (304 / 412), `If-Modified-Since` / `If-Unmodified-Since`; opt-in auto-ETag from FNV-1a body hash via `Conditional.with_auto_etag` | `flare.http.conditional` |
 | `FileServer.new(root)` | Static file serving with GET / HEAD + RFC 9110 §14.4 single-Range, MIME inference, path safety (`..` / NUL / absolute path rejection), `index.html` directory fall-through | [`static_files.mojo`](../examples/intermediate/static_files.mojo) |
-| `Retry[Inner]` + `RetryPolicy` | Re-invoke the inner handler up to `max_attempts` times on 5xx; idempotent-method gate on by default (GET / HEAD / PUT / DELETE / OPTIONS retry; POST / PATCH pass through once unless `retry_only_idempotent` is `False`) | [`reliability.mojo`](../examples/intermediate/reliability.mojo) |
-| `TimeoutMiddleware[Inner]` (`flare.http.Timeout`) | Bound the inner handler's wall-clock time; on overrun, the response is replaced with a sanitised 504; `budget_ms <= 0` is the explicit "disabled" sentinel that always trips 504 | [`reliability.mojo`](../examples/intermediate/reliability.mojo) |
+| `Retry[Inner]` + `RetryPolicy` | Re-invoke the inner handler up to `max_attempts` times on 5xx; RFC 9110 §9.2.2 idempotent-method gate on by default (GET / HEAD / PUT / DELETE / OPTIONS retry; POST / PATCH pass through once unless `retry_only_idempotent` is `False`). Optional exponential backoff with jitter via `RetryPolicy(backoff_base_ms, backoff_max_ms, backoff_jitter_ms)` | [`reliability.mojo`](../examples/intermediate/reliability.mojo) |
+| `PostHocDeadline[Inner]` | **Post-hoc** wall-clock guard: invokes the inner handler synchronously, then if the elapsed time exceeds `budget_ms`, replaces the response with a sanitised 504. Does **not** cancel the inner handler mid-execution -- it only refuses the response that was produced too late. `budget_ms <= 0` is the explicit "disabled" sentinel that always trips 504. The real cancel-cell wiring lives in v0.9 | [`reliability.mojo`](../examples/intermediate/reliability.mojo) |
 | `negotiate_encoding(Accept-Encoding) -> Encoding` | RFC 9110 §12.5.3 q-value parser exposed for direct use | `flare.http.middleware` |
 
 ## HTTP caching (RFC 9111)
 
-Cache primitives and a bounded in-memory store. The
-directive parser and key derivation are ready to wire into
-custom middleware today; the unified `Cache[Inner, S]`
-wrapper is a follow-up that builds on these primitives.
+Cache primitives, an in-memory store, and a wrapping `Cache[Inner, S]`
+middleware that handles RFC 9111 freshness and conditional revalidation.
 
 | Surface | Where |
 |---|---|
+| `Cache[Inner, S]` — wrapping middleware: on cache hit + fresh-per-RFC-9111 entry, returns the stored response without invoking `Inner`; on miss / stale, runs `Inner` and stores the response (subject to `Cache-Control` directives). Conditional revalidation forwards `If-None-Match` / `If-Modified-Since` to upstream and folds 304 into the cached entry | [`http_cache.mojo`](../examples/intermediate/http_cache.mojo) |
 | `parse_cache_control(headers) -> CacheControl` — RFC 9111 §5.2 directive parser (max-age, s-maxage, no-cache, no-store, private, public, must-revalidate, proxy-revalidate, immutable, stale-while-revalidate, stale-if-error) | `flare.http.cache.control` |
 | `CacheControl` — typed directive struct with the full RFC 9111 §5.2 surface | `flare.http.cache.control` |
-| `derive_cache_key(request) -> CacheKey`, `CacheKey` — method + canonical URL + `Vary`-aware key | `flare.http.cache.key` |
-| `CacheStore` trait + `InMemoryCacheStore(capacity)` — bounded LRU store with `get` / `put` / `invalidate`; freshness logic carried on `CacheEntry` | `flare.http.cache.store` |
-| `CacheEntry` — stored response payload + cache-control metadata + per-entry freshness timestamps | `flare.http.cache.store` |
+| `parse_vary_header(headers) -> List[String]` — RFC 9111 §4.1 `Vary:` parser feeding the secondary cache-key derivation | `flare.http.cache.control` |
+| `derive_cache_key(request) -> CacheKey`, `CacheKey` — method + canonical URL + `Vary`-aware secondary key | `flare.http.cache.key` |
+| `CacheStore` trait + `InMemoryCacheStore(capacity)` — bounded FIFO store with `get` / `put` / `remove`; freshness logic lives on `CacheEntry` (parsed `CacheControl` + `Vary` carried at insert time so the lookup path doesn't re-parse) | `flare.http.cache.store` |
+| `CacheEntry.is_fresh(now_ms)` — RFC 9111 §4.2 freshness check against the entry's parsed directives and `Date:` baseline | `flare.http.cache.store` |
 
 ## Cookies, sessions, auth
 
@@ -224,8 +223,10 @@ Sans-I/O codec primitives for QUIC v1 (RFC 9000) and HTTP/3
 (RFC 9114). Codecs only — the QUIC reactor, the TLS-on-UDP
 FFI, and the congestion-controller drive land alongside the
 QUIC server in a later release. The codecs are byte-clean
-against fixtures from `aioquic` + `quiche` and carry their
-own fuzz harnesses.
+against fixtures from `aioquic` + `quiche` and covered by
+the dedicated `fuzz-quic-varint`, `fuzz-quic-long-header`,
+and `fuzz-h3-frame` harnesses listed in the
+[fuzz coverage table](#testing-and-fuzz-coverage).
 
 | Surface | Where |
 |---|---|
@@ -237,11 +238,11 @@ own fuzz harnesses.
 
 ## gRPC
 
-Sans-I/O gRPC primitives on top of the `flare.http2` reactor.
-Ships the wire-level surface (LPM framing, canonical Status
-codes, Metadata carrier) that higher-level call shapes
-build on; service / stub generation lives in a follow-up
-module.
+Sans-I/O gRPC codec primitives — wire-level surface only
+(LPM framing, canonical Status codes, Metadata carrier).
+The HTTP/2 server adapter that translates these into an
+end-to-end gRPC server ships in v0.9, per the design
+register.
 
 | Surface | Where |
 |---|---|
@@ -416,7 +417,7 @@ Tests under [`tests/`](../tests/) mirror the package layout:
 |---|---|
 | Unit + integration tests | 600+ across `tests/` |
 | Examples (each part of `pixi run tests`) | 40+ under [`examples/`](../examples/) |
-| Fuzz harnesses | 35 under [`fuzz/`](../fuzz/), 8M+ runs combined, zero known crashes |
+| Fuzz harnesses | 40 under [`fuzz/`](../fuzz/), 9M+ runs combined, zero known crashes |
 | Sanitizer harnesses | `tests-asan` / `tests-tsan` / `tests-asserts-all` (see [`build.md`](build.md)) |
 | Conformance corpora | RFC 7230 HTTP/1 wire shapes under [`conformance/h1/`](../conformance/h1/) (runner: `test-conformance-h1`); RFC 6455 WebSocket frames under [`conformance/ws/`](../conformance/ws/) (runner: `test-conformance-ws`, 13 fixtures; Autobahn-anchored case ids 1.x / 2.x / 3.x / 5.x / 7.x) |
 
@@ -456,3 +457,8 @@ Per-harness breakdown (input → fuzzer):
 | HAProxy PROXY v1 + v2 | `fuzz-proxy-protocol` |
 | io_uring SQE / CQE codec | `fuzz-io-uring-sqe` |
 | io_uring reactor cancel-surface | `fuzz-uring-reactor` |
+| gRPC LPM message decoder | `fuzz-grpc-lpm-decoder` |
+| QUIC varint codec (canonical round-trip + non-shortest policy) | `fuzz-quic-varint` |
+| QUIC long header parser (consumed-bytes invariant) | `fuzz-quic-long-header` |
+| HTTP/3 frame codec (multi-byte varint frame types) | `fuzz-h3-frame` |
+| Cache-Control header parser (idempotent re-parse) | `fuzz-cache-control-parser` |
