@@ -298,49 +298,56 @@ def _accept_loop_fd(
                 pass
 
 
-def run_reactor_loop[
-    H: Handler
+def _run_handler_loop_impl[
+    H: Handler, is_shared: Bool
 ](
-    mut listener: TcpListener,
+    listener_fd: Int,
     config: ServerConfig,
     ref handler: H,
     ref stopping: Bool,
 ) raises:
-    """Run the single-threaded event loop until ``stopping`` becomes True.
+    """Shared epoll/kqueue event-loop body for the dynamic-handler path.
 
-    The caller (``HttpServer.serve``) owns the listener and provides the
-    request handler. This function owns the ``Reactor`` and ``TimerWheel``
-    for the duration of the loop.
+    Drives both the dedicated-listener (``run_reactor_loop``) and the
+    multi-worker shared-listener (``run_reactor_loop_shared``) entry
+    points; the public surfaces are thin wrappers that fan into this
+    body with ``is_shared`` chosen at the callsite. The two paths
+    differed only in (a) ``register`` vs ``register_exclusive`` for
+    the listener token and (b) the byte-equivalent accept drainer
+    -- folding both into one comptime-parameterised body deletes a
+    full ~120 lines of duplicated event / timer / fast-path code.
+
+    On Linux >= 4.5 ``register_exclusive`` sets ``EPOLLEXCLUSIVE`` so
+    the kernel wakes only one worker per accept event; on macOS the
+    flag is unavailable and the call falls back to plain ``register``
+    (the wakeup pattern degrades to "wake-all, one-wins" but
+    practical behaviour is similar because non-blocking ``accept``
+    returns ``EAGAIN`` on the losers).
 
     Args:
-        listener: Bound and listening ``TcpListener`` (ownership stays
-            with the caller; we only borrow for accept / fd access).
-        config: Server configuration.
-        handler: Per-request callback.
-        stopping: Checked on every poll iteration; when True the loop
-            exits and in-flight connections are closed. ``stopping`` is
-            re-read each iteration via a fresh external pointer so the
-            compiler cannot hoist the load out of the loop — the
-            multicore ``Scheduler`` mutates it from another thread.
+        listener_fd: Listener fd. The dedicated path obtains it from
+            its owned ``TcpListener``; the shared path borrows it
+            from the multi-worker scheduler. Either way this body
+            never closes the fd.
+        config: Per-worker / per-server ``ServerConfig``.
+        handler: Per-request callback (borrowed for the lifetime of
+            the loop).
+        stopping: Heap-allocated stop flag; re-read every iteration
+            via a fresh externally-mutated pointer so the optimiser
+            cannot LICM-hoist the load. The owning ``Scheduler`` (or
+            the dedicated-path caller) flips it on shutdown.
     """
-    listener._socket.set_nonblocking(True)
-    var listener_fd = listener._socket.fd
-
     var reactor = Reactor()
     var wheel = TimerWheel(now_ms=UInt64(_monotonic_ms()))
     var conns = Dict[Int, Int]()
     var timers = Dict[Int, UInt64]()
 
-    # Token 0 is reserved for the listener accept path.
-    reactor.register(listener_fd, UInt64(0), INTEREST_READ)
+    comptime if is_shared:
+        reactor.register_exclusive(c_int(listener_fd), UInt64(0), INTEREST_READ)
+    else:
+        reactor.register(c_int(listener_fd), UInt64(0), INTEREST_READ)
 
     var events = List[Event]()
-    # Take the address of the caller's ``stopping`` Bool once, then
-    # re-materialise a fresh ``UnsafePointer`` with ``MutExternalOrigin``
-    # inside the loop condition on every iteration. This defeats any
-    # LICM / load-forwarding the optimiser might otherwise do: from
-    # Mojo's point of view each iteration sees a brand-new pointer of
-    # externally-mutated origin, which it must re-load.
     var stopping_addr = Int(UnsafePointer[Bool, _](to=stopping))
     while not UnsafePointer[Bool, MutExternalOrigin](
         unsafe_from_address=stopping_addr
@@ -364,7 +371,7 @@ def run_reactor_loop[
             if evt.is_wakeup():
                 continue
             if evt.token == UInt64(0):
-                _accept_loop(listener, reactor, conns)
+                _accept_loop_fd(listener_fd, reactor, conns)
                 continue
             var fd = Int(evt.token)
             if fd not in conns:
@@ -377,12 +384,12 @@ def run_reactor_loop[
                     last_step = ch_ptr[].on_readable(handler, config)
                     step_done = last_step.done
                     # Fast path: while the state machine is cycling
-                    # (readable -> writable on request, writable -> readable
-                    # on keep-alive), drive the next step inline rather
-                    # than bouncing through the reactor. This is the
-                    # single biggest win on TFB plaintext with keep-alive.
-                    # Cap at 3 cycles so malicious pipelining can't starve
-                    # other fds.
+                    # (readable -> writable on request, writable ->
+                    # readable on keep-alive), drive the next step
+                    # inline rather than bouncing through the
+                    # reactor. The single biggest win on TFB
+                    # plaintext with keep-alive. Cap at 3 cycles so
+                    # malicious pipelining can't starve other fds.
                     var cycles = 0
                     while (not step_done) and cycles < 3:
                         cycles += 1
@@ -397,9 +404,6 @@ def run_reactor_loop[
                             and len(ch_ptr[].read_buf) > 0
                             and ch_ptr[].state == STATE_READING
                         ):
-                            # We have buffered bytes from the last recv
-                            # that might be a pipelined request. Drive
-                            # the state machine once more.
                             last_step = ch_ptr[].on_readable(handler, config)
                             step_done = last_step.done
                         else:
@@ -414,12 +418,44 @@ def run_reactor_loop[
             if step_done:
                 _cleanup_conn(fd, conns, timers, reactor)
 
-    # Graceful shutdown: close all active connections.
+    # Graceful shutdown: close every per-conn fd. The listener fd
+    # is owned by the caller in both modes (Scheduler in the shared
+    # case; the wrapper's ``mut TcpListener`` in the dedicated case)
+    # and is never closed here.
     var leftover = List[Int]()
     for kv in conns.items():
         leftover.append(kv.key)
     for i in range(len(leftover)):
         _cleanup_conn(leftover[i], conns, timers, reactor)
+
+
+def run_reactor_loop[
+    H: Handler
+](
+    mut listener: TcpListener,
+    config: ServerConfig,
+    ref handler: H,
+    ref stopping: Bool,
+) raises:
+    """Run the single-threaded event loop until ``stopping`` becomes True.
+
+    The caller (``HttpServer.serve``) owns the listener and provides
+    the request handler. This function delegates the loop body to
+    :func:`_run_handler_loop_impl` with ``is_shared=False`` so the
+    listener registers without ``EPOLLEXCLUSIVE``.
+
+    Args:
+        listener: Bound and listening ``TcpListener`` (ownership stays
+            with the caller; we only borrow for accept / fd access).
+        config: Server configuration.
+        handler: Per-request callback.
+        stopping: Checked on every poll iteration; when True the loop
+            exits and in-flight connections are closed.
+    """
+    listener._socket.set_nonblocking(True)
+    _run_handler_loop_impl[H, is_shared=False](
+        Int(listener._socket.fd), config, handler, stopping
+    )
 
 
 def run_reactor_loop_shared[
@@ -432,51 +468,77 @@ def run_reactor_loop_shared[
 ) raises:
     """Worker reactor loop sharing a single listener fd across workers.
 
-    multi-worker entry point. Functionally identical to
-    ``run_reactor_loop`` but:
-
-    1. ``listener_fd`` is borrowed from the ``Scheduler`` (the
-       ``Scheduler`` owns the underlying ``TcpListener`` and closes
-       it on shutdown). This worker never closes ``listener_fd``.
-    2. The listener is registered with ``Reactor.register_exclusive``
-       so the kernel sets ``EPOLLEXCLUSIVE`` on Linux (>= 4.5),
-       waking only one worker per accept event. On macOS the flag
-       is unavailable and registration falls back to plain
-       ``register`` — the wakeup pattern degrades to "wake-all,
-       one-wins" but practical behaviour is similar because
-       non-blocking ``accept`` returns ``EAGAIN`` on the losers.
+    Multi-worker entry point. Delegates to :func:`_run_handler_loop_impl`
+    with ``is_shared=True`` so the listener registers with
+    ``EPOLLEXCLUSIVE`` (Linux >= 4.5; falls back to plain register on
+    macOS) and the kernel wakes only one worker per accept event.
 
     The fairness improvement vs ``bind_reuseport`` is in the
-    accept-time distribution: instead of the kernel hashing each
-    new 4-tuple to one of N listeners (variance: a 256-conn storm
-    can land 80+ on one worker, 30 on another), every new accept
-    is offered to the worker that's currently waiting in
-    ``epoll_wait``. Idle workers absorb spikes; busy workers
-    aren't burdened with extra conns. The
-    ``benchmark/configs/throughput_mc.yaml`` p99 collapses from
-    seconds to milliseconds with this entry point (see
-    ``the design notes``).
+    accept-time distribution: instead of the kernel hashing each new
+    4-tuple to one of N listeners (variance: a 256-conn storm can
+    land 80+ on one worker, 30 on another), every new accept is
+    offered to the worker that's currently waiting in ``epoll_wait``.
+    Idle workers absorb spikes; busy workers aren't burdened with
+    extra conns.
 
     Args:
-        listener_fd: Listener fd, owned by the ``Scheduler``. Must
-            be in non-blocking mode before calling (the
-            ``Scheduler`` configures this once at bind time).
+        listener_fd: Listener fd, owned by the ``Scheduler``. Must be
+            in non-blocking mode before calling (the ``Scheduler``
+            configures this once at bind time). This worker never
+            closes ``listener_fd``.
         config: Per-worker copy of ``ServerConfig``.
         handler: Per-worker copy of ``H``.
-        stopping: Heap-allocated stop flag; ``Scheduler``
-            mutates it from another thread on shutdown. Re-read
-            each iteration via a fresh external pointer so the
-            compiler cannot LICM-hoist the load.
+        stopping: Heap-allocated stop flag mutated by the
+            ``Scheduler`` from another thread on shutdown.
+    """
+    _run_handler_loop_impl[H, is_shared=True](
+        listener_fd, config, handler, stopping
+    )
+
+
+def _run_static_loop_impl[
+    is_shared: Bool
+](
+    listener_fd: Int,
+    config: ServerConfig,
+    resp: StaticResponse,
+    ref stopping: Bool,
+) raises:
+    """Shared epoll/kqueue event-loop body for the static-response path.
+
+    Drives both :func:`run_reactor_loop_static` (dedicated listener)
+    and :func:`run_reactor_loop_static_shared` (multi-worker shared
+    listener). The two paths differed only in (a) ``register`` vs
+    ``register_exclusive`` for the listener token and (b) the
+    byte-equivalent accept drainer; folding both into one
+    comptime-parameterised body deletes ~120 lines of duplicate
+    event / timer / fast-path code.
+
+    Per-connection drive goes through
+    :meth:`ConnHandle.on_readable_static`: scan to ``\\r\\n\\r\\n`` +
+    ``Content-Length``, ``memcpy`` the canned bytes into ``write_buf``,
+    flush. No ``Request`` allocation, no handler call, no response
+    serialisation. Combined with the shared-listener variant this is
+    the fastest path flare exposes for fixed-response endpoints.
+
+    Args:
+        listener_fd: Listener fd, never closed here. The dedicated
+            wrapper extracts it from its owned ``TcpListener``; the
+            shared wrapper borrows it from the ``StaticScheduler``.
+        config: Per-worker / per-server ``ServerConfig``.
+        resp: Pre-encoded static response (immutable).
+        stopping: Heap-allocated stop flag re-read every iteration
+            via a fresh externally-mutated pointer (LICM defeat).
     """
     var reactor = Reactor()
     var wheel = TimerWheel(now_ms=UInt64(_monotonic_ms()))
     var conns = Dict[Int, Int]()
     var timers = Dict[Int, UInt64]()
 
-    # EPOLLEXCLUSIVE on Linux; plain register on macOS. Token 0 is
-    # reserved for the listener accept path (same convention as
-    # ``run_reactor_loop``).
-    reactor.register_exclusive(c_int(listener_fd), UInt64(0), INTEREST_READ)
+    comptime if is_shared:
+        reactor.register_exclusive(c_int(listener_fd), UInt64(0), INTEREST_READ)
+    else:
+        reactor.register(c_int(listener_fd), UInt64(0), INTEREST_READ)
 
     var events = List[Event]()
     var stopping_addr = Int(UnsafePointer[Bool, _](to=stopping))
@@ -512,7 +574,7 @@ def run_reactor_loop_shared[
             try:
                 var last_step = StepResult()
                 if evt.is_readable():
-                    last_step = ch_ptr[].on_readable(handler, config)
+                    last_step = ch_ptr[].on_readable_static(resp, config)
                     step_done = last_step.done
                     var cycles = 0
                     while (not step_done) and cycles < 3:
@@ -528,7 +590,9 @@ def run_reactor_loop_shared[
                             and len(ch_ptr[].read_buf) > 0
                             and ch_ptr[].state == STATE_READING
                         ):
-                            last_step = ch_ptr[].on_readable(handler, config)
+                            last_step = ch_ptr[].on_readable_static(
+                                resp, config
+                            )
                             step_done = last_step.done
                         else:
                             break
@@ -542,14 +606,25 @@ def run_reactor_loop_shared[
             if step_done:
                 _cleanup_conn(fd, conns, timers, reactor)
 
-    # Graceful shutdown: close all active per-conn fds. The shared
-    # listener fd is owned by ``Scheduler`` and stays open until
-    # ``Scheduler.shutdown`` closes it.
+    # Graceful shutdown. Dedicated path flips ``Cancel.SHUTDOWN`` on
+    # every leftover ConnHandle before close (paranoia copy from the
+    # cancel-aware loops; the static path's own state machine ignores
+    # the cell, but cancel-aware handlers wrapped around static
+    # endpoints might observe it elsewhere). Shared path skips the
+    # flip to match the prior behaviour of
+    # ``run_reactor_loop_static_shared``.
     var leftover = List[Int]()
     for kv in conns.items():
         leftover.append(kv.key)
-    for i in range(len(leftover)):
-        _cleanup_conn(leftover[i], conns, timers, reactor)
+
+    comptime if not is_shared:
+        for i in range(len(leftover)):
+            var ch_ptr = _conn_ptr_from_int(conns[leftover[i]])
+            ch_ptr[].cancel_cell.flip(CancelReason.SHUTDOWN)
+            _cleanup_conn(leftover[i], conns, timers, reactor)
+    else:
+        for i in range(len(leftover)):
+            _cleanup_conn(leftover[i], conns, timers, reactor)
 
 
 def run_reactor_loop_static(
@@ -562,9 +637,9 @@ def run_reactor_loop_static(
 
     Mirrors ``run_reactor_loop`` but drives each connection through
     ``ConnHandle.on_readable_static(resp, config)`` instead of the
-    parse-and-dispatch path. The canned bytes are ``memcpy``d into
-    ``write_buf`` per request — no ``Request`` construction, no
-    handler call, no response serialisation.
+    parse-and-dispatch path. Delegates to
+    :func:`_run_static_loop_impl` with ``is_shared=False`` so the
+    listener registers without ``EPOLLEXCLUSIVE``.
 
     Args:
         listener: Bound and listening ``TcpListener`` (caller owns it;
@@ -575,94 +650,9 @@ def run_reactor_loop_static(
             exits and in-flight connections are closed.
     """
     listener._socket.set_nonblocking(True)
-    var listener_fd = listener._socket.fd
-
-    var reactor = Reactor()
-    var wheel = TimerWheel(now_ms=UInt64(_monotonic_ms()))
-    var conns = Dict[Int, Int]()
-    var timers = Dict[Int, UInt64]()
-
-    reactor.register(listener_fd, UInt64(0), INTEREST_READ)
-
-    var events = List[Event]()
-    var stopping_addr = Int(UnsafePointer[Bool, _](to=stopping))
-    while not UnsafePointer[Bool, MutExternalOrigin](
-        unsafe_from_address=stopping_addr
-    )[]:
-        events.clear()
-        try:
-            _ = reactor.poll(100, events)
-        except:
-            break
-
-        var now_ms = UInt64(_monotonic_ms())
-        var fired = List[UInt64]()
-        wheel.advance(now_ms, fired)
-        for i in range(len(fired)):
-            var fd_tok = Int(fired[i])
-            if fd_tok in conns:
-                _cleanup_conn(fd_tok, conns, timers, reactor)
-
-        for i in range(len(events)):
-            var evt = events[i]
-            if evt.is_wakeup():
-                continue
-            if evt.token == UInt64(0):
-                _accept_loop(listener, reactor, conns)
-                continue
-            var fd = Int(evt.token)
-            if fd not in conns:
-                continue
-            var ch_ptr = _conn_ptr_from_int(conns[fd])
-            var step_done = False
-            try:
-                var last_step = StepResult()
-                if evt.is_readable():
-                    last_step = ch_ptr[].on_readable_static(resp, config)
-                    step_done = last_step.done
-                    var cycles = 0
-                    while (not step_done) and cycles < 3:
-                        cycles += 1
-                        if (
-                            last_step.want_write
-                            and len(ch_ptr[].write_buf) > ch_ptr[].write_pos
-                        ):
-                            last_step = ch_ptr[].on_writable(config)
-                            step_done = last_step.done
-                        elif (
-                            last_step.want_read
-                            and len(ch_ptr[].read_buf) > 0
-                            and ch_ptr[].state == STATE_READING
-                        ):
-                            last_step = ch_ptr[].on_readable_static(
-                                resp, config
-                            )
-                            step_done = last_step.done
-                        else:
-                            break
-                elif evt.is_writable():
-                    last_step = ch_ptr[].on_writable(config)
-                    step_done = last_step.done
-                if not step_done:
-                    _apply_step(fd, last_step, reactor, wheel, timers, ch_ptr)
-            except:
-                step_done = True
-            if step_done:
-                _cleanup_conn(fd, conns, timers, reactor)
-
-    # Graceful shutdown: flip Cancel.SHUTDOWN on every in-flight
-    # conn before closing — same in-thread pattern as
-    # ``run_reactor_loop_cancel`` (C12 / Track 3.2). Cancel-aware
-    # handlers (CancelHandler / ViewHandler) observe the flip
-    # at their next ``cancel.cancelled()`` poll. Plain Handlers
-    # ignore Cancel and run to completion.
-    var leftover = List[Int]()
-    for kv in conns.items():
-        leftover.append(kv.key)
-    for i in range(len(leftover)):
-        var ch_ptr = _conn_ptr_from_int(conns[leftover[i]])
-        ch_ptr[].cancel_cell.flip(CancelReason.SHUTDOWN)
-        _cleanup_conn(leftover[i], conns, timers, reactor)
+    _run_static_loop_impl[is_shared=False](
+        Int(listener._socket.fd), config, resp, stopping
+    )
 
 
 def run_reactor_loop_static_shared(
@@ -674,113 +664,28 @@ def run_reactor_loop_static_shared(
     """Multi-worker twin of :func:`run_reactor_loop_static`.
 
     Drives a pre-encoded ``StaticResponse`` over a SHARED listener fd
-    (owned by the ``Scheduler`` / ``StaticScheduler``; never closed
-    here). Same per-conn state machine as ``run_reactor_loop_static``
-    -- ``ConnHandle.on_readable_static`` parses far enough to find
-    ``\\r\\n\\r\\n`` + ``Content-Length`` and then ``memcpy``s the
-    canned bytes -- but registers via ``register_exclusive`` so the
-    kernel wakes only one worker per accept event (``EPOLLEXCLUSIVE``
-    on Linux >= 4.5; degrades to wake-all on macOS).
+    (owned by the ``StaticScheduler``; never closed here). Delegates
+    to :func:`_run_static_loop_impl` with ``is_shared=True`` so the
+    listener registers with ``EPOLLEXCLUSIVE`` (Linux >= 4.5; falls
+    back to plain register on macOS) and the kernel wakes only one
+    worker per accept event.
 
-    The combination of the static fast path (no parser, no handler,
-    no allocation per request, no response serialisation) with the
-    multi-worker scheduler is the fastest path flare exposes for
-    fixed-response endpoints: the per-request work drops to
-    memcpy + the syscall pair, which scales near-linearly across
-    cores.
+    The combination of the static fast path with the multi-worker
+    scheduler is the fastest path flare exposes for fixed-response
+    endpoints: per-request work drops to memcpy + the syscall pair,
+    which scales near-linearly across cores.
 
     Args:
         listener_fd: Borrowed shared listener fd. Must be in
-            non-blocking mode (the Scheduler does this once at
-            bind-time). This worker never closes it.
+            non-blocking mode (the ``StaticScheduler`` does this once
+            at bind-time). This worker never closes it.
         config: Per-worker copy of ``ServerConfig``.
         resp: Pre-encoded static response (immutable; safely shared
-            across workers via ``StaticScheduler``'s heap-stored
-            copy).
+            across workers via ``StaticScheduler``'s heap-stored copy).
         stopping: Heap-allocated stop flag mutated by
             ``StaticScheduler.shutdown`` from the main thread.
     """
-    var reactor = Reactor()
-    var wheel = TimerWheel(now_ms=UInt64(_monotonic_ms()))
-    var conns = Dict[Int, Int]()
-    var timers = Dict[Int, UInt64]()
-
-    reactor.register_exclusive(c_int(listener_fd), UInt64(0), INTEREST_READ)
-
-    var events = List[Event]()
-    var stopping_addr = Int(UnsafePointer[Bool, _](to=stopping))
-    while not UnsafePointer[Bool, MutExternalOrigin](
-        unsafe_from_address=stopping_addr
-    )[]:
-        events.clear()
-        try:
-            _ = reactor.poll(100, events)
-        except:
-            break
-
-        var now_ms = UInt64(_monotonic_ms())
-        var fired = List[UInt64]()
-        wheel.advance(now_ms, fired)
-        for i in range(len(fired)):
-            var fd_tok = Int(fired[i])
-            if fd_tok in conns:
-                _cleanup_conn(fd_tok, conns, timers, reactor)
-
-        for i in range(len(events)):
-            var evt = events[i]
-            if evt.is_wakeup():
-                continue
-            if evt.token == UInt64(0):
-                _accept_loop_fd(listener_fd, reactor, conns)
-                continue
-            var fd = Int(evt.token)
-            if fd not in conns:
-                continue
-            var ch_ptr = _conn_ptr_from_int(conns[fd])
-            var step_done = False
-            try:
-                var last_step = StepResult()
-                if evt.is_readable():
-                    last_step = ch_ptr[].on_readable_static(resp, config)
-                    step_done = last_step.done
-                    var cycles = 0
-                    while (not step_done) and cycles < 3:
-                        cycles += 1
-                        if (
-                            last_step.want_write
-                            and len(ch_ptr[].write_buf) > ch_ptr[].write_pos
-                        ):
-                            last_step = ch_ptr[].on_writable(config)
-                            step_done = last_step.done
-                        elif (
-                            last_step.want_read
-                            and len(ch_ptr[].read_buf) > 0
-                            and ch_ptr[].state == STATE_READING
-                        ):
-                            last_step = ch_ptr[].on_readable_static(
-                                resp, config
-                            )
-                            step_done = last_step.done
-                        else:
-                            break
-                elif evt.is_writable():
-                    last_step = ch_ptr[].on_writable(config)
-                    step_done = last_step.done
-                if not step_done:
-                    _apply_step(fd, last_step, reactor, wheel, timers, ch_ptr)
-            except:
-                step_done = True
-            if step_done:
-                _cleanup_conn(fd, conns, timers, reactor)
-
-    # Worker shutdown: close per-conn fds. Shared listener fd
-    # stays open -- StaticScheduler.shutdown closes it after
-    # joining all workers.
-    var leftover = List[Int]()
-    for kv in conns.items():
-        leftover.append(kv.key)
-    for i in range(len(leftover)):
-        _cleanup_conn(leftover[i], conns, timers, reactor)
+    _run_static_loop_impl[is_shared=True](listener_fd, config, resp, stopping)
 
 
 def run_reactor_loop_cancel[
