@@ -41,3 +41,18 @@ from .frame import (
     decode_h3_settings,
     encode_h3_settings,
 )
+from .request_reader import (
+    H3_REQUEST_EVENT_DATA,
+    H3_REQUEST_EVENT_HEADERS,
+    H3_REQUEST_EVENT_NEEDS_MORE,
+    H3_REQUEST_EVENT_PROTOCOL_ERROR,
+    H3_REQUEST_EVENT_TRAILERS,
+    H3_REQUEST_EVENT_UNKNOWN_FRAME,
+    H3_REQUEST_STATE_BODY,
+    H3_REQUEST_STATE_DONE,
+    H3_REQUEST_STATE_INIT,
+    H3_REQUEST_STATE_TRAILERS,
+    H3RequestEvent,
+    H3RequestReader,
+    feed,
+)
