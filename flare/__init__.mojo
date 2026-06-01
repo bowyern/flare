@@ -81,12 +81,23 @@ flare.http     - HTTP/1.1 client + reactor server + Router /
 flare.http.cache - RFC 9111 cache primitives (CacheControl directive
                  parser, CacheKey, InMemoryCacheStore)
 flare.grpc     - gRPC primitives on flare.http2: LPM message framing,
-                 canonical Status codes, Metadata carrier
+                 canonical Status codes, Metadata carrier, and the
+                 unary server adapter (HTTP/2 stream + h2 trailers
+                 → typed call context + Status outcome)
 flare.openapi  - OpenAPI 3.1 spec model + deterministic JSON emitter
-flare.quic     - Sans-I/O QUIC v1 codec primitives (varint + long /
-                 short packet headers); reactor + TLS + CC drive
+flare.quic     - Sans-I/O QUIC v1 codec primitives (varint, long /
+                 short packet headers, all 22 RFC 9000 §19 transport
+                 frames, RFC 9000 §18 transport parameters, RFC 9000
+                 §3 / §13 connection + stream state machines,
+                 CUBIC + HyStart++ congestion controller per RFC 9438
+                 / RFC 9406 / RFC 9002 §7.7); reactor + TLS drive
                  ship later alongside the QUIC server
-flare.h3       - Sans-I/O HTTP/3 frame codec + SETTINGS payload
+flare.h3       - Sans-I/O HTTP/3 frame codec, SETTINGS payload,
+                 request-stream reader + response-stream writer
+                 (RFC 9114 §4 + §7)
+flare.qpack    - Sans-I/O static-only QPACK encoder / decoder for
+                 HTTP/3 field sections (RFC 9204 Appendix A static
+                 table + literal + Huffman, shared with HPACK)
 flare.crypto   - HMAC-SHA256, base64url
 flare.tls      - TLS 1.2/1.3 (OpenSSL, client + server, ALPN, session resumption)
 flare.tcp      - TcpStream + TcpListener (IPv4 + IPv6)
@@ -104,10 +115,12 @@ flare.utils    - POSIX FFI thunks (fork / waitpid / kill / usleep /
 ```
 
 Each layer mostly imports from layers below it. The runtime
-scheduler reaches into ``flare.http`` to construct workers, and
-``flare.http`` re-imports ``flare.http2`` for the unified reactor
-dispatch; both shapes are tracked as cleanup work in the source
-under ``# TODO`` headers.
+scheduler is generic over a ``Frontend`` trait so that
+``flare.runtime`` no longer imports from ``flare.http``; the HTTP
+worker bring-up lives in ``flare.http.multicore`` and plugs into
+the scheduler via that trait. ``flare.http`` still re-imports
+``flare.http2`` for the unified reactor dispatch (the only
+remaining intra-http cycle, tracked as cleanup in the source).
 
 ## HTTP requests
 

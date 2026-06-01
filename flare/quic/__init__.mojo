@@ -1,26 +1,50 @@
 """``flare.quic`` — sans-I/O QUIC v1 codec primitives (RFC 9000).
 
 This package ships the *codec* layer of QUIC: pure byte-in /
-byte-out parsers and emitters for the wire format. It contains
-no socket I/O, no TLS handshake, no congestion controller, and
-no reactor integration. Every public type's contract is "give me
-bytes, get back a typed value (and optionally error context); give
-me a typed value, get back bytes".
+byte-out parsers and emitters for the wire format, plus pure
+state machines and congestion-controller helpers that operate
+on owned value-typed state. It contains no socket I/O and no
+TLS handshake. Every public type's contract is "give me bytes,
+get back a typed value (and optionally error context); give me
+a typed value, get back bytes".
 
 The codec layer is the load-bearing foundation that downstream
-modules (the QUIC reactor + connection state machine, the TLS
-handshake adapter, the congestion controllers) will build on top
-of. Shipping the codec layer first lets us cross-validate against
-reference implementations (aioquic, quiche) before committing to
-a particular reactor / TLS / CC design.
+modules (the QUIC reactor + datagram pump, the TLS handshake
+adapter that drives the CRYPTO frames) will build on top of.
+Shipping the codec layer first lets us cross-validate against
+reference fixtures before committing to a particular reactor /
+TLS design.
 
 Public re-exports:
 
-- :class:`Varint` — variable-length integer codec (RFC 9000 §16).
-- :func:`encode_varint`, :func:`decode_varint` — byte-level
-  helpers around the ``Varint`` struct.
-- :data:`VARINT_MAX` — largest representable varint value
-  (``2 ** 62 - 1``).
+- :mod:`.varint` — variable-length integer codec
+  (RFC 9000 §16): :class:`Varint`, :func:`encode_varint`,
+  :func:`decode_varint`, :func:`varint_encoded_length`,
+  :data:`VARINT_MAX`.
+- :mod:`.packet` — long / short header codec
+  (RFC 9000 §17): :class:`ConnectionId`, :class:`LongHeader`,
+  :class:`ShortHeader`, :class:`InitialExtras`, the
+  ``PACKET_TYPE_*`` constants, and their byte-level helpers.
+- :mod:`.frame` — all 22 RFC 9000 §19 transport frames behind
+  a single discriminated :class:`Frame` union, plus
+  :func:`encode_frame` / :func:`parse_frame`.
+- :mod:`.transport_params` — RFC 9000 §18 transport-parameter
+  codec: :class:`TransportParameters`,
+  :func:`encode_transport_parameters`,
+  :func:`decode_transport_parameters`, and the ``TP_ID_*``
+  constants for every parameter the codec carries.
+- :mod:`.state` — RFC 9000 §3 / §13 sans-I/O connection +
+  stream state machines: :class:`Connection`, :class:`Stream`,
+  :func:`handle_frame`, :func:`mark_handshake_complete`,
+  :func:`is_idle_timeout_expired`, :func:`connection_close`,
+  and the ``CONN_STATE_*`` / ``STREAM_STATE_*`` constants.
+- :mod:`.cc` — CUBIC + HyStart++ congestion controller and
+  pacing budget (RFC 9438 + RFC 9406 + RFC 9002 §7.7) as
+  pure functions over a :class:`CcState` value:
+  :func:`cc_init`, :func:`on_packet_sent`,
+  :func:`on_ack_received`, :func:`on_packets_lost`,
+  :func:`on_round_start`, :func:`pacing_budget`,
+  :func:`pacing_rate_bytes_per_second`, :func:`can_send`.
 """
 
 from .varint import (

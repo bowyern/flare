@@ -9,17 +9,20 @@ gRPC is a 4-layer protocol on top of HTTP/2:
 2. **Status + Metadata** -- the trailer ``grpc-status``,
    ``grpc-message``, and trailing-metadata header set. Carried in
    :mod:`flare.grpc.status`.
-3. **Call shapes** -- unary, server-streaming, client-streaming,
-   and bidirectional. Each maps onto a single HTTP/2 stream
-   (request HEADERS + DATA frames carry length-prefixed messages,
-   response HEADERS + DATA + trailing HEADERS carry the reply).
-4. **Codegen** -- proto3 message + service codegen. Not in this
-   commit; the framing + status layers are the prerequisite.
+3. **Call shapes** -- unary (this module, via the
+   :mod:`flare.grpc.server` adapter), and server-streaming /
+   client-streaming / bidirectional (deferred). Each maps onto
+   a single HTTP/2 stream (request HEADERS + DATA frames carry
+   length-prefixed messages, response HEADERS + DATA +
+   trailing HEADERS carry the reply).
+4. **Codegen** -- proto3 message + service codegen. Deferred;
+   handler bodies for now construct ``List[UInt8]`` payloads
+   directly using whatever serialiser the user picks.
 
-This module establishes the bottom two layers (framing + status).
-The call shapes + codegen build on top of these in later commits;
-the HTTP/2 reactor already provides the stream multiplexer they
-need.
+This module establishes layers 1, 2 and the unary path of
+layer 3. The HTTP/2 reactor already provides the stream
+multiplexer the call shapes need; the server adapter mounts on
+the existing :class:`Handler` trait via :class:`GrpcUnary`.
 
 Public re-exports:
 
@@ -29,6 +32,19 @@ Public re-exports:
   the byte-level codec.
 - :class:`GrpcStatus` + the named status code constants --
   trailer carrier + RPC outcome.
+- :class:`GrpcMetadata`, :class:`GrpcMetadataEntry` -- the
+  initial- and trailing-metadata carrier.
+- :class:`GrpcUnary` -- the per-method handler trait the
+  application implements; receives a decoded request payload
+  and returns either response bytes or a non-OK status.
+- :class:`GrpcCallContext`, :class:`GrpcCallOutcome` -- the
+  per-call inputs and outputs the server adapter threads
+  through the H2 stream.
+- :func:`parse_request_headers`, :func:`stitch_request_data`,
+  :func:`encode_unary_response`, :func:`run_unary_call` -- the
+  sans-I/O building blocks of the unary server adapter (H2
+  headers + DATA → ``GrpcCallContext`` → handler →
+  LPM-wrapped response bytes + outcome).
 """
 
 from .framing import (

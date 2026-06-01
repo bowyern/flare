@@ -19,6 +19,19 @@ Public re-exports:
 - :func:`decode_h3_settings`, :func:`encode_h3_settings` — the
   HTTP/3 SETTINGS frame payload codec (a list of ``identifier:
   value`` varint pairs, RFC 9114 §7.2.4).
+- :class:`H3RequestReader` + :func:`feed` — sans-I/O state
+  machine that consumes the request-stream byte stream and
+  emits :class:`H3RequestEvent` values (HEADERS, DATA,
+  TRAILERS, UNKNOWN_FRAME, NEEDS_MORE, PROTOCOL_ERROR) per
+  RFC 9114 §4. The ``H3_REQUEST_EVENT_*`` /
+  ``H3_REQUEST_STATE_*`` constants enumerate the event tags
+  and state tags.
+- :func:`encode_response_headers`, :func:`encode_response_data`,
+  :func:`encode_response_trailers` — sans-I/O response-stream
+  writer that emits the corresponding HTTP/3 frames (HEADERS,
+  DATA, TRAILERS) with QPACK-encoded field sections, ASCII
+  header-name lowercasing, and pseudo-header validation per
+  RFC 9114 §4.
 """
 
 from .frame import (

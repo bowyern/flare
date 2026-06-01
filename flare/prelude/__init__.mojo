@@ -324,6 +324,48 @@ from ..quic import (
     parse_long_header as quic_parse_long_header,
     parse_initial_extras as quic_parse_initial_extras,
     parse_short_header as quic_parse_short_header,
+    # RFC 9000 §19 transport frames.
+    Frame as QuicFrame,
+    ParsedFrame as QuicParsedFrame,
+    encode_frame as quic_encode_frame,
+    parse_frame as quic_parse_frame,
+    # RFC 9000 §18 transport parameters.
+    TransportParameters as QuicTransportParameters,
+    encode_transport_parameters as quic_encode_transport_parameters,
+    decode_transport_parameters as quic_decode_transport_parameters,
+    empty_transport_parameters as quic_empty_transport_parameters,
+    # RFC 9000 §3 / §13 state machines.
+    Connection as QuicConnection,
+    ConnectionEvents as QuicConnectionEvents,
+    Stream as QuicStream,
+    handle_frame as quic_handle_frame,
+    mark_handshake_complete as quic_mark_handshake_complete,
+    is_idle_timeout_expired as quic_is_idle_timeout_expired,
+    connection_close as quic_connection_close,
+    new_connection as quic_new_connection,
+    new_stream as quic_new_stream,
+    empty_events as quic_empty_events,
+    # RFC 9438 + 9406 + 9002 §7.7 congestion controller.
+    CcState as QuicCcState,
+    cc_init as quic_cc_init,
+    on_packet_sent as quic_on_packet_sent,
+    on_ack_received as quic_on_ack_received,
+    on_packets_lost as quic_on_packets_lost,
+    on_round_start as quic_on_round_start,
+    pacing_budget as quic_pacing_budget,
+    pacing_rate_bytes_per_second as quic_pacing_rate_bytes_per_second,
+    can_send as quic_can_send,
+)
+
+# flare.qpack
+from ..qpack import (
+    QpackHeader,
+    decode_field_section as qpack_decode_field_section,
+    encode_field_section as qpack_encode_field_section,
+    QPACK_STATIC_TABLE_SIZE,
+    static_table_find as qpack_static_table_find,
+    static_table_find_name as qpack_static_table_find_name,
+    static_table_lookup as qpack_static_table_lookup,
 )
 
 # flare.h3
@@ -346,6 +388,24 @@ from ..h3 import (
     encode_h3_frame,
     decode_h3_settings,
     encode_h3_settings,
+    # H3 request-stream reader (RFC 9114 §4 + §7).
+    H3RequestEvent,
+    H3RequestReader,
+    feed as h3_feed,
+    H3_REQUEST_EVENT_HEADERS,
+    H3_REQUEST_EVENT_DATA,
+    H3_REQUEST_EVENT_TRAILERS,
+    H3_REQUEST_EVENT_UNKNOWN_FRAME,
+    H3_REQUEST_EVENT_NEEDS_MORE,
+    H3_REQUEST_EVENT_PROTOCOL_ERROR,
+    H3_REQUEST_STATE_INIT,
+    H3_REQUEST_STATE_BODY,
+    H3_REQUEST_STATE_TRAILERS,
+    H3_REQUEST_STATE_DONE,
+    # H3 response-stream writer (RFC 9114 §4 + §7).
+    encode_response_headers as h3_encode_response_headers,
+    encode_response_data as h3_encode_response_data,
+    encode_response_trailers as h3_encode_response_trailers,
 )
 
 # flare.grpc
@@ -377,6 +437,14 @@ from ..grpc import (
     GRPC_STATUS_DATA_LOSS,
     GRPC_STATUS_UNAUTHENTICATED,
     GrpcStatus,
+    # Unary server adapter (H2 stream → gRPC call).
+    GrpcCallContext,
+    GrpcCallOutcome,
+    GrpcUnary,
+    encode_unary_response as grpc_encode_unary_response,
+    parse_request_headers as grpc_parse_request_headers,
+    run_unary_call as grpc_run_unary_call,
+    stitch_request_data as grpc_stitch_request_data,
 )
 
 # flare.ws
