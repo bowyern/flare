@@ -62,10 +62,12 @@ from flare.http.static_response import StaticResponse
 
 # Per-connection state-machine constants, ``StepResult``, ``ConnHandle``,
 # the h2c-upgrade detector, and the byte-fast-path / keep-alive helpers
-# all live in ``flare.http._reactor.conn_handle``. They are re-exported
-# here for back-compat with every existing import site (``flare.http``,
-# ``flare.http2``, ``flare.runtime``, ``tests/``, ``fuzz/``).
-from ._reactor.conn_handle import (
+# live in ``flare.http._reactor`` (split across ``conn_handle``,
+# ``keepalive_scan``, and ``write_path`` modules). The sub-package's
+# ``__init__`` aggregates them; we re-export every existing public
+# symbol here for back-compat with imports across ``flare.http``,
+# ``flare.http2``, ``flare.runtime``, ``tests/``, ``fuzz/``.
+from ._reactor import (
     STATE_READING,
     STATE_WRITING,
     STATE_CLOSING,
