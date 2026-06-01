@@ -16,10 +16,21 @@
 #
 # Allowlist:
 #   Files in ``ALLOWLIST`` are tracked + reported but do not fail the
-#   lint. Each entry must carry a ``# TODO(track-N): split into ...``
-#   comment in the source file pointing at the planned decomposition.
-#   The allowlist is meant to **shrink to empty** as decomposition
-#   work lands; a file leaves the allowlist by being split.
+#   lint. The allowlist is meant to **shrink to empty** as
+#   decomposition work lands; a file leaves the allowlist by being
+#   split.
+#
+# ALLOWLIST policy:
+#   Every entry MUST come with:
+#     1. A dated ``# TODO(YYYY-MM-DD)`` comment in the allowlisted
+#        source file referencing the planned decomposition. The lint
+#        checks for the marker and refuses to honour an undated
+#        entry.
+#     2. A deadline (next minor version cycle) by which the entry
+#        must clear. The dated TODO doubles as the deadline anchor;
+#        when the date passes, the next sweep removes the entry
+#        unconditionally and the lint starts failing the file.
+#   Entries without a dated TODO are removed at the next sweep.
 #
 # Exit code 0 = clean (every file under threshold or on the
 # allowlist), non-zero = at least one file is over threshold and not
@@ -62,8 +73,19 @@ while IFS= read -r -d '' file; do
             fi
         done
         if (( is_allowlisted == 1 )); then
-            echo "check-reactor-size: ALLOWLISTED: $file ($lines lines, threshold $threshold)" >&2
-            allowlisted=$((allowlisted + 1))
+            # ALLOWLIST hygiene: every allowlisted file MUST carry a
+            # dated ``# TODO(YYYY-MM-DD ...)`` marker pointing at the
+            # planned decomposition. Undated TODOs (or no TODO at all)
+            # promote the file back to a hard violation so the entry
+            # cannot live in the list silently.
+            if grep -E "^[[:space:]]*#.*TODO\([0-9]{4}-[0-9]{2}-[0-9]{2}" "$file" \
+               > /dev/null 2>&1; then
+                echo "check-reactor-size: ALLOWLISTED: $file ($lines lines, threshold $threshold)" >&2
+                allowlisted=$((allowlisted + 1))
+            else
+                echo "check-reactor-size: VIOLATION: $file is allowlisted but has no dated '# TODO(YYYY-MM-DD ...)' marker" >&2
+                violations=$((violations + 1))
+            fi
         else
             echo "check-reactor-size: VIOLATION: $file ($lines lines > $threshold)" >&2
             violations=$((violations + 1))
