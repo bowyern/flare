@@ -38,25 +38,123 @@ from flare.quic import (
     FRAME_TYPE_HANDSHAKE_DONE,
     FRAME_TYPE_PING,
     FRAME_TYPE_STREAM_BASE,
-    Frame,
+    FrameHandler,
     StreamFrame,
+    apply_handshake_done,
+    apply_stream,
     cc_init,
     can_send,
     decode_transport_parameters,
     empty_events,
-    encode_frame,
+    encode_handshake_done,
+    encode_ping,
+    encode_stream,
     encode_transport_parameters,
     encode_varint,
-    handle_frame,
+    handle_frame_buf,
     new_connection,
     on_ack_received,
     on_packet_sent,
     on_round_start,
     pacing_rate_bytes_per_second,
-    parse_frame,
+    parse_frame_into,
 )
-from flare.quic.frame import _zero_frame
+from flare.quic.frame import (
+    CryptoFrame,
+    DataBlockedFrame,
+    MaxDataFrame,
+    MaxStreamDataFrame,
+    MaxStreamsFrame,
+    NewConnectionIdFrame,
+    NewTokenFrame,
+    PathChallengeFrame,
+    PathResponseFrame,
+    ResetStreamFrame,
+    RetireConnectionIdFrame,
+    StopSendingFrame,
+    StreamDataBlockedFrame,
+    StreamsBlockedFrame,
+)
 from flare.quic.transport_params import empty_transport_parameters
+
+
+@fieldwise_init
+struct _DemoHandler(FrameHandler, Movable):
+    """Minimal :trait:`FrameHandler` recording the frame types the
+    demo exercises (PING / STREAM / HANDSHAKE_DONE). Everything
+    else falls through to a no-op so the demo can drive the
+    dispatcher with unrelated frame seeds without raising."""
+
+    var ping_count: Int
+    var stream_seen: Bool
+    var stream_id: UInt64
+    var stream_fin: Bool
+    var handshake_done_count: Int
+
+    def on_padding(mut self, count: Int) raises:
+        pass
+
+    def on_ping(mut self) raises:
+        self.ping_count += 1
+
+    def on_ack(mut self, ack: AckFrame) raises:
+        pass
+
+    def on_reset_stream(mut self, rs: ResetStreamFrame) raises:
+        pass
+
+    def on_stop_sending(mut self, ss: StopSendingFrame) raises:
+        pass
+
+    def on_crypto(mut self, c: CryptoFrame) raises:
+        pass
+
+    def on_new_token(mut self, t: NewTokenFrame) raises:
+        pass
+
+    def on_stream(mut self, sf: StreamFrame) raises:
+        self.stream_seen = True
+        self.stream_id = sf.stream_id
+        self.stream_fin = sf.fin
+
+    def on_max_data(mut self, m: MaxDataFrame) raises:
+        pass
+
+    def on_max_stream_data(mut self, m: MaxStreamDataFrame) raises:
+        pass
+
+    def on_max_streams(mut self, m: MaxStreamsFrame) raises:
+        pass
+
+    def on_data_blocked(mut self, db: DataBlockedFrame) raises:
+        pass
+
+    def on_stream_data_blocked(mut self, sdb: StreamDataBlockedFrame) raises:
+        pass
+
+    def on_streams_blocked(mut self, sb: StreamsBlockedFrame) raises:
+        pass
+
+    def on_new_connection_id(mut self, ncid: NewConnectionIdFrame) raises:
+        pass
+
+    def on_retire_connection_id(mut self, rcid: RetireConnectionIdFrame) raises:
+        pass
+
+    def on_path_challenge(mut self, pc: PathChallengeFrame) raises:
+        pass
+
+    def on_path_response(mut self, pr: PathResponseFrame) raises:
+        pass
+
+    def on_connection_close(mut self, cc: ConnectionCloseFrame) raises:
+        pass
+
+    def on_handshake_done(mut self) raises:
+        self.handshake_done_count += 1
+
+    def on_unknown(mut self, type_id: UInt64) raises:
+        pass
 
 
 def _hex(bytes: List[UInt8]) -> String:
@@ -99,45 +197,54 @@ def main() raises:
 
     # ── Frame round trip ──────────────────────────────────────────
     print("[2] Frame codec round trip")
-    var ping = _zero_frame(FRAME_TYPE_PING)
     var ping_bytes = List[UInt8]()
-    encode_frame(ping^, ping_bytes)
-    var ping_back = parse_frame(Span[UInt8, _](ping_bytes))
+    encode_ping(ping_bytes)
+    var demo_handler = _DemoHandler(
+        ping_count=0,
+        stream_seen=False,
+        stream_id=UInt64(0),
+        stream_fin=False,
+        handshake_done_count=0,
+    )
+    var ping_consumed = parse_frame_into(
+        Span[UInt8, _](ping_bytes), demo_handler
+    )
     print("    PING       -> " + _hex(ping_bytes))
     print(
         "      consumed = "
-        + String(ping_back.consumed)
-        + ", kind="
-        + String(ping_back.frame.kind)
+        + String(ping_consumed)
+        + ", ping_count="
+        + String(demo_handler.ping_count)
     )
 
     var data = List[UInt8]()
     for c in String("hello").as_bytes():
         data.append(c)
-    var sf = StreamFrame(
-        stream_id=UInt64(0),
-        offset=UInt64(0),
-        data=data^,
-        fin=True,
-    )
-    var stream = _zero_frame(FRAME_TYPE_STREAM_BASE)
-    stream.stream = sf^
     var stream_bytes = List[UInt8]()
-    encode_frame(stream^, stream_bytes)
-    var stream_back = parse_frame(Span[UInt8, _](stream_bytes))
+    encode_stream(
+        StreamFrame(
+            stream_id=UInt64(0),
+            offset=UInt64(0),
+            data=data^,
+            fin=True,
+        ),
+        stream_bytes,
+    )
+    var stream_consumed = parse_frame_into(
+        Span[UInt8, _](stream_bytes), demo_handler
+    )
     print("    STREAM(fin=1, off=0, hello) -> " + _hex(stream_bytes))
     print(
         "      consumed = "
-        + String(stream_back.consumed)
+        + String(stream_consumed)
         + ", stream_id="
-        + String(stream_back.frame.stream.stream_id)
+        + String(demo_handler.stream_id)
         + ", fin="
-        + String(stream_back.frame.stream.fin)
+        + String(demo_handler.stream_fin)
     )
 
-    var hsd = _zero_frame(FRAME_TYPE_HANDSHAKE_DONE)
     var hsd_bytes = List[UInt8]()
-    encode_frame(hsd^, hsd_bytes)
+    encode_handshake_done(hsd_bytes)
     print("    HANDSHAKE_DONE -> " + _hex(hsd_bytes))
     print()
 
@@ -165,19 +272,24 @@ def main() raises:
     print("[4] Connection state machine drive")
     var conn = new_connection()
     var events = empty_events()
-    handle_frame(conn, ping_back.frame, UInt64(100), events)
-    handle_frame(conn, hsd^, UInt64(200), events)
-    var stream2 = _zero_frame(FRAME_TYPE_STREAM_BASE)
+    _ = handle_frame_buf(conn, Span[UInt8, _](ping_bytes), UInt64(100), events)
+    _ = handle_frame_buf(conn, Span[UInt8, _](hsd_bytes), UInt64(200), events)
+    var stream2_bytes = List[UInt8]()
     var data2 = List[UInt8]()
     for c in String("hello").as_bytes():
         data2.append(c)
-    stream2.stream = StreamFrame(
-        stream_id=UInt64(0),
-        offset=UInt64(0),
-        data=data2^,
-        fin=True,
+    encode_stream(
+        StreamFrame(
+            stream_id=UInt64(0),
+            offset=UInt64(0),
+            data=data2^,
+            fin=True,
+        ),
+        stream2_bytes,
     )
-    handle_frame(conn, stream2^, UInt64(300), events)
+    _ = handle_frame_buf(
+        conn, Span[UInt8, _](stream2_bytes), UInt64(300), events
+    )
     print("    handshake_done = " + String(events.handshake_done))
     print("    new_streams = " + String(len(events.new_streams)))
     print("    finished_streams = " + String(len(events.finished_streams)))

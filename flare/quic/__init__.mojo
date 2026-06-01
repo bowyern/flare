@@ -25,9 +25,11 @@ Public re-exports:
   (RFC 9000 §17): :class:`ConnectionId`, :class:`LongHeader`,
   :class:`ShortHeader`, :class:`InitialExtras`, the
   ``PACKET_TYPE_*`` constants, and their byte-level helpers.
-- :mod:`.frame` — all 22 RFC 9000 §19 transport frames behind
-  a single discriminated :class:`Frame` union, plus
-  :func:`encode_frame` / :func:`parse_frame`.
+- :mod:`.frame` — all 22 RFC 9000 §19 transport frames as typed
+  payload structs plus :trait:`FrameHandler` +
+  :func:`parse_frame_into[H]` for zero-carrier dispatch, and
+  per-type ``encode_*`` writers that append to a caller-owned
+  ``mut out: List[UInt8]``.
 - :mod:`.transport_params` — RFC 9000 §18 transport-parameter
   codec: :class:`TransportParameters`,
   :func:`encode_transport_parameters`,
@@ -35,9 +37,10 @@ Public re-exports:
   constants for every parameter the codec carries.
 - :mod:`.state` — RFC 9000 §3 / §13 sans-I/O connection +
   stream state machines: :class:`Connection`, :class:`Stream`,
-  :func:`handle_frame`, :func:`mark_handshake_complete`,
+  :func:`handle_frame_buf`, :func:`mark_handshake_complete`,
   :func:`is_idle_timeout_expired`, :func:`connection_close`,
-  and the ``CONN_STATE_*`` / ``STREAM_STATE_*`` constants.
+  the per-typed-payload ``apply_*`` helpers, and the
+  ``CONN_STATE_*`` / ``STREAM_STATE_*`` constants.
 - :mod:`.cc` — CUBIC + HyStart++ congestion controller and
   pacing budget (RFC 9438 + RFC 9406 + RFC 9002 §7.7) as
   pure functions over a :class:`CcState` value:
@@ -79,7 +82,6 @@ from .frame import (
     CryptoFrame,
     DataBlockedFrame,
     EcnCounts,
-    Frame,
     FRAME_TYPE_ACK,
     FRAME_TYPE_ACK_ECN,
     FRAME_TYPE_CONNECTION_CLOSE_APPLICATION,
@@ -104,13 +106,13 @@ from .frame import (
     FRAME_TYPE_STREAM_DATA_BLOCKED,
     FRAME_TYPE_STREAMS_BLOCKED_BIDI,
     FRAME_TYPE_STREAMS_BLOCKED_UNI,
+    FrameHandler,
     HandshakeDoneFrame,
     MaxDataFrame,
     MaxStreamDataFrame,
     MaxStreamsFrame,
     NewConnectionIdFrame,
     NewTokenFrame,
-    ParsedFrame,
     PathChallengeFrame,
     PathResponseFrame,
     ResetStreamFrame,
@@ -119,8 +121,27 @@ from .frame import (
     StreamFrame,
     StreamDataBlockedFrame,
     StreamsBlockedFrame,
-    encode_frame,
-    parse_frame,
+    encode_ack,
+    encode_connection_close,
+    encode_crypto,
+    encode_data_blocked,
+    encode_handshake_done,
+    encode_max_data,
+    encode_max_stream_data,
+    encode_max_streams,
+    encode_new_connection_id,
+    encode_new_token,
+    encode_padding,
+    encode_path_challenge,
+    encode_path_response,
+    encode_ping,
+    encode_reset_stream,
+    encode_retire_connection_id,
+    encode_stop_sending,
+    encode_stream,
+    encode_stream_data_blocked,
+    encode_streams_blocked,
+    parse_frame_into,
 )
 from .transport_params import (
     DEFAULT_ACK_DELAY_EXPONENT,
@@ -188,9 +209,17 @@ from .state import (
     STREAM_STATE_RESET_RECVD,
     STREAM_STATE_RESET_SENT,
     Stream,
+    apply_ack,
+    apply_connection_close,
+    apply_handshake_done,
+    apply_max_data,
+    apply_max_stream_data,
+    apply_reset_stream,
+    apply_stop_sending,
+    apply_stream,
     connection_close,
     empty_events,
-    handle_frame,
+    handle_frame_buf,
     is_idle_timeout_expired,
     mark_handshake_complete,
     new_connection,

@@ -2,11 +2,11 @@
 
 This module is the canonical sans-I/O codec for the 22 transport
 frame types QUIC v1 carries inside (deprotected) packet payloads.
-It parses one frame at a time -- the QUIC connection state
-machine drives the buffer cursor and dispatches per-frame
-handling. Every encoder accepts a typed value and an output list;
-every parser accepts a buffer slice and returns a typed
-``Frame`` plus the number of bytes consumed.
+The parser walks one frame at a time and dispatches each decoded
+payload through a typed callback on a caller-supplied
+:trait:`FrameHandler`; the QUIC connection state machine implements
+the handler and advances per-frame state without ever materialising
+an intermediate carrier value.
 
 Frame types covered (RFC 9000 §19, all 22):
 
@@ -31,11 +31,19 @@ Frame types covered (RFC 9000 §19, all 22):
 * §19.19 CONNECTION_CLOSE (transport 0x1c, application 0x1d)
 * §19.20 HANDSHAKE_DONE (0x1e)
 
-The wire-level union over all 22 types is represented by the
-``Frame`` discriminated struct: a ``kind`` byte selects which of
-the 22 typed payload structs is populated. Every typed struct is
-``Copyable`` + ``Movable`` so callers can shuttle frames through
-queue / batch shapes without lifetime gymnastics.
+Dispatch contract
+-----------------
+
+:func:`parse_frame_into` reads exactly one frame at the start of
+the supplied :class:`Span[UInt8, _]`, fires the matching typed
+callback on the caller's handler, and returns the number of wire
+bytes consumed. The caller advances its cursor and re-invokes the
+dispatcher on the remainder until the buffer drains or a parse
+error fires.
+
+Every typed payload struct is ``Copyable`` + ``Movable`` so the
+handler can stash the dispatched value (or move it into a queue)
+without lifetime gymnastics.
 
 Sans-I/O contract
 -----------------
@@ -47,9 +55,7 @@ References
 ----------
 
 * RFC 9000 §19 "Frame Types and Formats".
-* RFC 9000 §16  "Variable-Length Integer Encoding" (varint).
-* aioquic ``packet.PullQuicFrame`` / ``packet.encode_frame``.
-* quiche ``frame::Frame::from_bytes`` / ``frame::Frame::to_bytes``.
+* RFC 9000 §16 "Variable-Length Integer Encoding" (varint).
 """
 
 from std.collections import List
@@ -299,197 +305,131 @@ struct HandshakeDoneFrame(Copyable, ImplicitlyCopyable, Movable):
     pass
 
 
-# ── Frame discriminated union ────────────────────────────────────────────────
+# ── Frame dispatch trait ─────────────────────────────────────────────────────
 
 
-@fieldwise_init
-struct Frame(Copyable, Movable):
-    """Discriminated union over all 22 RFC 9000 §19 frame types.
+trait FrameHandler(ImplicitlyDestructible, Movable):
+    """Per-type callback contract :func:`parse_frame_into` fires.
 
-    ``kind`` is the wire-level type byte (or its canonical
-    alias for variable-shape ranges -- e.g. STREAM frames collapse
-    to ``FRAME_TYPE_STREAM_BASE`` here, with the OFF/LEN/FIN flag
-    bits surfaced through the typed payload). Exactly one of the
-    typed payload fields is populated; the rest are zero / empty
-    sentinels.
+    The dispatcher reads one wire frame at the start of the input
+    buffer and invokes the matching callback. Implementors carry
+    out the per-frame state-machine work (or stash the dispatched
+    payload for later use) without an intermediate carrier
+    allocation: each callback receives the already-typed payload
+    by value.
 
-    The codec uses a single struct rather than a Mojo trait /
-    sum-type because Mojo doesn't yet expose a sum-type with
-    pattern-match semantics; the discriminated-struct shape
-    matches what aioquic's ``QuicFrame`` and quiche's ``Frame``
-    enum compile to anyway, and it keeps every frame
-    ``Copyable`` + ``Movable`` for free.
+    The 20 callbacks below cover every RFC 9000 §19 frame type.
+    The ACK / ACK-ECN split is collapsed into :meth:`on_ack` (the
+    handler reads ``len(ack.ecn)`` to discriminate); the
+    MAX_STREAMS / STREAMS_BLOCKED bidi/uni splits are collapsed
+    via the ``unidirectional`` flag on the typed payload; the
+    CONNECTION_CLOSE transport/application split is collapsed via
+    the ``application`` flag.
+
+    The :meth:`on_unknown` callback fires for frame type
+    codepoints outside the v1 master table -- callers either log
+    + discard (forward-compatibility) or raise the connection.
     """
 
-    var kind: Int
+    def on_padding(mut self, count: Int) raises:
+        """PADDING run consumed (§19.1).
 
-    var padding_length: Int
-    var ack: AckFrame
-    var reset_stream: ResetStreamFrame
-    var stop_sending: StopSendingFrame
-    var crypto: CryptoFrame
-    var new_token: NewTokenFrame
-    var stream: StreamFrame
-    var max_data: MaxDataFrame
-    var max_stream_data: MaxStreamDataFrame
-    var max_streams: MaxStreamsFrame
-    var data_blocked: DataBlockedFrame
-    var stream_data_blocked: StreamDataBlockedFrame
-    var streams_blocked: StreamsBlockedFrame
-    var new_connection_id: NewConnectionIdFrame
-    var retire_connection_id: RetireConnectionIdFrame
-    var path_challenge: PathChallengeFrame
-    var path_response: PathResponseFrame
-    var connection_close: ConnectionCloseFrame
+        ``count`` is the number of consecutive 0x00 bytes the
+        parser collapsed into one callback (≥ 1).
+        """
+        ...
 
+    def on_ping(mut self) raises:
+        """PING frame (§19.2)."""
+        ...
 
-@fieldwise_init
-struct ParsedFrame(Copyable, Movable):
-    """A parsed frame plus the number of wire bytes it consumed.
+    def on_ack(mut self, ack: AckFrame) raises:
+        """ACK / ACK-ECN frame (§19.3). When ``len(ack.ecn) == 1``
+        the wire type was 0x03 (ACK with ECN counts); otherwise
+        0x02."""
+        ...
 
-    Returned by :func:`parse_frame`; the caller advances its
-    cursor by ``consumed`` and re-invokes :func:`parse_frame` on
-    the remainder until the buffer is drained or a parse error
-    fires.
-    """
+    def on_reset_stream(mut self, rs: ResetStreamFrame) raises:
+        """RESET_STREAM (§19.4)."""
+        ...
 
-    var frame: Frame
-    var consumed: Int
+    def on_stop_sending(mut self, ss: StopSendingFrame) raises:
+        """STOP_SENDING (§19.5)."""
+        ...
 
+    def on_crypto(mut self, c: CryptoFrame) raises:
+        """CRYPTO (§19.6)."""
+        ...
 
-# ── Empty-payload helpers (sentinels for the discriminated union) ────────────
+    def on_new_token(mut self, t: NewTokenFrame) raises:
+        """NEW_TOKEN (§19.7)."""
+        ...
 
+    def on_stream(mut self, sf: StreamFrame) raises:
+        """STREAM (§19.8). The wire-type flag bits are surfaced via
+        ``sf.offset`` (set / zero), the explicit data length (read
+        when LEN was set) and ``sf.fin``."""
+        ...
 
-def _empty_ack() -> AckFrame:
-    return AckFrame(
-        largest_acknowledged=UInt64(0),
-        ack_delay=UInt64(0),
-        first_ack_range=UInt64(0),
-        ranges=List[AckRange](),
-        ecn=List[EcnCounts](),
-    )
+    def on_max_data(mut self, m: MaxDataFrame) raises:
+        """MAX_DATA (§19.9)."""
+        ...
 
+    def on_max_stream_data(mut self, m: MaxStreamDataFrame) raises:
+        """MAX_STREAM_DATA (§19.10)."""
+        ...
 
-def _empty_reset_stream() -> ResetStreamFrame:
-    return ResetStreamFrame(
-        stream_id=UInt64(0),
-        application_error_code=UInt64(0),
-        final_size=UInt64(0),
-    )
+    def on_max_streams(mut self, m: MaxStreamsFrame) raises:
+        """MAX_STREAMS (§19.11). The bidi (0x12) vs uni (0x13) wire
+        split is surfaced via ``m.unidirectional``."""
+        ...
 
+    def on_data_blocked(mut self, db: DataBlockedFrame) raises:
+        """DATA_BLOCKED (§19.12)."""
+        ...
 
-def _empty_stop_sending() -> StopSendingFrame:
-    return StopSendingFrame(
-        stream_id=UInt64(0),
-        application_error_code=UInt64(0),
-    )
+    def on_stream_data_blocked(mut self, sdb: StreamDataBlockedFrame) raises:
+        """STREAM_DATA_BLOCKED (§19.13)."""
+        ...
 
+    def on_streams_blocked(mut self, sb: StreamsBlockedFrame) raises:
+        """STREAMS_BLOCKED (§19.14). The bidi (0x16) vs uni (0x17)
+        wire split is surfaced via ``sb.unidirectional``."""
+        ...
 
-def _empty_crypto() -> CryptoFrame:
-    return CryptoFrame(offset=UInt64(0), data=List[UInt8]())
+    def on_new_connection_id(mut self, ncid: NewConnectionIdFrame) raises:
+        """NEW_CONNECTION_ID (§19.15)."""
+        ...
 
+    def on_retire_connection_id(mut self, rcid: RetireConnectionIdFrame) raises:
+        """RETIRE_CONNECTION_ID (§19.16)."""
+        ...
 
-def _empty_new_token() -> NewTokenFrame:
-    return NewTokenFrame(token=List[UInt8]())
+    def on_path_challenge(mut self, pc: PathChallengeFrame) raises:
+        """PATH_CHALLENGE (§19.17)."""
+        ...
 
+    def on_path_response(mut self, pr: PathResponseFrame) raises:
+        """PATH_RESPONSE (§19.18)."""
+        ...
 
-def _empty_stream() -> StreamFrame:
-    return StreamFrame(
-        stream_id=UInt64(0),
-        offset=UInt64(0),
-        data=List[UInt8](),
-        fin=False,
-    )
+    def on_connection_close(mut self, cc: ConnectionCloseFrame) raises:
+        """CONNECTION_CLOSE (§19.19). The transport (0x1c) vs
+        application (0x1d) wire split is surfaced via
+        ``cc.application``."""
+        ...
 
+    def on_handshake_done(mut self) raises:
+        """HANDSHAKE_DONE (§19.20)."""
+        ...
 
-def _empty_max_data() -> MaxDataFrame:
-    return MaxDataFrame(maximum_data=UInt64(0))
-
-
-def _empty_max_stream_data() -> MaxStreamDataFrame:
-    return MaxStreamDataFrame(
-        stream_id=UInt64(0),
-        maximum_stream_data=UInt64(0),
-    )
-
-
-def _empty_max_streams() -> MaxStreamsFrame:
-    return MaxStreamsFrame(
-        unidirectional=False,
-        maximum_streams=UInt64(0),
-    )
-
-
-def _empty_data_blocked() -> DataBlockedFrame:
-    return DataBlockedFrame(maximum_data=UInt64(0))
-
-
-def _empty_stream_data_blocked() -> StreamDataBlockedFrame:
-    return StreamDataBlockedFrame(
-        stream_id=UInt64(0),
-        maximum_stream_data=UInt64(0),
-    )
-
-
-def _empty_streams_blocked() -> StreamsBlockedFrame:
-    return StreamsBlockedFrame(
-        unidirectional=False,
-        maximum_streams=UInt64(0),
-    )
-
-
-def _empty_new_connection_id() -> NewConnectionIdFrame:
-    return NewConnectionIdFrame(
-        sequence_number=UInt64(0),
-        retire_prior_to=UInt64(0),
-        connection_id=List[UInt8](),
-        stateless_reset_token=List[UInt8](),
-    )
-
-
-def _empty_retire_connection_id() -> RetireConnectionIdFrame:
-    return RetireConnectionIdFrame(sequence_number=UInt64(0))
-
-
-def _empty_path_challenge() -> PathChallengeFrame:
-    return PathChallengeFrame(data=List[UInt8]())
-
-
-def _empty_path_response() -> PathResponseFrame:
-    return PathResponseFrame(data=List[UInt8]())
-
-
-def _empty_connection_close() -> ConnectionCloseFrame:
-    return ConnectionCloseFrame(
-        application=False,
-        error_code=UInt64(0),
-        frame_type=UInt64(0),
-        reason_phrase=List[UInt8](),
-    )
-
-
-def _zero_frame(kind: Int) -> Frame:
-    return Frame(
-        kind=kind,
-        padding_length=0,
-        ack=_empty_ack(),
-        reset_stream=_empty_reset_stream(),
-        stop_sending=_empty_stop_sending(),
-        crypto=_empty_crypto(),
-        new_token=_empty_new_token(),
-        stream=_empty_stream(),
-        max_data=_empty_max_data(),
-        max_stream_data=_empty_max_stream_data(),
-        max_streams=_empty_max_streams(),
-        data_blocked=_empty_data_blocked(),
-        stream_data_blocked=_empty_stream_data_blocked(),
-        streams_blocked=_empty_streams_blocked(),
-        new_connection_id=_empty_new_connection_id(),
-        retire_connection_id=_empty_retire_connection_id(),
-        path_challenge=_empty_path_challenge(),
-        path_response=_empty_path_response(),
-        connection_close=_empty_connection_close(),
-    )
+    def on_unknown(mut self, type_id: UInt64) raises:
+        """A frame whose wire type lies outside the v1 master
+        table fired. Default policy lives in the implementor: a
+        permissive handler may log and ignore; a strict handler
+        raises to terminate the connection.
+        """
+        ...
 
 
 # ── Encoding helpers (varint append) ─────────────────────────────────────────
@@ -710,62 +650,6 @@ def encode_handshake_done(mut out: List[UInt8]):
     out.append(UInt8(FRAME_TYPE_HANDSHAKE_DONE))
 
 
-# ── Top-level encode dispatcher ──────────────────────────────────────────────
-
-
-def encode_frame(frame: Frame, mut out: List[UInt8]) raises:
-    """Dispatch to the per-type encoder based on ``frame.kind``."""
-    var k = frame.kind
-    if k == FRAME_TYPE_PADDING:
-        encode_padding(frame.padding_length, out)
-    elif k == FRAME_TYPE_PING:
-        encode_ping(out)
-    elif k == FRAME_TYPE_ACK or k == FRAME_TYPE_ACK_ECN:
-        encode_ack(frame.ack, out)
-    elif k == FRAME_TYPE_RESET_STREAM:
-        encode_reset_stream(frame.reset_stream, out)
-    elif k == FRAME_TYPE_STOP_SENDING:
-        encode_stop_sending(frame.stop_sending, out)
-    elif k == FRAME_TYPE_CRYPTO:
-        encode_crypto(frame.crypto, out)
-    elif k == FRAME_TYPE_NEW_TOKEN:
-        encode_new_token(frame.new_token, out)
-    elif k == FRAME_TYPE_STREAM_BASE:
-        encode_stream(frame.stream, out)
-    elif k == FRAME_TYPE_MAX_DATA:
-        encode_max_data(frame.max_data, out)
-    elif k == FRAME_TYPE_MAX_STREAM_DATA:
-        encode_max_stream_data(frame.max_stream_data, out)
-    elif k == FRAME_TYPE_MAX_STREAMS_BIDI or k == FRAME_TYPE_MAX_STREAMS_UNI:
-        encode_max_streams(frame.max_streams, out)
-    elif k == FRAME_TYPE_DATA_BLOCKED:
-        encode_data_blocked(frame.data_blocked, out)
-    elif k == FRAME_TYPE_STREAM_DATA_BLOCKED:
-        encode_stream_data_blocked(frame.stream_data_blocked, out)
-    elif (
-        k == FRAME_TYPE_STREAMS_BLOCKED_BIDI
-        or k == FRAME_TYPE_STREAMS_BLOCKED_UNI
-    ):
-        encode_streams_blocked(frame.streams_blocked, out)
-    elif k == FRAME_TYPE_NEW_CONNECTION_ID:
-        encode_new_connection_id(frame.new_connection_id, out)
-    elif k == FRAME_TYPE_RETIRE_CONNECTION_ID:
-        encode_retire_connection_id(frame.retire_connection_id, out)
-    elif k == FRAME_TYPE_PATH_CHALLENGE:
-        encode_path_challenge(frame.path_challenge, out)
-    elif k == FRAME_TYPE_PATH_RESPONSE:
-        encode_path_response(frame.path_response, out)
-    elif (
-        k == FRAME_TYPE_CONNECTION_CLOSE_TRANSPORT
-        or k == FRAME_TYPE_CONNECTION_CLOSE_APPLICATION
-    ):
-        encode_connection_close(frame.connection_close, out)
-    elif k == FRAME_TYPE_HANDSHAKE_DONE:
-        encode_handshake_done(out)
-    else:
-        raise Error("quic frame: unsupported encode kind " + String(k))
-
-
 # ── Per-type parsers ─────────────────────────────────────────────────────────
 
 
@@ -791,36 +675,48 @@ def _read_bytes(
     return out^
 
 
-def parse_frame(buf: Span[UInt8, _]) raises -> ParsedFrame:
-    """Parse a single transport frame at the start of ``buf``.
+# ── Top-level parse + dispatch ───────────────────────────────────────────────
+
+
+def parse_frame_into[
+    H: FrameHandler
+](buf: Span[UInt8, _], mut handler: H) raises -> Int:
+    """Parse a single transport frame at the start of ``buf`` and
+    fire the matching :trait:`FrameHandler` callback.
 
     The QUIC frame type is itself varint-encoded (§19); for the
     22 codepoints defined in v1 the encoding is single-byte, but
-    the codec reads it as a varint to stay forward-compatible
+    the dispatcher reads it as a varint to stay forward-compatible
     with extension types that may register higher-numbered
-    codepoints.
+    codepoints. Codepoints outside the v1 master table fire
+    :meth:`FrameHandler.on_unknown` with the decoded type id; the
+    handler decides whether to ignore (forward-compat) or raise.
 
-    Returns a :class:`ParsedFrame` carrying the typed
-    :class:`Frame` plus the number of wire bytes consumed.
+    Returns the number of wire bytes consumed -- the caller
+    advances its cursor and re-invokes the dispatcher on the
+    remainder. The dispatcher never panics on malformed input;
+    structural errors (truncated payload, malformed varint, range
+    out of bounds) are reported via raised :class:`Error`.
     """
     if len(buf) == 0:
         raise Error("quic frame: empty buffer")
     var pos = 0
     var type_var = decode_varint(buf[pos:])
     pos += type_var.consumed
-    var t = Int(type_var.value)
+    var raw_type = type_var.value
+    var t = Int(raw_type)
     if t == FRAME_TYPE_PADDING:
         # Per §19.1, PADDING is one byte. The caller can collapse
-        # runs by repeatedly invoking parse_frame; we surface a
-        # single-frame view here so the caller can attribute byte
+        # runs by repeatedly invoking the dispatcher; we surface a
+        # single-frame view here so the caller attributes byte
         # counts cleanly. A small-batch optimisation could fuse
         # consecutive 0x00s but that lives in the connection
         # state-machine layer above.
-        var f = _zero_frame(FRAME_TYPE_PADDING)
-        f.padding_length = 1
-        return ParsedFrame(frame=f^, consumed=pos)
+        handler.on_padding(1)
+        return pos
     if t == FRAME_TYPE_PING:
-        return ParsedFrame(frame=_zero_frame(FRAME_TYPE_PING), consumed=pos)
+        handler.on_ping()
+        return pos
     if t == FRAME_TYPE_ACK or t == FRAME_TYPE_ACK_ECN:
         var largest = _read_varint(buf, pos)
         var delay = _read_varint(buf, pos)
@@ -839,47 +735,46 @@ def parse_frame(buf: Span[UInt8, _]) raises -> ParsedFrame:
             var ect1 = _read_varint(buf, pos)
             var ce = _read_varint(buf, pos)
             ecn.append(EcnCounts(ect0=ect0, ect1=ect1, ce=ce))
-        var f = _zero_frame(t)
-        f.ack = AckFrame(
-            largest_acknowledged=largest,
-            ack_delay=delay,
-            first_ack_range=first,
-            ranges=ranges^,
-            ecn=ecn^,
+        handler.on_ack(
+            AckFrame(
+                largest_acknowledged=largest,
+                ack_delay=delay,
+                first_ack_range=first,
+                ranges=ranges^,
+                ecn=ecn^,
+            )
         )
-        return ParsedFrame(frame=f^, consumed=pos)
+        return pos
     if t == FRAME_TYPE_RESET_STREAM:
         var sid = _read_varint(buf, pos)
         var ec = _read_varint(buf, pos)
         var fs = _read_varint(buf, pos)
-        var f = _zero_frame(FRAME_TYPE_RESET_STREAM)
-        f.reset_stream = ResetStreamFrame(
-            stream_id=sid, application_error_code=ec, final_size=fs
+        handler.on_reset_stream(
+            ResetStreamFrame(
+                stream_id=sid, application_error_code=ec, final_size=fs
+            )
         )
-        return ParsedFrame(frame=f^, consumed=pos)
+        return pos
     if t == FRAME_TYPE_STOP_SENDING:
         var sid = _read_varint(buf, pos)
         var ec = _read_varint(buf, pos)
-        var f = _zero_frame(FRAME_TYPE_STOP_SENDING)
-        f.stop_sending = StopSendingFrame(
-            stream_id=sid, application_error_code=ec
+        handler.on_stop_sending(
+            StopSendingFrame(stream_id=sid, application_error_code=ec)
         )
-        return ParsedFrame(frame=f^, consumed=pos)
+        return pos
     if t == FRAME_TYPE_CRYPTO:
         var off = _read_varint(buf, pos)
         var n = _read_varint(buf, pos)
         var data = _read_bytes(buf, pos, Int(n))
-        var f = _zero_frame(FRAME_TYPE_CRYPTO)
-        f.crypto = CryptoFrame(offset=off, data=data^)
-        return ParsedFrame(frame=f^, consumed=pos)
+        handler.on_crypto(CryptoFrame(offset=off, data=data^))
+        return pos
     if t == FRAME_TYPE_NEW_TOKEN:
         var n = _read_varint(buf, pos)
         if n == UInt64(0):
             raise Error("quic new_token: empty token (RFC 9000 §19.7)")
         var token = _read_bytes(buf, pos, Int(n))
-        var f = _zero_frame(FRAME_TYPE_NEW_TOKEN)
-        f.new_token = NewTokenFrame(token=token^)
-        return ParsedFrame(frame=f^, consumed=pos)
+        handler.on_new_token(NewTokenFrame(token=token^))
+        return pos
     if t >= FRAME_TYPE_STREAM_BASE and t <= FRAME_TYPE_STREAM_MAX:
         var has_off = (t & STREAM_OFF_BIT) != 0
         var has_len = (t & STREAM_LEN_BIT) != 0
@@ -895,54 +790,53 @@ def parse_frame(buf: Span[UInt8, _]) raises -> ParsedFrame:
         else:
             # No explicit length -- payload extends to end of buffer.
             data = _read_bytes(buf, pos, len(buf) - pos)
-        var f = _zero_frame(FRAME_TYPE_STREAM_BASE)
-        f.stream = StreamFrame(stream_id=sid, offset=off, data=data^, fin=fin)
-        return ParsedFrame(frame=f^, consumed=pos)
+        handler.on_stream(
+            StreamFrame(stream_id=sid, offset=off, data=data^, fin=fin)
+        )
+        return pos
     if t == FRAME_TYPE_MAX_DATA:
         var v = _read_varint(buf, pos)
-        var f = _zero_frame(FRAME_TYPE_MAX_DATA)
-        f.max_data = MaxDataFrame(maximum_data=v)
-        return ParsedFrame(frame=f^, consumed=pos)
+        handler.on_max_data(MaxDataFrame(maximum_data=v))
+        return pos
     if t == FRAME_TYPE_MAX_STREAM_DATA:
         var sid = _read_varint(buf, pos)
         var v = _read_varint(buf, pos)
-        var f = _zero_frame(FRAME_TYPE_MAX_STREAM_DATA)
-        f.max_stream_data = MaxStreamDataFrame(
-            stream_id=sid, maximum_stream_data=v
+        handler.on_max_stream_data(
+            MaxStreamDataFrame(stream_id=sid, maximum_stream_data=v)
         )
-        return ParsedFrame(frame=f^, consumed=pos)
+        return pos
     if t == FRAME_TYPE_MAX_STREAMS_BIDI or t == FRAME_TYPE_MAX_STREAMS_UNI:
         var v = _read_varint(buf, pos)
-        var f = _zero_frame(t)
-        f.max_streams = MaxStreamsFrame(
-            unidirectional=t == FRAME_TYPE_MAX_STREAMS_UNI,
-            maximum_streams=v,
+        handler.on_max_streams(
+            MaxStreamsFrame(
+                unidirectional=t == FRAME_TYPE_MAX_STREAMS_UNI,
+                maximum_streams=v,
+            )
         )
-        return ParsedFrame(frame=f^, consumed=pos)
+        return pos
     if t == FRAME_TYPE_DATA_BLOCKED:
         var v = _read_varint(buf, pos)
-        var f = _zero_frame(FRAME_TYPE_DATA_BLOCKED)
-        f.data_blocked = DataBlockedFrame(maximum_data=v)
-        return ParsedFrame(frame=f^, consumed=pos)
+        handler.on_data_blocked(DataBlockedFrame(maximum_data=v))
+        return pos
     if t == FRAME_TYPE_STREAM_DATA_BLOCKED:
         var sid = _read_varint(buf, pos)
         var v = _read_varint(buf, pos)
-        var f = _zero_frame(FRAME_TYPE_STREAM_DATA_BLOCKED)
-        f.stream_data_blocked = StreamDataBlockedFrame(
-            stream_id=sid, maximum_stream_data=v
+        handler.on_stream_data_blocked(
+            StreamDataBlockedFrame(stream_id=sid, maximum_stream_data=v)
         )
-        return ParsedFrame(frame=f^, consumed=pos)
+        return pos
     if (
         t == FRAME_TYPE_STREAMS_BLOCKED_BIDI
         or t == FRAME_TYPE_STREAMS_BLOCKED_UNI
     ):
         var v = _read_varint(buf, pos)
-        var f = _zero_frame(t)
-        f.streams_blocked = StreamsBlockedFrame(
-            unidirectional=t == FRAME_TYPE_STREAMS_BLOCKED_UNI,
-            maximum_streams=v,
+        handler.on_streams_blocked(
+            StreamsBlockedFrame(
+                unidirectional=t == FRAME_TYPE_STREAMS_BLOCKED_UNI,
+                maximum_streams=v,
+            )
         )
-        return ParsedFrame(frame=f^, consumed=pos)
+        return pos
     if t == FRAME_TYPE_NEW_CONNECTION_ID:
         var seq = _read_varint(buf, pos)
         var retire = _read_varint(buf, pos)
@@ -958,29 +852,29 @@ def parse_frame(buf: Span[UInt8, _]) raises -> ParsedFrame:
             raise Error(
                 "quic new_connection_id: retire_prior_to > sequence_number"
             )
-        var f = _zero_frame(FRAME_TYPE_NEW_CONNECTION_ID)
-        f.new_connection_id = NewConnectionIdFrame(
-            sequence_number=seq,
-            retire_prior_to=retire,
-            connection_id=cid^,
-            stateless_reset_token=token^,
+        handler.on_new_connection_id(
+            NewConnectionIdFrame(
+                sequence_number=seq,
+                retire_prior_to=retire,
+                connection_id=cid^,
+                stateless_reset_token=token^,
+            )
         )
-        return ParsedFrame(frame=f^, consumed=pos)
+        return pos
     if t == FRAME_TYPE_RETIRE_CONNECTION_ID:
         var seq = _read_varint(buf, pos)
-        var f = _zero_frame(FRAME_TYPE_RETIRE_CONNECTION_ID)
-        f.retire_connection_id = RetireConnectionIdFrame(sequence_number=seq)
-        return ParsedFrame(frame=f^, consumed=pos)
+        handler.on_retire_connection_id(
+            RetireConnectionIdFrame(sequence_number=seq)
+        )
+        return pos
     if t == FRAME_TYPE_PATH_CHALLENGE:
         var data = _read_bytes(buf, pos, 8)
-        var f = _zero_frame(FRAME_TYPE_PATH_CHALLENGE)
-        f.path_challenge = PathChallengeFrame(data=data^)
-        return ParsedFrame(frame=f^, consumed=pos)
+        handler.on_path_challenge(PathChallengeFrame(data=data^))
+        return pos
     if t == FRAME_TYPE_PATH_RESPONSE:
         var data = _read_bytes(buf, pos, 8)
-        var f = _zero_frame(FRAME_TYPE_PATH_RESPONSE)
-        f.path_response = PathResponseFrame(data=data^)
-        return ParsedFrame(frame=f^, consumed=pos)
+        handler.on_path_response(PathResponseFrame(data=data^))
+        return pos
     if (
         t == FRAME_TYPE_CONNECTION_CLOSE_TRANSPORT
         or t == FRAME_TYPE_CONNECTION_CLOSE_APPLICATION
@@ -991,17 +885,17 @@ def parse_frame(buf: Span[UInt8, _]) raises -> ParsedFrame:
             ft = _read_varint(buf, pos)
         var rn = _read_varint(buf, pos)
         var reason = _read_bytes(buf, pos, Int(rn))
-        var f = _zero_frame(t)
-        f.connection_close = ConnectionCloseFrame(
-            application=t == FRAME_TYPE_CONNECTION_CLOSE_APPLICATION,
-            error_code=ec,
-            frame_type=ft,
-            reason_phrase=reason^,
+        handler.on_connection_close(
+            ConnectionCloseFrame(
+                application=t == FRAME_TYPE_CONNECTION_CLOSE_APPLICATION,
+                error_code=ec,
+                frame_type=ft,
+                reason_phrase=reason^,
+            )
         )
-        return ParsedFrame(frame=f^, consumed=pos)
+        return pos
     if t == FRAME_TYPE_HANDSHAKE_DONE:
-        return ParsedFrame(
-            frame=_zero_frame(FRAME_TYPE_HANDSHAKE_DONE),
-            consumed=pos,
-        )
-    raise Error("quic frame: unknown type " + String(t))
+        handler.on_handshake_done()
+        return pos
+    handler.on_unknown(raw_type)
+    return pos

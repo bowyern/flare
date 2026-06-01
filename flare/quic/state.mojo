@@ -1,9 +1,9 @@
 """QUIC connection + stream state machines (RFC 9000 §3 + §13).
 
 Pure sans-I/O state model for a QUIC connection. The reactor
-(later Phase D commit) wraps this in UDP I/O + crypto; the codec
-layer here just walks the state machines as packets / frames /
-timer ticks arrive.
+wrapping wraps this in UDP I/O + crypto; the codec layer here
+just walks the state machines as packets / frames / timer ticks
+arrive.
 
 Public surface:
 
@@ -20,15 +20,20 @@ Public surface:
   - flow-control limits + cwnd via :class:`CcState`,
   - per-stream :class:`Stream` instances keyed by stream-id,
   - the timer-driven idle / pto / loss-detection deadlines.
-* :func:`handle_frame` -- per-frame ingestion entry point. Takes
-  one parsed :class:`flare.quic.frame.Frame` and advances the
-  connection + stream state machines without emitting any wire
-  bytes (the connection's outbox is filled by the caller via
-  helpers like :func:`emit_ack` / :func:`emit_max_data` / ...).
+* :func:`handle_frame_buf` -- per-buffer ingestion entry point.
+  Reads one wire frame from the start of ``buf``, dispatches the
+  matching :trait:`FrameHandler` callback into the connection
+  state machines, and returns the number of bytes consumed. The
+  caller drains a packet payload by advancing its cursor and
+  re-invoking the dispatcher.
 * :class:`ConnectionEvents` -- the value the driver returns from
   one tick: bytes the caller should send, the next deadline at
   which to call back, plus connection-level events (handshake
   done, stream finished, connection closed).
+* :func:`apply_stream` / :func:`apply_ack` / etc. -- per-typed
+  payload helpers the dispatcher calls; exposed so the reactor
+  layer (and tests) can drive transitions directly when they
+  already have a typed payload in hand.
 
 The state-machine layer is intentionally sans-I/O: there are no
 sockets, no TLS handshake, no time source. The caller passes
@@ -42,28 +47,29 @@ References:
 """
 
 from std.collections import List, Optional, Dict
-from std.memory import Span
+from std.memory import Span, UnsafePointer
 
 from .frame import (
     AckFrame,
     AckRange,
     ConnectionCloseFrame,
     CryptoFrame,
-    Frame,
-    FRAME_TYPE_ACK,
-    FRAME_TYPE_ACK_ECN,
-    FRAME_TYPE_CONNECTION_CLOSE_APPLICATION,
-    FRAME_TYPE_CONNECTION_CLOSE_TRANSPORT,
-    FRAME_TYPE_CRYPTO,
-    FRAME_TYPE_HANDSHAKE_DONE,
-    FRAME_TYPE_MAX_DATA,
-    FRAME_TYPE_MAX_STREAM_DATA,
-    FRAME_TYPE_PADDING,
-    FRAME_TYPE_PING,
-    FRAME_TYPE_RESET_STREAM,
-    FRAME_TYPE_STOP_SENDING,
-    FRAME_TYPE_STREAM_BASE,
+    DataBlockedFrame,
+    FrameHandler,
+    MaxDataFrame,
+    MaxStreamDataFrame,
+    MaxStreamsFrame,
+    NewConnectionIdFrame,
+    NewTokenFrame,
+    PathChallengeFrame,
+    PathResponseFrame,
+    ResetStreamFrame,
+    RetireConnectionIdFrame,
+    StopSendingFrame,
+    StreamDataBlockedFrame,
     StreamFrame,
+    StreamsBlockedFrame,
+    parse_frame_into,
 )
 
 
@@ -85,9 +91,9 @@ struct Stream(Copyable, ImplicitlyCopyable, Movable):
 
     The state field uses the seven STREAM_STATE_* constants;
     transitions are driven by frames (STREAM with FIN, RESET_STREAM,
-    STOP_SENDING) routed through :func:`handle_frame`. Send and
-    receive high-water-marks are tracked separately so flow control
-    can advance independently per direction.
+    STOP_SENDING) routed through :func:`handle_frame_buf`. Send
+    and receive high-water-marks are tracked separately so flow
+    control can advance independently per direction.
     """
 
     var id: UInt64
@@ -128,9 +134,9 @@ comptime CONN_STATE_CLOSED: Int = 4
 struct ConnectionEvents(Copyable, Movable):
     """Per-tick output of the connection state machine.
 
-    The driver calls :func:`handle_frame` (one or more times) with
-    parsed frames, then reads :class:`ConnectionEvents` to discover
-    what state has changed:
+    The driver calls :func:`handle_frame_buf` (one or more times)
+    with parsed frames, then reads :class:`ConnectionEvents` to
+    discover what state has changed:
 
     * ``handshake_done`` -- TLS handshake completed this tick.
     * ``connection_closed`` -- the peer closed the connection or
@@ -214,14 +220,34 @@ def new_connection(
     )
 
 
-# ── Frame ingestion ────────────────────────────────────────────────────────
+# ── Per-typed-payload state transitions ────────────────────────────────────
 
 
-def _on_stream_frame(
+@always_inline
+def _arrive(mut conn: Connection, now_us: UInt64, ack_eliciting: Bool):
+    """Per-frame bookkeeping: update activity time + ack-pending.
+
+    Every frame ingestion calls this first. ACK / PADDING /
+    CONNECTION_CLOSE pass ``ack_eliciting=False`` per RFC 9002 §2;
+    everything else is ack-eliciting.
+    """
+    conn.last_activity_us = now_us
+    if ack_eliciting:
+        conn.ack_pending = True
+
+
+def apply_stream(
     mut conn: Connection,
     sf: StreamFrame,
     mut events: ConnectionEvents,
 ) raises:
+    """Apply a STREAM frame (§19.8) to the connection.
+
+    Creates the stream on first sight, advances the recv offset
+    high-water-mark, enforces the flow-control limit, and emits a
+    ``finished_streams`` entry when the FIN bit closes the recv
+    side. Raises on flow-control violation.
+    """
     var sid = sf.stream_id
     var existing = conn.streams.get(sid)
     var s: Stream
@@ -247,7 +273,7 @@ def _on_stream_frame(
     conn.streams[sid] = s
 
 
-def _on_ack_frame(mut conn: Connection, ack: AckFrame):
+def apply_ack(mut conn: Connection, ack: AckFrame):
     """Apply an ACK frame to the connection-level bookkeeping.
 
     The codec-layer state machine only tracks bytes_in_flight at
@@ -260,11 +286,13 @@ def _on_ack_frame(mut conn: Connection, ack: AckFrame):
         conn.largest_received_packet = ack.largest_acknowledged
 
 
-def _on_close_frame(
+def apply_connection_close(
     mut conn: Connection,
     cc: ConnectionCloseFrame,
     mut events: ConnectionEvents,
 ):
+    """Apply a CONNECTION_CLOSE frame to the connection. Marks the
+    connection as DRAINING and stores the close reason."""
     conn.state = CONN_STATE_DRAINING
     conn.close_error_code = cc.error_code
     var reason = List[UInt8]()
@@ -275,97 +303,197 @@ def _on_close_frame(
     events.error_code = cc.error_code
 
 
-def handle_frame(
-    mut conn: Connection,
-    frame: Frame,
-    now_us: UInt64,
-    mut events: ConnectionEvents,
-) raises:
-    """Apply one parsed frame to the connection state machines.
+def apply_max_data(mut conn: Connection, m: MaxDataFrame):
+    """Apply a MAX_DATA frame: monotonically advance the
+    connection's send-side flow-control limit."""
+    if m.maximum_data > conn.max_data_send:
+        conn.max_data_send = m.maximum_data
 
-    Updates ``last_activity_us`` for the idle timer, flips
-    ``ack_pending`` for ack-eliciting frame types (everything
-    except ACK / PADDING / CONNECTION_CLOSE per RFC 9002 §2),
-    and dispatches per-frame state transitions.
 
-    The caller batches per-packet frame iteration: for each
-    received packet, decode its frames with
-    :func:`flare.quic.frame.parse_frame` and call this function
-    per frame, accumulating events in the same
-    :class:`ConnectionEvents` carrier. After the packet is
-    drained the caller reads the events back.
+def apply_max_stream_data(mut conn: Connection, m: MaxStreamDataFrame):
+    """Apply a MAX_STREAM_DATA frame: advance the per-stream send
+    high-water-mark for the addressed stream (no-op if the stream
+    has not been seen yet)."""
+    var sid = m.stream_id
+    var s_opt = conn.streams.get(sid)
+    if Bool(s_opt):
+        var s = s_opt.value()
+        if m.maximum_stream_data > s.max_send_data:
+            s.max_send_data = m.maximum_stream_data
+        conn.streams[sid] = s
+
+
+def apply_reset_stream(mut conn: Connection, rs: ResetStreamFrame):
+    """Apply a RESET_STREAM frame: transition the stream to
+    RESET_RECVD (no-op if the stream is unknown)."""
+    var sid = rs.stream_id
+    var s_opt = conn.streams.get(sid)
+    if Bool(s_opt):
+        var s = s_opt.value()
+        s.state = STREAM_STATE_RESET_RECVD
+        conn.streams[sid] = s
+
+
+def apply_stop_sending(mut conn: Connection, ss: StopSendingFrame):
+    """Apply a STOP_SENDING frame: transition the stream to
+    RESET_SENT (no-op if the stream is unknown)."""
+    var sid = ss.stream_id
+    var s_opt = conn.streams.get(sid)
+    if Bool(s_opt):
+        var s = s_opt.value()
+        s.state = STREAM_STATE_RESET_SENT
+        conn.streams[sid] = s
+
+
+def apply_handshake_done(mut conn: Connection, mut events: ConnectionEvents):
+    """Apply a HANDSHAKE_DONE frame: flip the connection to
+    ESTABLISHED and surface the event."""
+    conn.handshake_complete = True
+    conn.state = CONN_STATE_ESTABLISHED
+    events.handshake_done = True
+
+
+# ── Frame-dispatch adapter ────────────────────────────────────────────────
+
+
+@fieldwise_init
+struct _ConnFrameHandler(FrameHandler):
+    """:trait:`FrameHandler` impl bridging the parser into the
+    connection state machines.
+
+    Holds raw addresses for the caller's :class:`Connection` and
+    :class:`ConnectionEvents` so the dispatcher can mutate them
+    in place without owning them. The handler is built once per
+    :func:`handle_frame_buf` call and discarded immediately; the
+    pointer lifetimes are bounded by the calling stack frame.
     """
-    if conn.state == CONN_STATE_CLOSED:
-        return
-    conn.last_activity_us = now_us
-    var k = frame.kind
-    var ack_eliciting = not (
-        k == FRAME_TYPE_ACK
-        or k == FRAME_TYPE_ACK_ECN
-        or k == FRAME_TYPE_PADDING
-        or k == FRAME_TYPE_CONNECTION_CLOSE_TRANSPORT
-        or k == FRAME_TYPE_CONNECTION_CLOSE_APPLICATION
-    )
-    if ack_eliciting:
-        conn.ack_pending = True
-    if k == FRAME_TYPE_PADDING or k == FRAME_TYPE_PING:
-        return
-    if k == FRAME_TYPE_ACK or k == FRAME_TYPE_ACK_ECN:
-        _on_ack_frame(conn, frame.ack)
-        return
-    if k == FRAME_TYPE_CRYPTO:
+
+    var conn_addr: Int
+    var events_addr: Int
+    var now_us: UInt64
+
+    @always_inline
+    def _conn(self) -> UnsafePointer[Connection, MutExternalOrigin]:
+        return UnsafePointer[Connection, MutExternalOrigin](
+            unsafe_from_address=self.conn_addr
+        )
+
+    @always_inline
+    def _events(
+        self,
+    ) -> UnsafePointer[ConnectionEvents, MutExternalOrigin]:
+        return UnsafePointer[ConnectionEvents, MutExternalOrigin](
+            unsafe_from_address=self.events_addr
+        )
+
+    def on_padding(mut self, count: Int) raises:
+        _arrive(self._conn()[], self.now_us, ack_eliciting=False)
+
+    def on_ping(mut self) raises:
+        _arrive(self._conn()[], self.now_us, ack_eliciting=True)
+
+    def on_ack(mut self, ack: AckFrame) raises:
+        _arrive(self._conn()[], self.now_us, ack_eliciting=False)
+        apply_ack(self._conn()[], ack)
+
+    def on_reset_stream(mut self, rs: ResetStreamFrame) raises:
+        _arrive(self._conn()[], self.now_us, ack_eliciting=True)
+        apply_reset_stream(self._conn()[], rs)
+
+    def on_stop_sending(mut self, ss: StopSendingFrame) raises:
+        _arrive(self._conn()[], self.now_us, ack_eliciting=True)
+        apply_stop_sending(self._conn()[], ss)
+
+    def on_crypto(mut self, c: CryptoFrame) raises:
+        _arrive(self._conn()[], self.now_us, ack_eliciting=True)
         # Crypto stream is opaque at this layer; the reactor
         # forwards its bytes to the TLS handshake adapter, then
         # later signals handshake completion via
         # :func:`mark_handshake_complete`.
-        return
-    if k == FRAME_TYPE_STREAM_BASE:
-        _on_stream_frame(conn, frame.stream, events)
-        return
-    if k == FRAME_TYPE_HANDSHAKE_DONE:
-        conn.handshake_complete = True
-        conn.state = CONN_STATE_ESTABLISHED
-        events.handshake_done = True
-        return
-    if (
-        k == FRAME_TYPE_CONNECTION_CLOSE_TRANSPORT
-        or k == FRAME_TYPE_CONNECTION_CLOSE_APPLICATION
-    ):
-        _on_close_frame(conn, frame.connection_close, events)
-        return
-    if k == FRAME_TYPE_MAX_DATA:
-        if frame.max_data.maximum_data > conn.max_data_send:
-            conn.max_data_send = frame.max_data.maximum_data
-        return
-    if k == FRAME_TYPE_MAX_STREAM_DATA:
-        var sid = frame.max_stream_data.stream_id
-        var s_opt = conn.streams.get(sid)
-        if Bool(s_opt):
-            var s = s_opt.value()
-            if frame.max_stream_data.maximum_stream_data > s.max_send_data:
-                s.max_send_data = frame.max_stream_data.maximum_stream_data
-            conn.streams[sid] = s
-        return
-    if k == FRAME_TYPE_RESET_STREAM:
-        var sid = frame.reset_stream.stream_id
-        var s_opt = conn.streams.get(sid)
-        if Bool(s_opt):
-            var s = s_opt.value()
-            s.state = STREAM_STATE_RESET_RECVD
-            conn.streams[sid] = s
-        return
-    if k == FRAME_TYPE_STOP_SENDING:
-        var sid = frame.stop_sending.stream_id
-        var s_opt = conn.streams.get(sid)
-        if Bool(s_opt):
-            var s = s_opt.value()
-            s.state = STREAM_STATE_RESET_SENT
-            conn.streams[sid] = s
-        return
-    # Other frame types (NEW_TOKEN, NEW_CONNECTION_ID, PATH_*,
-    # MAX_STREAMS, *_BLOCKED, RETIRE_CONNECTION_ID) advance
-    # connection bookkeeping the reactor handles directly; the
-    # codec-layer state machine treats them as no-ops here.
+
+    def on_new_token(mut self, t: NewTokenFrame) raises:
+        _arrive(self._conn()[], self.now_us, ack_eliciting=True)
+
+    def on_stream(mut self, sf: StreamFrame) raises:
+        _arrive(self._conn()[], self.now_us, ack_eliciting=True)
+        apply_stream(self._conn()[], sf, self._events()[])
+
+    def on_max_data(mut self, m: MaxDataFrame) raises:
+        _arrive(self._conn()[], self.now_us, ack_eliciting=True)
+        apply_max_data(self._conn()[], m)
+
+    def on_max_stream_data(mut self, m: MaxStreamDataFrame) raises:
+        _arrive(self._conn()[], self.now_us, ack_eliciting=True)
+        apply_max_stream_data(self._conn()[], m)
+
+    def on_max_streams(mut self, m: MaxStreamsFrame) raises:
+        _arrive(self._conn()[], self.now_us, ack_eliciting=True)
+
+    def on_data_blocked(mut self, db: DataBlockedFrame) raises:
+        _arrive(self._conn()[], self.now_us, ack_eliciting=True)
+
+    def on_stream_data_blocked(mut self, sdb: StreamDataBlockedFrame) raises:
+        _arrive(self._conn()[], self.now_us, ack_eliciting=True)
+
+    def on_streams_blocked(mut self, sb: StreamsBlockedFrame) raises:
+        _arrive(self._conn()[], self.now_us, ack_eliciting=True)
+
+    def on_new_connection_id(mut self, ncid: NewConnectionIdFrame) raises:
+        _arrive(self._conn()[], self.now_us, ack_eliciting=True)
+
+    def on_retire_connection_id(mut self, rcid: RetireConnectionIdFrame) raises:
+        _arrive(self._conn()[], self.now_us, ack_eliciting=True)
+
+    def on_path_challenge(mut self, pc: PathChallengeFrame) raises:
+        _arrive(self._conn()[], self.now_us, ack_eliciting=True)
+
+    def on_path_response(mut self, pr: PathResponseFrame) raises:
+        _arrive(self._conn()[], self.now_us, ack_eliciting=True)
+
+    def on_connection_close(mut self, cc: ConnectionCloseFrame) raises:
+        _arrive(self._conn()[], self.now_us, ack_eliciting=False)
+        apply_connection_close(self._conn()[], cc, self._events()[])
+
+    def on_handshake_done(mut self) raises:
+        _arrive(self._conn()[], self.now_us, ack_eliciting=True)
+        apply_handshake_done(self._conn()[], self._events()[])
+
+    def on_unknown(mut self, type_id: UInt64) raises:
+        # Forward-compatibility: extension codepoints are ignored
+        # at the state-machine layer; the reactor wrapper may
+        # still log them if it cares.
+        _arrive(self._conn()[], self.now_us, ack_eliciting=True)
+
+
+# ── Top-level frame ingestion ─────────────────────────────────────────────
+
+
+def handle_frame_buf(
+    mut conn: Connection,
+    buf: Span[UInt8, _],
+    now_us: UInt64,
+    mut events: ConnectionEvents,
+) raises -> Int:
+    """Apply one wire frame from the start of ``buf`` to the
+    connection state machines.
+
+    Returns the number of bytes the dispatcher consumed; the
+    caller drains the rest of a packet payload by advancing its
+    cursor and re-invoking the dispatcher on the remainder.
+    Internally builds a small adapter implementing
+    :trait:`flare.quic.frame.FrameHandler` and delegates to
+    :func:`flare.quic.frame.parse_frame_into`.
+    """
+    if conn.state == CONN_STATE_CLOSED:
+        # Drop bytes silently — caller will advance past closed
+        # connections in its packet drain.
+        return len(buf)
+    var conn_addr = Int(UnsafePointer[Connection, _](to=conn))
+    var events_addr = Int(UnsafePointer[ConnectionEvents, _](to=events))
+    var h = _ConnFrameHandler(
+        conn_addr=conn_addr, events_addr=events_addr, now_us=now_us
+    )
+    return parse_frame_into(buf, h)
 
 
 def mark_handshake_complete(
