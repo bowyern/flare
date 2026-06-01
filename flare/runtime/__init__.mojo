@@ -28,6 +28,7 @@ from .event import (
 from .reactor import Reactor
 from .timer_wheel import TimerWheel
 from ._thread import num_cpus
+from .frontend import Frontend
 from .scheduler import Scheduler, default_worker_count
 from .pool import Pool
 from .buffer_pool import BufferHandle, BufferPool

@@ -40,22 +40,36 @@ Expected behaviour: ``0 failed, 0 slow`` across every iteration.
 from std.memory import UnsafePointer
 from std.os import getenv
 
-from flare.http import Handler, Request, Response, ok
-from flare.http.server import ServerConfig
 from flare.http._server_reactor_impl import _monotonic_ms
 from flare.net import SocketAddr
-from flare.runtime.scheduler import Scheduler
+from flare.runtime import Frontend, Scheduler
+from flare.runtime._libc_time import libc_nanosleep_ms
 
 
-# ── Handler: zero-size, Copyable, Handler-conforming, no side effects ───────
+# ── Frontend: zero-protocol, idles until stopping flips ─────────────────────
 
 
 @fieldwise_init
-struct _NopHandler(Copyable, Handler):
+struct _NopFrontend(Copyable, Frontend, Movable):
+    """Test-only frontend: spin in 50 ms sleeps until ``stopping``.
+
+    Mirrors the production ``HttpFrontend`` lifecycle (run_worker
+    returns when stopping flips, frontend is per-worker copyable)
+    without pulling in any HTTP machinery -- the stress driver
+    exercises the scheduler primitives in isolation.
+    """
+
     var tag: Int
 
-    def serve(self, req: Request) raises -> Response:
-        return ok("nop")
+    def requires_per_worker_listener(self) -> Bool:
+        return False
+
+    def run_worker(mut self, listener_fd: Int, mut stopping: Bool):
+        var stopping_addr = Int(UnsafePointer[Bool, _](to=stopping))
+        while not UnsafePointer[Bool, MutExternalOrigin](
+            unsafe_from_address=stopping_addr
+        )[]:
+            _ = libc_nanosleep_ms(50)
 
 
 # ── xorshift64 PRNG (deterministic, no external dep) ────────────────────────
@@ -68,17 +82,6 @@ def _xorshift64(mut state: UInt64) -> UInt64:
     x = x ^ (x << 17)
     state = x
     return x
-
-
-# ── Config used for every iteration (tight timeouts for responsiveness) ─────
-
-
-def _stress_config() -> ServerConfig:
-    var cfg = ServerConfig()
-    cfg.idle_timeout_ms = 100
-    cfg.write_timeout_ms = 200
-    cfg.shutdown_timeout_ms = 200
-    return cfg^
 
 
 # ── Stress loop ─────────────────────────────────────────────────────────────
@@ -110,14 +113,11 @@ def _run_one(mut rng: UInt64, iter_idx: Int) raises -> Int:
     var extra_churn = Int(r2 % UInt64(4))  # 0..=3
 
     var addr = SocketAddr.localhost(0)
-    var h = _NopHandler(iter_idx)
-    var cfg = _stress_config()
 
     var t_start = _monotonic_ms()
-    var s = Scheduler[_NopHandler].start(
+    var s = Scheduler[_NopFrontend].start(
         addr=addr,
-        config=cfg^,
-        handler=h^,
+        frontend=_NopFrontend(iter_idx),
         num_workers=num_workers,
         pin_cores=pin_cores,
     )

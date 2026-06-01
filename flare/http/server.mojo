@@ -181,33 +181,13 @@ comptime _DEFAULT_SERVER_CONFIG: ServerConfig = ServerConfig()
 
 
 # ── ShutdownReport ───────────────────────────────────────────────────────────
+#
+# The canonical type lives in :mod:`flare.runtime.scheduler` (a runtime
+# primitive: it represents the result of joining N pthread workers).
+# Re-exported here so the public ``flare.http.ShutdownReport`` surface
+# is unchanged for users who imported it from the HTTP module.
 
-
-@fieldwise_init
-struct ShutdownReport(Copyable, ImplicitlyCopyable, Movable):
-    """Result of a graceful shutdown via ``HttpServer.drain`` or
-    ``Scheduler.drain``.
-
-    The multi-worker variant returns one report per worker; the
-    single-threaded ``HttpServer.drain`` returns one. ``drained``
-    and ``timed_out`` are best-effort counts the reactor / scheduler
-    can observe from its own side; ``in_flight_at_deadline`` is the
-    remaining-connection count at the moment the timeout elapsed
-    (zero when drain completed cleanly).
-
-    Fields:
-        drained: Connections that completed their in-flight work
-            inside the drain timeout. Best-effort.
-        timed_out: Connections that were force-closed because the
-            drain timeout elapsed before they finished. Best-effort.
-        in_flight_at_deadline: Connections still alive at the
-            instant the timeout fired (== ``timed_out`` after the
-            force-close completes).
-    """
-
-    var drained: Int
-    var timed_out: Int
-    var in_flight_at_deadline: Int
+from flare.runtime.scheduler import ShutdownReport
 
 
 # ── HttpServer ────────────────────────────────────────────────────────────────
@@ -704,7 +684,8 @@ struct HttpServer(Movable):
         dispatch through the same ``Scheduler.start`` call site. Not
         part of the public API; callers should go through ``serve``.
         """
-        from ..runtime.scheduler import Scheduler
+        from ..runtime import Scheduler
+        from .frontend import HttpFrontend
 
         var addr = self._listener.local_addr()
         self._listener.close()
@@ -715,14 +696,17 @@ struct HttpServer(Movable):
         if not self.config.use_bufring:
             self.config.use_bufring = _resolve_bufring_handler_env()
 
-        var scheduler = Scheduler[H].start(
+        var frontend = HttpFrontend[H](
+            handler^,
+            self.config.copy(),
+            self.h2_config.copy(),
+            auto_protocol=True,
+        )
+        var scheduler = Scheduler[HttpFrontend[H]].start(
             addr=addr,
-            config=self.config.copy(),
-            handler=handler^,
+            frontend=frontend^,
             num_workers=num_workers,
             pin_cores=pin_cores,
-            auto_protocol=True,
-            h2_config=self.h2_config.copy(),
         )
 
         # Block until the caller flips _stopping via close() or until
@@ -980,7 +964,8 @@ struct HttpServer(Movable):
         """Multi-worker twin of :meth:`serve_static`.
 
         Spawns ``num_workers`` pthread workers via
-        :class:`flare.runtime.scheduler.StaticScheduler`, each running
+        :class:`flare.runtime.Scheduler` parameterized over
+        :class:`flare.http.StaticHttpFrontend`, each running
         ``run_reactor_loop_static_shared``. Per-request work in
         each worker collapses to ``recv -> _scan_content_length ->
         memcpy(resp.bytes) -> send`` -- no parser, no handler, no
@@ -991,7 +976,7 @@ struct HttpServer(Movable):
         write buffers (no cross-thread state).
 
         The HttpServer's bound listener is closed before spawning;
-        the StaticScheduler then binds its own listener(s) at the
+        the Scheduler then binds its own listener(s) at the
         same address. By default each worker pre-binds its own
         ``SO_REUSEPORT`` listener (highest throughput; matches
         actix_web's listener strategy). Export
@@ -1001,7 +986,7 @@ struct HttpServer(Movable):
         static fast path) for a uniformly tighter p99.99 σ
         under sustained load; see ``docs/benchmark.md``.
 
-        Caller is expected to hold the StaticScheduler reference
+        Caller is expected to hold the scheduler reference
         returned via ``self._stopping`` indirectly -- in practice,
         callers run this until SIGINT and let the process exit.
 
@@ -1016,16 +1001,17 @@ struct HttpServer(Movable):
             Error: On ``pthread_create`` failure (rare); partially-
                 started workers are best-effort joined before raise.
         """
-        from ..runtime.scheduler import StaticScheduler
+        from ..runtime import Scheduler
         from ..runtime._libc_time import libc_nanosleep_ms
+        from .frontend import StaticHttpFrontend
 
         var addr = self._listener.local_addr()
         self._listener.close()
 
-        var scheduler = StaticScheduler.start(
+        var frontend = StaticHttpFrontend(self.config.copy(), resp^)
+        var scheduler = Scheduler[StaticHttpFrontend].start(
             addr=addr,
-            config=self.config.copy(),
-            resp=resp^,
+            frontend=frontend^,
             num_workers=num_workers,
             pin_cores=pin_cores,
         )

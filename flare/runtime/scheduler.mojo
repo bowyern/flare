@@ -36,16 +36,24 @@ not trigger an ``EPOLLHUP`` and the workers stay blocked in
 ``epoll_wait`` until the 100 ms poll timeout fires. The heap flag is
 what actually breaks the loop.
 
-This module is ``Handler``-generic: every worker runs the same
-``H: Handler`` that the caller passed to ``Scheduler.start``. The
-handler value is moved (per-worker copies are made via ``H.copy()``;
-if that's expensive users should wrap their handler's expensive state
-behind an ``UnsafePointer`` or a similar shared-reference holder).
+This module is :trait:`Frontend`-generic: every worker calls
+:meth:`Frontend.run_worker` once with its assigned listener fd
+and the shared stopping flag. The frontend value is moved
+(per-worker copies are made via ``F.copy()``; if that's expensive
+users should wrap their handler's expensive state behind an
+``UnsafePointer`` or a similar shared-reference holder).
 
-Only the ``Handler`` and ``ServerConfig`` machinery that already
-has is touched; the run loop is ``run_reactor_loop_shared[H]`` from
-``flare.http._server_reactor_impl`` (the shared-listener
-variant of the prior ``run_reactor_loop``).
+The scheduler used to import directly from
+:mod:`flare.http._server_reactor_impl`,
+:mod:`flare.http._unified_reactor_impl`,
+:mod:`flare.http.handler`, :mod:`flare.http.server`,
+:mod:`flare.http.static_response`, and :mod:`flare.http2.server`.
+That layering violation (runtime depending on protocol modules)
+is gone now; the scheduler depends only on the
+:trait:`flare.runtime.Frontend` trait and concrete impls live
+where their protocol does
+(:class:`flare.http.HttpFrontend` /
+:class:`flare.http.StaticHttpFrontend`).
 
 Known limitations:
 
@@ -55,12 +63,12 @@ Known limitations:
   things: (1) aligned single-byte loads and stores being atomic at
   the hardware level on x86-64 and ARM64 with no torn reads;
   (2) the volatile-style ``UnsafePointer[Bool, MutExternalOrigin]``
-  materialisation inside ``run_reactor_loop_shared`` defeating
+  materialisation inside the frontend's serving loop defeating
   the optimiser's LICM so every iteration re-reads the flag.
   This is enough in practice on both platforms flare targets,
   but the flag should be upgraded to an ``Atomic`` with explicit
   release/acquire ordering once the stdlib stabilises one.
-- Worker panics that escape ``run_reactor_loop_shared`` are caught and
+- Worker panics that escape :meth:`Frontend.run_worker` are caught and
   discarded in ``_worker_entry`` because pthread has no exception
   channel. ``is_running()`` still reports ``True`` until the
   ``ThreadHandle`` is joined, which is a mildly wrong signal for a
@@ -72,24 +80,49 @@ Known limitations:
 from std.ffi import c_int, external_call
 from std.memory import UnsafePointer, alloc
 
-from ..http.handler import Handler
-from ..http.server import ServerConfig, ShutdownReport
-from ..http._server_reactor_impl import (
-    run_reactor_loop_shared,
-    run_reactor_loop_static_shared,
-    run_uring_bufring_reactor_loop_shared,
-)
-from ..http._unified_reactor_impl import run_unified_reactor_loop_shared
-from ..http.static_response import StaticResponse
-from ..http2.server import Http2Config
-from .uring_reactor import use_uring_backend
 from std.os import getenv
 from std.sys.info import CompilationTarget
 from ..net import SocketAddr
 from ..tcp import TcpListener
 
 from ._thread import ThreadHandle, num_cpus, _OpaquePtr
+from .frontend import Frontend
 from .reuseport import bind_reuseport, bind_shared
+
+
+# ── ShutdownReport (per-worker drain accounting) ─────────────────────────────
+
+
+@fieldwise_init
+struct ShutdownReport(Copyable, ImplicitlyCopyable, Movable):
+    """Per-worker drain summary returned by :meth:`Scheduler.drain`.
+
+    Originally defined under ``flare.http.server`` and imported back
+    by the scheduler; promoted into :mod:`flare.runtime` to break
+    the runtime → http import cycle. ``flare.http.server`` re-exports
+    this type so the public ``flare.http.ShutdownReport`` surface is
+    unchanged.
+
+    The per-worker registry that would let us count individual
+    in-flight connections lives on each worker's stack today;
+    until that registry is published back through a shared
+    atomic, ``in_flight_at_deadline`` is the coarse 0/1 signal
+    driven by whether the worker's join completed inside the
+    budget.
+
+    Fields:
+        drained: Connections that completed their in-flight work
+            inside the drain timeout. Best-effort.
+        timed_out: Connections that were force-closed because the
+            drain timeout elapsed before they finished. Best-effort.
+        in_flight_at_deadline: Connections still alive at the
+            instant the timeout fired (== ``timed_out`` after the
+            force-close completes).
+    """
+
+    var drained: Int
+    var timed_out: Int
+    var in_flight_at_deadline: Int
 
 
 # ── Context cleanup helpers ──────────────────────────────────────────────────
@@ -110,11 +143,11 @@ def _scheduler_free_raw(raw: _OpaquePtr):
     raw.free()
 
 
-def _scheduler_free_ctxs[H: Handler & Copyable](addrs: List[Int]):
-    """Destroy each WorkerCtx[H] at the given address then free it."""
+def _scheduler_free_ctxs[F: Frontend & Copyable](addrs: List[Int]):
+    """Destroy each ``_WorkerCtx[F]`` at the given address then free it."""
     for i in range(len(addrs)):
         var raw = _OpaquePtr(unsafe_from_address=addrs[i])
-        var typed = raw.bitcast[_WorkerCtx[H]]()
+        var typed = raw.bitcast[_WorkerCtx[F]]()
         typed.destroy_pointee()
         _scheduler_free_raw(raw)
 
@@ -122,80 +155,67 @@ def _scheduler_free_ctxs[H: Handler & Copyable](addrs: List[Int]):
 # ── Per-worker context ───────────────────────────────────────────────────────
 
 
-struct _WorkerCtx[H: Handler & Copyable](Movable):
+struct _WorkerCtx[F: Frontend & Copyable](Movable):
     """Heap-allocated context passed to a pthread start routine.
 
     Carries a *borrowed* listener fd (the underlying ``TcpListener``
-    is owned by the parent ``Scheduler``), a copy of the handler +
-    config, the shared stopping flag (as a raw address), and a
-    worker index for pinning + logging. Workers must NOT close
+    is owned by the parent ``Scheduler``), a per-worker copy of
+    the frontend, the shared stopping flag (as a raw address), and
+    a worker index for pinning + logging. Workers must NOT close
     ``listener_fd`` — that's the ``Scheduler``'s job on shutdown.
+
+    The frontend encapsulates everything protocol-specific that
+    used to live on this struct (handler, server config, HTTP/2
+    settings, auto-protocol toggle); the runtime layer no longer
+    needs to know any of those flags exist.
     """
 
     var listener_fd: Int
     """The listener fd this worker will use. Semantics depend on
-    the backend:
-    * **epoll path**: shared across all workers; owned by the
-      Scheduler; workers call register_exclusive (EPOLLEXCLUSIVE)
-      to share accept fairly.
-    * **io_uring buffer-ring path**: per-worker fd, bound via
-      SO_REUSEPORT on the Scheduler thread (so concurrent-bind
-      races can't happen) and handed to this specific worker;
-      owned by the Scheduler's _shared_listener_addr table for
-      cleanup. Each worker arms multishot accept on its OWN fd."""
+    the binding strategy chosen by the Scheduler:
+    * **shared listener (default-off)**: shared across all
+      workers; owned by the Scheduler; workers call
+      register_exclusive (EPOLLEXCLUSIVE) to share accept fairly.
+    * **per-worker SO_REUSEPORT (default-on)**: per-worker fd,
+      bound on the Scheduler thread (so concurrent-bind races
+      can't happen) and handed to this specific worker; owned
+      by the Scheduler's per-worker listener table for cleanup.
+    """
     var bind_addr: SocketAddr
     """Bind address (the same one the Scheduler resolved). Kept
     for diagnostics + future use; the actual fd is in
-    ``listener_fd`` regardless of backend now."""
-    var config: ServerConfig
-    var handler: Self.H
+    ``listener_fd`` regardless of strategy."""
+    var frontend: Self.F
     var stopping_addr: Int
     var worker_idx: Int
     var pin_cores: Bool
-    # ``unified``: True -> dispatch to
-    # ``flare.http._unified_reactor_impl.run_unified_reactor_loop_shared``
-    # (auto HTTP/1.1 + HTTP/2 dispatch via preface peek). False
-    # (default) -> use the HTTP/1.1-only legacy
-    # ``run_reactor_loop_shared`` and preserve byte-for-byte the
-    # behaviour for callers that haven't opted into the unified
-    # path.
-    var auto_protocol: Bool
-    # ``h2_config``: HTTP/2 SETTINGS used by the unified path's
-    # ``H2ConnHandle``. Ignored when ``unified`` is False.
-    var h2_config: Http2Config
 
     def __init__(
         out self,
         listener_fd: Int,
         bind_addr: SocketAddr,
-        var config: ServerConfig,
-        var handler: Self.H,
+        var frontend: Self.F,
         stopping_addr: Int,
         worker_idx: Int,
         pin_cores: Bool,
-        auto_protocol: Bool,
-        var h2_config: Http2Config,
     ):
         self.listener_fd = listener_fd
         self.bind_addr = bind_addr
-        self.config = config^
-        self.handler = handler^
+        self.frontend = frontend^
         self.stopping_addr = stopping_addr
         self.worker_idx = worker_idx
         self.pin_cores = pin_cores
-        self.auto_protocol = auto_protocol
-        self.h2_config = h2_config^
 
 
-# ── Worker entry point (comptime-specialised per H) ─────────────────────────
+# ── Worker entry point (comptime-specialised per F) ─────────────────────────
 
 
-def _worker_entry[H: Handler & Copyable](arg: _OpaquePtr) -> _OpaquePtr:
+def _worker_entry[F: Frontend & Copyable](arg: _OpaquePtr) -> _OpaquePtr:
     """Pthread start routine for one reactor worker.
 
-    Casts ``arg`` back to a ``_WorkerCtx[H]`` pointer, optionally pins
-    to a CPU, then runs ``run_reactor_loop_shared[H]`` until the shared
-    stopping flag is observed.
+    Casts ``arg`` back to a ``_WorkerCtx[F]`` pointer, optionally
+    pins to a CPU, then delegates to :meth:`Frontend.run_worker`
+    until the shared stopping flag is observed.
 
     The context was allocated on the main thread with libc ``malloc``
     plus ``init_pointee_move``; the Scheduler main thread destroys and
@@ -205,85 +225,43 @@ def _worker_entry[H: Handler & Copyable](arg: _OpaquePtr) -> _OpaquePtr:
     var raw = UnsafePointer[UInt8, MutExternalOrigin](
         unsafe_from_address=ctx_addr
     )
-    var ctx_ptr = raw.bitcast[_WorkerCtx[H]]()
+    var ctx_ptr = raw.bitcast[_WorkerCtx[F]]()
 
-    try:
-        var stopping_ptr = UnsafePointer[Bool, MutExternalOrigin](
-            unsafe_from_address=ctx_ptr[].stopping_addr
-        )
+    var stopping_ptr = UnsafePointer[Bool, MutExternalOrigin](
+        unsafe_from_address=ctx_ptr[].stopping_addr
+    )
 
-        # CPU pinning is best-effort: on macOS it's a no-op and on
-        # Linux an overly-ambitious CPU index might raise. Pinning
-        # happens from the worker itself via pthread_self, so we
-        # re-wrap the current thread id into a ThreadHandle just to
-        # reuse the ``pin_to_cpu`` helper.
-        if ctx_ptr[].pin_cores:
-            try:
-                var cpu = ctx_ptr[].worker_idx % num_cpus()
-                var self_handle = ThreadHandle(
-                    _thread_id=external_call["pthread_self", UInt64]()
-                )
-                self_handle.pin_to_cpu(cpu)
-            except:
-                pass
-
-        # ``stopping_ptr[]`` dereferences to the heap-allocated Bool.
-        # The shared reactor loop takes ``stopping`` as a ``def``
-        # parameter (reference semantics in Mojo), so every
-        # iteration re-reads the live flag from this stable heap
-        # address. That address was captured at
-        # ``Scheduler.start`` time and stays valid until
-        # ``Scheduler.shutdown`` joins every worker.
-        #
-        # Multi-worker buffer-ring path: opt-in via
-        # ``ServerConfig.use_bufring`` (which the HttpServer
-        # entry point resolves once at startup from
-        # ``FLARE_BUFRING_HANDLER=1``). Each pthread worker
-        # owns its own UringReactor + per-worker recv buffer
-        # pool; multishot accept on the shared listener fd
-        # distributes new conns to one worker each.
-        comptime if CompilationTarget.is_linux():
-            if use_uring_backend() and ctx_ptr[].config.use_bufring:
-                # SO_REUSEPORT per-worker bind: each worker has
-                # its OWN pre-bound listener fd (bound on the
-                # Scheduler thread before pthread spawn so binds
-                # are serialised, avoiding any concurrent-bind
-                # race). The fd is passed through
-                # ``ctx_ptr[].listener_fd``; the corresponding
-                # TcpListener struct is owned by the Scheduler's
-                # per_worker_listener_ptrs table and freed on
-                # Scheduler.shutdown.
-                run_uring_bufring_reactor_loop_shared[H](
-                    ctx_ptr[].listener_fd,
-                    ctx_ptr[].config,
-                    ctx_ptr[].handler,
-                    stopping_ptr[],
-                )
-                return UnsafePointer[UInt8, MutExternalOrigin](
-                    unsafe_from_address=0
-                )
-        # Pick the unified (HTTP/1.1 + HTTP/2 auto-dispatch)
-        # reactor loop or the HTTP/1.1-only loop based on what
-        # the Scheduler caller requested. The unified path
-        # auto-detects the wire protocol per connection by
-        # peeking the first 24 bytes for the H2 preface.
-        if ctx_ptr[].auto_protocol:
-            run_unified_reactor_loop_shared[H](
-                ctx_ptr[].listener_fd,
-                ctx_ptr[].config,
-                ctx_ptr[].h2_config.copy(),
-                ctx_ptr[].handler,
-                stopping_ptr[],
+    # CPU pinning is best-effort: on macOS it's a no-op and on
+    # Linux an overly-ambitious CPU index might raise. Pinning
+    # happens from the worker itself via pthread_self, so we
+    # re-wrap the current thread id into a ThreadHandle just to
+    # reuse the ``pin_to_cpu`` helper.
+    if ctx_ptr[].pin_cores:
+        try:
+            var cpu = ctx_ptr[].worker_idx % num_cpus()
+            var self_handle = ThreadHandle(
+                _thread_id=external_call["pthread_self", UInt64]()
             )
-        else:
-            run_reactor_loop_shared[H](
-                ctx_ptr[].listener_fd,
-                ctx_ptr[].config,
-                ctx_ptr[].handler,
-                stopping_ptr[],
-            )
-    except:
-        pass
+            self_handle.pin_to_cpu(cpu)
+        except:
+            pass
+
+    # ``stopping_ptr[]`` dereferences to the heap-allocated Bool.
+    # The frontend's serving loop takes ``stopping`` as a ``def``
+    # parameter (reference semantics in Mojo), so every
+    # iteration re-reads the live flag from this stable heap
+    # address. That address was captured at
+    # ``Scheduler.start`` time and stays valid until
+    # ``Scheduler.shutdown`` joins every worker.
+    #
+    # ``run_worker`` is declared on the trait without ``raises``
+    # so impls cannot throw across the pthread boundary; the
+    # impl is responsible for catching internally and exiting
+    # cleanly when the stop flag flips.
+    ctx_ptr[].frontend.run_worker(
+        ctx_ptr[].listener_fd,
+        stopping_ptr[],
+    )
 
     # Ctx ownership: the Scheduler main thread destroys + frees every
     # ctx AFTER joining the worker, so we don't touch it here.
@@ -293,14 +271,17 @@ def _worker_entry[H: Handler & Copyable](arg: _OpaquePtr) -> _OpaquePtr:
 # ── Scheduler ────────────────────────────────────────────────────────────────
 
 
-struct Scheduler[H: Handler & Copyable](Movable):
-    """Owns ``num_workers`` pthread workers, each running a reactor
-    loop sharing a single listener fd.
+struct Scheduler[F: Frontend & Copyable](Movable):
+    """Owns ``num_workers`` pthread workers, each running a frontend's
+    serving loop sharing a single listener fd (or its own
+    SO_REUSEPORT listener when the strategy demands).
 
     Usage:
         ```mojo
-        var s = Scheduler.start[MyHandler](
-            addr, config, handler^, num_workers=4
+        from flare.http import HttpFrontend
+        var frontend = HttpFrontend(handler^, config^)
+        var s = Scheduler[HttpFrontend[MyHandler]].start(
+            addr, frontend^, num_workers=4
         )
         # ... server running ...
         s.shutdown()
@@ -323,14 +304,16 @@ struct Scheduler[H: Handler & Copyable](Movable):
           ``start`` to switch to a single shared listener bound
           via ``bind_shared`` and registered with
           ``Reactor.register_exclusive`` (``EPOLLEXCLUSIVE`` on
-          Linux >= 4.5) -- the kernel wakes one worker per
+          Linux >= 4.5) — the kernel wakes one worker per
           accept event, idle workers absorb spikes, p99.99 σ
           is uniformly tighter under sustained load for 7-22 %
           less req/s depending on path (see
-          ``docs/benchmark.md``). The io_uring buffer-ring path
-          (``FLARE_BUFRING_HANDLER=1``) uses per-worker
-          SO_REUSEPORT unconditionally.
-        - Handler is cloned into each worker via ``H.copy()``.
+          ``docs/benchmark.md``). Frontends that *require*
+          per-worker listeners (the io_uring buffer-ring
+          frontend) override this via
+          :meth:`Frontend.requires_per_worker_listener`.
+        - The frontend value is cloned into each worker via
+          ``F.copy()``.
     """
 
     # Workers are stored in a heap-allocated block of exactly
@@ -388,44 +371,31 @@ struct Scheduler[H: Handler & Copyable](Movable):
     @staticmethod
     def start(
         addr: SocketAddr,
-        var config: ServerConfig,
-        var handler: Self.H,
+        var frontend: Self.F,
         num_workers: Int,
         pin_cores: Bool = True,
-        auto_protocol: Bool = False,
-        var h2_config: Http2Config = Http2Config(),
-    ) raises -> Scheduler[Self.H]:
+    ) raises -> Scheduler[Self.F]:
         """Spawn ``num_workers`` threads sharing one listener.
 
-        The scheduler binds a single ``TcpListener`` (via
-        ``bind_shared``) and hands its fd to every worker. Each
-        worker registers the fd with ``Reactor.register_exclusive``
-        so the kernel wakes only one worker per accept event
-        (``EPOLLEXCLUSIVE`` on Linux >= 4.5). On macOS the flag is
-        unavailable and the fallback is the classic non-blocking
-        accept "wake-all, one-wins" pattern.
-
-        This eliminates the prior ``SO_REUSEPORT`` 4-tuple-hash
-        distribution variance that caused multi-second tail latency
-        under high-concurrency loads.
+        The scheduler binds its listener(s) according to
+        :meth:`Frontend.requires_per_worker_listener` plus the
+        ``FLARE_REUSEPORT_WORKERS`` env knob, then hands one fd
+        per worker into :meth:`Frontend.run_worker`. The frontend
+        encapsulates everything protocol-specific (handler,
+        request config, HTTP/2 settings, auto-protocol toggle,
+        backend selection); the runtime layer no longer knows
+        any of those flags exist.
 
         Args:
-            addr: Address the shared listener binds.
-            config: Shared server config (copied per worker).
-            handler: Shared request handler (copied per worker).
+            addr: Address the listener(s) bind.
+            frontend: Per-worker run target. Cloned per worker
+                via :meth:`Frontend.copy`.
             num_workers: Number of worker threads. Must be in
-                ``1..=256``; values outside that range raise. The
-                upper bound is a defensive guard against runaway
-                ``pthread_create`` + heap allocation.
+                ``1..=256``; values outside that range raise.
+                The upper bound is a defensive guard against
+                runaway ``pthread_create`` + heap allocation.
             pin_cores: If ``True`` (default), pin worker N to core
                 ``N % num_cpus``. No-op on macOS.
-            auto_protocol: When ``True``, every worker dispatches
-                through the unified HTTP/1.1 + HTTP/2 reactor loop
-                (preface peek selects the protocol per connection).
-                When ``False`` (default), uses the HTTP/1.1-only
-                loop.
-            h2_config: HTTP/2 SETTINGS used by the unified path.
-                Ignored when ``auto_protocol`` is ``False``.
 
         Returns:
             A running ``Scheduler`` whose workers will continue to
@@ -433,9 +403,9 @@ struct Scheduler[H: Handler & Copyable](Movable):
 
         Raises:
             Error: If ``num_workers`` is outside ``1..=256``, if the
-                shared listener fails to bind, or if
-                ``pthread_create`` fails; partially-started workers
-                are best-effort joined before re-raising.
+                listener fails to bind, or if ``pthread_create``
+                fails; partially-started workers are best-effort
+                joined before re-raising.
         """
         if num_workers < 1 or num_workers > 256:
             raise Error(
@@ -443,7 +413,7 @@ struct Scheduler[H: Handler & Copyable](Movable):
                 + String(num_workers)
                 + ")"
             )
-        var s = Scheduler[Self.H]()
+        var s = Scheduler[Self.F]()
 
         # Heap-allocate the stopping flag. Using a struct field would
         # be unsafe: ``return s^`` moves the Scheduler to the caller
@@ -458,35 +428,30 @@ struct Scheduler[H: Handler & Copyable](Movable):
         var stopping_addr = Int(stop_ptr)
         s._stopping_addr = stopping_addr
 
-        # Listener binding strategy depends on the per-worker
-        # backend:
+        # Listener binding strategy. Defaults to per-worker
+        # SO_REUSEPORT (matches actix_web; highest steady-state
+        # throughput on dev-box workloads). Override paths:
         #
-        # * **epoll path (default)**: bind ONE listener via
-        #   ``bind_shared`` (no SO_REUSEPORT) and hand its fd to
-        #   every worker. ``Reactor.register_exclusive`` +
-        #   EPOLLEXCLUSIVE wakes only one worker per accept event,
-        #   giving fairer accept-time distribution than
-        #   SO_REUSEPORT's 4-tuple hash. Workers borrow the fd
-        #   via ``ctx.listener_fd``.
-        #
-        # * **io_uring buffer-ring path** (`config.use_bufring=True`):
-        #   the Scheduler does NOT bind its own listener -- if it
-        #   did, the kernel's SO_REUSEPORT group would route some
-        #   incoming connections to the Scheduler's listener
-        #   (which has no accepter), causing them to time out in
-        #   the listen backlog. Instead, each worker binds its
-        #   OWN SO_REUSEPORT listener inside ``_worker_entry``.
-        #   ``ctx.listener_fd`` is set to -1 and ignored by the
-        #   io_uring dispatch.
+        # * **Frontend forces per-worker** (e.g. io_uring buffer-
+        #   ring): :meth:`Frontend.requires_per_worker_listener`
+        #   returns True. The scheduler binds N SO_REUSEPORT
+        #   listeners on its own thread (serialised binds avoid
+        #   any concurrent-bind race) and hands one to each
+        #   worker.
+        # * **FLARE_REUSEPORT_WORKERS=0**: opt back into a single
+        #   ``bind_shared`` listener with ``EPOLLEXCLUSIVE`` (7-22 %
+        #   less req/s for a uniformly tighter p99.99 σ; see
+        #   ``docs/benchmark.md``). Workers register the shared
+        #   fd with ``Reactor.register_exclusive`` so the kernel
+        #   wakes one worker per accept event.
         #
         # Decision is made on the Scheduler thread (not in the
         # workers) so an ``AddressInUse`` from a faulty
         # configuration raises on the caller's thread, not inside
         # an opaque pthread.
-        var use_io_uring_handler = False
-        comptime if CompilationTarget.is_linux():
-            if use_uring_backend() and config.use_bufring:
-                use_io_uring_handler = True
+        var frontend_demands_per_worker = (
+            frontend.requires_per_worker_listener()
+        )
 
         # Per-worker ``SO_REUSEPORT`` listeners (each worker
         # accept(2)s on its own fd; kernel hashes new 4-tuples to
@@ -515,7 +480,9 @@ struct Scheduler[H: Handler & Copyable](Movable):
         # reuseport mode pre-bind per-worker SO_REUSEPORT listeners
         # on this thread (serialised binds avoid concurrent-bind
         # races) and skip the shared listener.
-        var prebind_per_worker = use_io_uring_handler or use_reuseport_workers
+        var prebind_per_worker = (
+            frontend_demands_per_worker or use_reuseport_workers
+        )
         if prebind_per_worker:
             # Probe-bind to validate the addr (raises on the
             # caller's thread if AddressInUse / etc.); the probe
@@ -578,8 +545,7 @@ struct Scheduler[H: Handler & Copyable](Movable):
                     pass
 
         for i in range(num_workers):
-            var cfg_copy = config.copy()
-            var handler_copy = handler.copy()
+            var frontend_copy = frontend.copy()
             # Pick this worker's listener fd: either the shared
             # epoll listener, or its own per-worker SO_REUSEPORT
             # listener (pre-bound on this thread above).
@@ -589,26 +555,23 @@ struct Scheduler[H: Handler & Copyable](Movable):
                     unsafe_from_address=s._per_worker_listener_addrs[i]
                 )
                 worker_listener_fd = Int(pwl_ptr[].as_raw_fd())
-            var ctx = _WorkerCtx[Self.H](
+            var ctx = _WorkerCtx[Self.F](
                 worker_listener_fd,
                 addr,
-                cfg_copy^,
-                handler_copy^,
+                frontend_copy^,
                 stopping_addr,
                 i,
                 pin_cores,
-                auto_protocol,
-                h2_config.copy(),
             )
             # Native Mojo allocator (see _scheduler_free_raw for why).
-            var ctx_ptr = alloc[_WorkerCtx[Self.H]](1)
+            var ctx_ptr = alloc[_WorkerCtx[Self.F]](1)
             ctx_ptr.init_pointee_move(ctx^)
             var arg = ctx_ptr.bitcast[UInt8]()
             var ctx_addr = Int(ctx_ptr)
 
             var spawned = False
             try:
-                var th = ThreadHandle.spawn[_worker_entry[Self.H]](arg)
+                var th = ThreadHandle.spawn[_worker_entry[Self.F]](arg)
                 # Move the (non-Copyable) handle into the next slot
                 # of the worker array; bump the live-slot counter.
                 (s._workers_ptr + s._workers_len).init_pointee_move(th^)
@@ -634,14 +597,14 @@ struct Scheduler[H: Handler & Copyable](Movable):
                 s._workers_len = 0
                 # Destroy + free EVERY ctx (the ones that workers claimed
                 # + this one that never got claimed).
-                _scheduler_free_ctxs[Self.H](s._ctx_addrs)
+                _scheduler_free_ctxs[Self.F](s._ctx_addrs)
                 s._ctx_addrs.clear()
                 ctx_ptr.destroy_pointee()
                 _scheduler_free_raw(ctx_ptr.bitcast[UInt8]())
                 # All workers joined, so no one is reading the
                 # shared listener anymore -- destroy + free it
-                # if we owned one (the io_uring handler path uses
-                # per-worker listeners and leaves listener_ptr null).
+                # if we owned one (paths that prebind per-worker
+                # listeners leave listener_ptr null).
                 if Int(listener_ptr) != 0:
                     listener_ptr.destroy_pointee()
                     _scheduler_free_raw(listener_ptr.bitcast[UInt8]())
@@ -705,9 +668,9 @@ struct Scheduler[H: Handler & Copyable](Movable):
 
         # After all workers have joined, it's safe to destroy and free
         # their per-thread contexts. Doing it here (non-generic call
-        # site: no monomorphisation per H) avoids a Mojo build conflict
+        # site: no monomorphisation per F) avoids a Mojo build conflict
         # with mozz's ``free`` declaration in the fuzz environment.
-        _scheduler_free_ctxs[Self.H](self._ctx_addrs)
+        _scheduler_free_ctxs[Self.F](self._ctx_addrs)
         self._ctx_addrs.clear()
 
         # Drop the shared ``TcpListener`` now that every worker has
@@ -868,390 +831,3 @@ def default_worker_count() -> Int:
     leave headroom for the kernel network stack.
     """
     return num_cpus()
-
-
-# ── Static-response multi-worker scheduler ──────────────────────────────────
-#
-# StaticScheduler is the multi-worker twin of HttpServer.serve_static.
-# It binds ONE shared listener (no SO_REUSEPORT -- same EPOLLEXCLUSIVE
-# fairness story as the regular Scheduler) and spawns N pthread workers
-# that each run run_reactor_loop_static_shared with a copy of the
-# StaticResponse. The per-request work in each worker collapses to:
-#
-#   epoll_wait -> recv -> _scan_content_length -> memcpy(resp.bytes) -> send
-#
-# No parser builds a HeaderMap, no handler is called, no Response is
-# allocated, no headers are looked up, no body is re-serialised. This is
-# the fastest path flare exposes for fixed-response endpoints (health
-# checks, TFB-style benchmarks, low-latency micro-services) and scales
-# near-linearly across the N pthreads because each worker owns its own
-# conns dict + write buffers (no cross-thread state).
-#
-# Design choice: NOT generic. StaticResponse is a concrete type so we
-# don't need the H: Handler & Copyable templating that the regular
-# Scheduler uses. This keeps monomorphisation cost down and makes the
-# struct + worker_entry trivially callable.
-
-
-struct _StaticWorkerCtx(Movable):
-    """Per-worker context for the static-response scheduler.
-
-    Like ``_WorkerCtx[H]`` but carries a ``StaticResponse`` instead of
-    a handler. The ``StaticResponse`` is copied per-worker so each
-    pthread has its own immutable view of the response bytes (the
-    buffers themselves are owned per-worker; the original is dropped
-    after spawn).
-    """
-
-    var listener_fd: Int
-    var bind_addr: SocketAddr
-    var config: ServerConfig
-    var resp: StaticResponse
-    var stopping_addr: Int
-    var worker_idx: Int
-    var pin_cores: Bool
-
-    def __init__(
-        out self,
-        listener_fd: Int,
-        bind_addr: SocketAddr,
-        var config: ServerConfig,
-        var resp: StaticResponse,
-        stopping_addr: Int,
-        worker_idx: Int,
-        pin_cores: Bool,
-    ):
-        self.listener_fd = listener_fd
-        self.bind_addr = bind_addr
-        self.config = config^
-        self.resp = resp^
-        self.stopping_addr = stopping_addr
-        self.worker_idx = worker_idx
-        self.pin_cores = pin_cores
-
-
-def _static_worker_entry(arg: _OpaquePtr) -> _OpaquePtr:
-    """Pthread start routine for one static-response reactor worker.
-
-    Casts ``arg`` back to a ``_StaticWorkerCtx`` pointer, optionally
-    pins to a CPU, then runs ``run_reactor_loop_static_shared`` until
-    the shared stopping flag is observed.
-    """
-    var ctx_addr = Int(arg)
-    var raw = UnsafePointer[UInt8, MutExternalOrigin](
-        unsafe_from_address=ctx_addr
-    )
-    var ctx_ptr = raw.bitcast[_StaticWorkerCtx]()
-
-    try:
-        var stopping_ptr = UnsafePointer[Bool, MutExternalOrigin](
-            unsafe_from_address=ctx_ptr[].stopping_addr
-        )
-
-        if ctx_ptr[].pin_cores:
-            try:
-                var cpu = ctx_ptr[].worker_idx % num_cpus()
-                var self_handle = ThreadHandle(
-                    external_call["pthread_self", UInt64]()
-                )
-                self_handle.pin_to_cpu(cpu)
-            except:
-                pass
-
-        run_reactor_loop_static_shared(
-            ctx_ptr[].listener_fd,
-            ctx_ptr[].config,
-            ctx_ptr[].resp,
-            stopping_ptr[],
-        )
-    except:
-        pass
-
-    return UnsafePointer[UInt8, MutExternalOrigin](unsafe_from_address=0)
-
-
-def _static_scheduler_free_ctxs(addrs: List[Int]):
-    """Destroy each _StaticWorkerCtx at the given address then free it."""
-    for i in range(len(addrs)):
-        var raw = _OpaquePtr(unsafe_from_address=addrs[i])
-        var typed = raw.bitcast[_StaticWorkerCtx]()
-        typed.destroy_pointee()
-        _scheduler_free_raw(raw)
-
-
-struct StaticScheduler(Movable):
-    """Multi-worker scheduler that serves a single ``StaticResponse``.
-
-    Multi-worker twin of ``HttpServer.serve_static``. Spawns N
-    pthread workers, each running ``run_reactor_loop_static_shared``
-    with a copy of the pre-encoded response bytes.
-
-    Listener strategy mirrors ``Scheduler``:
-
-    - Default: each worker pre-binds its own ``SO_REUSEPORT``
-      listener on this thread (highest throughput; matches
-      actix_web's listener strategy).
-    - ``FLARE_REUSEPORT_WORKERS=0``: opt back into a single
-      shared listener via ``bind_shared``, borrowed by every
-      worker and registered with ``EPOLLEXCLUSIVE`` (7-22 %
-      less req/s for a uniformly tighter p99.99 σ under
-      sustained load; see ``docs/benchmark.md``).
-
-    Use ``StaticScheduler.start(addr, config, resp, num_workers)`` to
-    launch and ``shutdown()`` to drain. Same lifecycle contract as
-    ``Scheduler``.
-
-    Intended for the TFB plaintext gate (where every response is
-    identical) and for production health-check / fixed-response
-    endpoints under heavy load.
-    """
-
-    var _workers_ptr: UnsafePointer[ThreadHandle, MutExternalOrigin]
-    var _workers_len: Int
-    var _shared_listener_addr: Int
-    var _shared_listener_fd: Int
-    var _per_worker_listener_addrs: List[Int]
-    """Default-on for ``num_workers >= 2``: the StaticScheduler
-    pre-binds one SO_REUSEPORT listener per worker on its own
-    thread (serialised binds avoid any concurrent-bind race).
-    Each entry is the heap address of an owned ``TcpListener``;
-    freed in ``shutdown()`` after all workers join. Empty in the
-    opt-out shared-listener EPOLLEXCLUSIVE mode
-    (``FLARE_REUSEPORT_WORKERS=0``)."""
-    var _ctx_addrs: List[Int]
-    var _stopping_addr: Int
-
-    def __init__(out self):
-        """Build an empty scheduler; use ``StaticScheduler.start``."""
-        self._workers_ptr = UnsafePointer[ThreadHandle, MutExternalOrigin](
-            unsafe_from_address=0
-        )
-        self._workers_len = 0
-        self._shared_listener_addr = 0
-        self._shared_listener_fd = -1
-        self._per_worker_listener_addrs = List[Int]()
-        self._ctx_addrs = List[Int]()
-        self._stopping_addr = 0
-
-    @staticmethod
-    def start(
-        addr: SocketAddr,
-        var config: ServerConfig,
-        var resp: StaticResponse,
-        num_workers: Int,
-        pin_cores: Bool = True,
-    ) raises -> StaticScheduler:
-        """Spawn ``num_workers`` static-response workers sharing one listener.
-
-        Args:
-            addr: Address the shared listener binds.
-            config: Per-worker copy of ``ServerConfig``.
-            resp: Pre-encoded response bytes (copied per worker).
-            num_workers: Number of worker threads. ``1..=256``.
-            pin_cores: Pin worker N to core ``N % num_cpus``. No-op
-                on macOS.
-
-        Returns:
-            A running ``StaticScheduler`` whose workers serve ``resp``
-            until ``shutdown()``.
-        """
-        if num_workers < 1 or num_workers > 256:
-            raise Error(
-                "StaticScheduler.start: num_workers must be in 1..=256 (got "
-                + String(num_workers)
-                + ")"
-            )
-        var s = StaticScheduler()
-
-        var stop_ptr = alloc[Bool](1)
-        stop_ptr.init_pointee_copy(False)
-        var stop_raw = stop_ptr.bitcast[UInt8]()
-        var stopping_addr = Int(stop_ptr)
-        s._stopping_addr = stopping_addr
-
-        # Per-worker SO_REUSEPORT is the default (each worker
-        # owns its own listener fd; kernel hashes new 4-tuples
-        # to one of N). Matches actix_web's listener strategy
-        # and gives the highest steady-state throughput on
-        # dev-box workloads. ``FLARE_REUSEPORT_WORKERS=0``
-        # opts back into the single shared listener with
-        # EPOLLEXCLUSIVE — strictly tighter p99.99 σ under
-        # sustained load (kernel offers each accept to whichever
-        # worker is currently parked in epoll_wait, idle workers
-        # absorb spikes) for 7-22 % less req/s depending on
-        # path. See ``docs/benchmark.md`` for the head-to-head
-        # numbers.
-        var use_reuseport_workers = True
-        if getenv("FLARE_REUSEPORT_WORKERS") == "0":
-            use_reuseport_workers = False
-
-        var listener_fd: Int = -1
-        if use_reuseport_workers:
-            # Probe-bind to surface AddressInUse / etc. on the
-            # caller's thread before spawning any workers.
-            try:
-                var probe = bind_reuseport(addr)
-                _ = probe^
-            except e:
-                _scheduler_free_raw(stop_raw)
-                s._stopping_addr = 0
-                raise e^
-            s._shared_listener_addr = 0
-            s._shared_listener_fd = -1
-        else:
-            var bound = bind_shared(addr)
-            try:
-                bound._socket.set_nonblocking(True)
-            except e:
-                _scheduler_free_raw(stop_raw)
-                s._stopping_addr = 0
-                raise e^
-            listener_fd = Int(bound.as_raw_fd())
-            var lp = alloc[TcpListener](1)
-            lp.init_pointee_move(bound^)
-            s._shared_listener_addr = Int(lp)
-            s._shared_listener_fd = listener_fd
-
-        s._workers_ptr = alloc[ThreadHandle](num_workers)
-        s._workers_len = 0
-
-        # Pre-bind per-worker SO_REUSEPORT listeners on this
-        # thread (serialised binds avoid concurrent-bind races).
-        if use_reuseport_workers:
-            for _ in range(num_workers):
-                try:
-                    var pwl = bind_reuseport(addr)
-                    pwl._socket.set_nonblocking(True)
-                    var ptr = alloc[TcpListener](1)
-                    ptr.init_pointee_move(pwl^)
-                    s._per_worker_listener_addrs.append(Int(ptr))
-                except:
-                    pass
-
-        for i in range(num_workers):
-            var cfg_copy = config.copy()
-            var resp_copy = resp.copy()
-            # Pick this worker's listener fd: either the shared
-            # epoll listener, or its own per-worker SO_REUSEPORT
-            # listener (pre-bound on this thread above).
-            var worker_listener_fd: Int = listener_fd
-            if use_reuseport_workers and i < len(s._per_worker_listener_addrs):
-                var pwl_ptr = UnsafePointer[TcpListener, MutExternalOrigin](
-                    unsafe_from_address=s._per_worker_listener_addrs[i]
-                )
-                worker_listener_fd = Int(pwl_ptr[].as_raw_fd())
-            var ctx = _StaticWorkerCtx(
-                worker_listener_fd,
-                addr,
-                cfg_copy^,
-                resp_copy^,
-                stopping_addr,
-                i,
-                pin_cores,
-            )
-            var ctx_ptr = alloc[_StaticWorkerCtx](1)
-            ctx_ptr.init_pointee_move(ctx^)
-            var arg = ctx_ptr.bitcast[UInt8]()
-            var ctx_addr = Int(ctx_ptr)
-
-            var spawned = False
-            try:
-                var th = ThreadHandle.spawn[_static_worker_entry](arg)
-                (s._workers_ptr + s._workers_len).init_pointee_move(th^)
-                s._workers_len += 1
-                s._ctx_addrs.append(ctx_addr)
-                spawned = True
-            except:
-                pass
-            if not spawned:
-                # Roll back partial start.
-                stop_ptr[] = True
-                for j in range(s._workers_len):
-                    try:
-                        (s._workers_ptr + j)[].join()
-                    except:
-                        pass
-                    (s._workers_ptr + j).destroy_pointee()
-                _scheduler_free_raw(s._workers_ptr.bitcast[UInt8]())
-                s._workers_ptr = UnsafePointer[ThreadHandle, MutExternalOrigin](
-                    unsafe_from_address=0
-                )
-                s._workers_len = 0
-                _static_scheduler_free_ctxs(s._ctx_addrs)
-                s._ctx_addrs.clear()
-                ctx_ptr.destroy_pointee()
-                _scheduler_free_raw(ctx_ptr.bitcast[UInt8]())
-                var lpr = _OpaquePtr(
-                    unsafe_from_address=s._shared_listener_addr
-                )
-                var lpt = lpr.bitcast[TcpListener]()
-                lpt.destroy_pointee()
-                _scheduler_free_raw(lpr)
-                s._shared_listener_addr = 0
-                s._shared_listener_fd = -1
-                _scheduler_free_raw(stop_raw)
-                s._stopping_addr = 0
-                raise Error("pthread_create failed in StaticScheduler.start")
-
-        return s^
-
-    def shutdown(mut self) raises:
-        """Signal every worker to stop and wait for them to join."""
-        if self._stopping_addr != 0:
-            var stop_ptr = UnsafePointer[Bool, MutExternalOrigin](
-                unsafe_from_address=self._stopping_addr
-            )
-            stop_ptr[] = True
-
-        if self._shared_listener_fd >= 0:
-            _ = external_call["close", c_int, c_int](
-                c_int(self._shared_listener_fd)
-            )
-            self._shared_listener_fd = -1
-
-        for i in range(self._workers_len):
-            try:
-                (self._workers_ptr + i)[].join()
-            except:
-                pass
-            (self._workers_ptr + i).destroy_pointee()
-        if self._workers_len > 0:
-            _scheduler_free_raw(self._workers_ptr.bitcast[UInt8]())
-            self._workers_ptr = UnsafePointer[ThreadHandle, MutExternalOrigin](
-                unsafe_from_address=0
-            )
-            self._workers_len = 0
-
-        _static_scheduler_free_ctxs(self._ctx_addrs)
-        self._ctx_addrs.clear()
-
-        if self._shared_listener_addr != 0:
-            var raw = _OpaquePtr(unsafe_from_address=self._shared_listener_addr)
-            var typed = raw.bitcast[TcpListener]()
-            typed.destroy_pointee()
-            _scheduler_free_raw(raw)
-            self._shared_listener_addr = 0
-
-        # Free any per-worker SO_REUSEPORT listeners (the
-        # default path; populated unless FLARE_REUSEPORT_WORKERS=0
-        # opted into the shared-listener mode). Each listener's
-        # destructor closes its fd; in-flight epoll registrations
-        # against that fd are unregistered as the worker reactor
-        # tears down before join.
-        for i in range(len(self._per_worker_listener_addrs)):
-            var pwl_raw = _OpaquePtr(
-                unsafe_from_address=self._per_worker_listener_addrs[i]
-            )
-            var pwl_typed = pwl_raw.bitcast[TcpListener]()
-            pwl_typed.destroy_pointee()
-            _scheduler_free_raw(pwl_raw)
-        self._per_worker_listener_addrs.clear()
-
-        if self._stopping_addr != 0:
-            var stop_raw = _OpaquePtr(unsafe_from_address=self._stopping_addr)
-            _scheduler_free_raw(stop_raw)
-            self._stopping_addr = 0
-
-    def is_running(self) -> Bool:
-        """Return True if any worker has not yet joined."""
-        return self._workers_len > 0

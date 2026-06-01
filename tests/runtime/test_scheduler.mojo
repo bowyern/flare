@@ -13,34 +13,44 @@ Runtime-behaviour tests (actual HTTP round-trips across N workers)
 live in ``test_server_multicore.mojo`` (Step 10). The tests here are
 lifecycle-only, which is what keeps them stable under kqueue +
 pthread timing differences between platforms.
+
+The scheduler is :trait:`Frontend`-generic; the tests use a tiny
+local ``_NopFrontend`` that runs an idle loop and observes the
+stop flag. That keeps the runtime tests free of any
+:mod:`flare.http` dependency -- the layering inversion is what
+made this possible.
 """
 
 from std.testing import assert_true, assert_equal, TestSuite
 
-from flare.http import Handler, Request, Response, Method, ok
-from flare.http.server import ServerConfig
 from flare.net import SocketAddr
-from flare.runtime.scheduler import Scheduler, default_worker_count
+from flare.runtime import Frontend, Scheduler, default_worker_count
+from flare.runtime._libc_time import libc_nanosleep_ms
 
 
-# ── A minimal stateless handler satisfying Handler ─────────────────────────
+# ── A minimal Frontend whose run_worker idles until stopping flips ──────────
 
 
 @fieldwise_init
-struct _NopHandler(Copyable, Handler):
+struct _NopFrontend(Copyable, Frontend, Movable):
+    """Test-only frontend: spin in 50 ms sleeps until ``stopping``.
+
+    No socket reads, no protocol logic -- the lifecycle tests
+    exercise pthread spawn / join, the heap-shared stop flag, and
+    the listener bind / cleanup paths that ``Scheduler`` owns.
+    """
+
     var tag: Int
 
-    def serve(self, req: Request) raises -> Response:
-        return ok("nop")
+    def requires_per_worker_listener(self) -> Bool:
+        return False
 
-
-def _config_fast_shutdown() -> ServerConfig:
-    """Config tuned so tests exit fast on shutdown."""
-    var cfg = ServerConfig()
-    cfg.idle_timeout_ms = 200
-    cfg.write_timeout_ms = 500
-    cfg.shutdown_timeout_ms = 300
-    return cfg^
+    def run_worker(mut self, listener_fd: Int, mut stopping: Bool):
+        var stopping_addr = Int(UnsafePointer[Bool, _](to=stopping))
+        while not UnsafePointer[Bool, MutExternalOrigin](
+            unsafe_from_address=stopping_addr
+        )[]:
+            _ = libc_nanosleep_ms(50)
 
 
 # ── default_worker_count ───────────────────────────────────────────────────
@@ -58,10 +68,8 @@ def test_default_worker_count_positive() raises:
 def test_scheduler_start_and_shutdown_n2() raises:
     """Scheduler with 2 workers: start, shut down cleanly."""
     var addr = SocketAddr.localhost(0)
-    var h = _NopHandler(0)
-    var cfg = _config_fast_shutdown()
-    var s = Scheduler[_NopHandler].start(
-        addr=addr, config=cfg^, handler=h^, num_workers=2, pin_cores=False
+    var s = Scheduler[_NopFrontend].start(
+        addr=addr, frontend=_NopFrontend(0), num_workers=2, pin_cores=False
     )
     assert_true(s.is_running())
     s.shutdown()
@@ -71,10 +79,8 @@ def test_scheduler_start_and_shutdown_n2() raises:
 def test_scheduler_start_and_shutdown_n4() raises:
     """Scheduler with 4 workers: start, shut down cleanly."""
     var addr = SocketAddr.localhost(0)
-    var h = _NopHandler(0)
-    var cfg = _config_fast_shutdown()
-    var s = Scheduler[_NopHandler].start(
-        addr=addr, config=cfg^, handler=h^, num_workers=4, pin_cores=False
+    var s = Scheduler[_NopFrontend].start(
+        addr=addr, frontend=_NopFrontend(0), num_workers=4, pin_cores=False
     )
     assert_true(s.is_running())
     s.shutdown()
@@ -85,14 +91,11 @@ def test_scheduler_drain_returns_per_worker_reports() raises:
     """``Scheduler.drain`` returns one ``ShutdownReport`` per
     worker; the count matches ``num_workers``."""
     var addr = SocketAddr.localhost(0)
-    var h = _NopHandler(0)
-    var cfg = _config_fast_shutdown()
-    var s = Scheduler[_NopHandler].start(
-        addr=addr, config=cfg^, handler=h^, num_workers=3, pin_cores=False
+    var s = Scheduler[_NopFrontend].start(
+        addr=addr, frontend=_NopFrontend(0), num_workers=3, pin_cores=False
     )
     var reports = s.drain(timeout_ms=200)
     assert_equal(len(reports), 3)
-    # All workers joined inside the budget — drained=1 each.
     for i in range(len(reports)):
         assert_equal(reports[i].drained, 1)
         assert_equal(reports[i].timed_out, 0)
@@ -102,10 +105,8 @@ def test_scheduler_drain_returns_per_worker_reports() raises:
 
 def test_scheduler_drain_zero_timeout_is_hard_stop() raises:
     var addr = SocketAddr.localhost(0)
-    var h = _NopHandler(0)
-    var cfg = _config_fast_shutdown()
-    var s = Scheduler[_NopHandler].start(
-        addr=addr, config=cfg^, handler=h^, num_workers=2, pin_cores=False
+    var s = Scheduler[_NopFrontend].start(
+        addr=addr, frontend=_NopFrontend(0), num_workers=2, pin_cores=False
     )
     var reports = s.drain(timeout_ms=0)
     assert_equal(len(reports), 2)
@@ -116,13 +117,11 @@ def test_scheduler_drain_zero_timeout_is_hard_stop() raises:
 def test_scheduler_shutdown_idempotent() raises:
     """``shutdown()`` is safe to call twice."""
     var addr = SocketAddr.localhost(0)
-    var h = _NopHandler(0)
-    var cfg = _config_fast_shutdown()
-    var s = Scheduler[_NopHandler].start(
-        addr=addr, config=cfg^, handler=h^, num_workers=2, pin_cores=False
+    var s = Scheduler[_NopFrontend].start(
+        addr=addr, frontend=_NopFrontend(0), num_workers=2, pin_cores=False
     )
     s.shutdown()
-    s.shutdown()  # must not crash
+    s.shutdown()
     assert_true(not s.is_running())
 
 
@@ -130,12 +129,9 @@ def test_scheduler_multiple_start_cycles() raises:
     """Two start / shutdown cycles in sequence do not leak."""
     var addr = SocketAddr.localhost(0)
     for _ in range(2):
-        var h = _NopHandler(0)
-        var cfg = _config_fast_shutdown()
-        var s = Scheduler[_NopHandler].start(
+        var s = Scheduler[_NopFrontend].start(
             addr=addr,
-            config=cfg^,
-            handler=h^,
+            frontend=_NopFrontend(0),
             num_workers=2,
             pin_cores=False,
         )
@@ -145,10 +141,8 @@ def test_scheduler_multiple_start_cycles() raises:
 def test_scheduler_pin_cores_flag_default_no_crash() raises:
     """``pin_cores=True`` (default on Linux, no-op on macOS) does not crash."""
     var addr = SocketAddr.localhost(0)
-    var h = _NopHandler(0)
-    var cfg = _config_fast_shutdown()
-    var s = Scheduler[_NopHandler].start(
-        addr=addr, config=cfg^, handler=h^, num_workers=2, pin_cores=True
+    var s = Scheduler[_NopFrontend].start(
+        addr=addr, frontend=_NopFrontend(0), num_workers=2, pin_cores=True
     )
     s.shutdown()
 
