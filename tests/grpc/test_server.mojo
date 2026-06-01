@@ -13,6 +13,7 @@ from std.testing import assert_equal, assert_false, assert_true
 
 from flare.grpc import (
     GRPC_STATUS_INTERNAL,
+    GRPC_STATUS_INVALID_ARGUMENT,
     GRPC_STATUS_OK,
     GrpcCallContext,
     GrpcCallOutcome,
@@ -364,6 +365,94 @@ def test_run_unary_call_echo() raises:
     assert_equal(dec.message.payload[1], UInt8(0xBB))
 
 
+@fieldwise_init
+struct RaisingUnary(GrpcUnary, Movable):
+    """Handler that raises out of ``serve_unary`` -- used to verify
+    ``run_unary_call`` folds that into an INTERNAL outcome rather
+    than propagating the exception.
+    """
+
+    var hit: Bool
+
+    def serve_unary(
+        mut self,
+        ctx: GrpcCallContext,
+        request_bytes: Span[UInt8, _],
+    ) raises -> GrpcUnaryReply:
+        self.hit = True
+        raise Error("simulated handler failure")
+
+
+def test_run_unary_call_invalid_method_emits_invalid_argument() raises:
+    """Header-validation failure (`GET` instead of `POST`) must
+    surface as `INVALID_ARGUMENT` rather than raising.
+    """
+    var encoded = encode_grpc_message(Span[UInt8, _](List[UInt8]()))
+    var handler = EchoUnary(seen_path=String(""))
+    var outcome = run_unary_call(
+        handler,
+        _headers(
+            String("GET"),
+            String("/svc/m"),
+            String("application/grpc"),
+            String("trailers"),
+        ),
+        Span[UInt8, _](encoded),
+    )
+    assert_equal(outcome.status.code, GRPC_STATUS_INVALID_ARGUMENT)
+    assert_equal(len(outcome.response_data), 0)
+
+
+def test_run_unary_call_truncated_lpm_emits_invalid_argument() raises:
+    """Stitch failure (LPM header says 10 bytes, only 3 follow)
+    must surface as `INVALID_ARGUMENT` and the body must be empty.
+    """
+    var buf = List[UInt8]()
+    buf.append(UInt8(0))
+    buf.append(UInt8(0))
+    buf.append(UInt8(0))
+    buf.append(UInt8(0))
+    buf.append(UInt8(10))
+    buf.append(UInt8(0xAA))
+    buf.append(UInt8(0xBB))
+    buf.append(UInt8(0xCC))
+    var handler = EchoUnary(seen_path=String(""))
+    var outcome = run_unary_call(
+        handler,
+        _headers(
+            String("POST"),
+            String("/svc/m"),
+            String("application/grpc"),
+            String("trailers"),
+        ),
+        Span[UInt8, _](buf),
+    )
+    assert_equal(outcome.status.code, GRPC_STATUS_INVALID_ARGUMENT)
+    assert_equal(len(outcome.response_data), 0)
+
+
+def test_run_unary_call_handler_raise_emits_internal() raises:
+    """A handler that raises out of `serve_unary` must produce a
+    typed outcome with `INTERNAL` status and an empty body.
+    """
+    var payload = List[UInt8]()
+    payload.append(UInt8(0xAA))
+    var encoded = encode_grpc_message(Span[UInt8, _](payload))
+    var handler = RaisingUnary(hit=False)
+    var outcome = run_unary_call(
+        handler,
+        _headers(
+            String("POST"),
+            String("/svc/m"),
+            String("application/grpc"),
+            String("trailers"),
+        ),
+        Span[UInt8, _](encoded),
+    )
+    assert_equal(outcome.status.code, GRPC_STATUS_INTERNAL)
+    assert_equal(len(outcome.response_data), 0)
+
+
 def test_run_unary_call_error_status_emits_empty_body() raises:
     var payload = List[UInt8]()
     payload.append(UInt8(0xAA))
@@ -400,4 +489,7 @@ def main() raises:
     test_stitch_rejects_compressed_frame()
     test_run_unary_call_echo()
     test_run_unary_call_error_status_emits_empty_body()
-    print("test_grpc_server: 16 passed")
+    test_run_unary_call_invalid_method_emits_invalid_argument()
+    test_run_unary_call_truncated_lpm_emits_invalid_argument()
+    test_run_unary_call_handler_raise_emits_internal()
+    print("test_grpc_server: 19 passed")

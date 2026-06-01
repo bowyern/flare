@@ -62,7 +62,12 @@ from .framing import (
     encode_grpc_message,
 )
 from .metadata import GrpcMetadata
-from .status import GRPC_STATUS_OK, GRPC_STATUS_INTERNAL, GrpcStatus
+from .status import (
+    GRPC_STATUS_OK,
+    GRPC_STATUS_INTERNAL,
+    GRPC_STATUS_INVALID_ARGUMENT,
+    GrpcStatus,
+)
 
 
 # ── Validation helpers ─────────────────────────────────────────────────────
@@ -401,13 +406,43 @@ def encode_unary_response(
     return encode_grpc_message(Span[UInt8, _](response_bytes), compressed=False)
 
 
+def _outcome_from_reply(var reply: GrpcUnaryReply) -> GrpcCallOutcome:
+    """Pack a :class:`GrpcUnaryReply` into the wire-shape
+    :class:`GrpcCallOutcome` the H2 driver actually emits.
+
+    A non-OK reply produces an empty response-body buffer per the
+    spec (the trailer carries the status, not the body). The
+    LPM-encoder only runs on the OK branch; if it itself raises
+    (out-of-memory) the outcome falls back to an empty body +
+    INTERNAL status so the driver still has something well-formed
+    to put on the wire.
+    """
+    var response_data = List[UInt8]()
+    var status = reply.status.copy()
+    if status.is_ok():
+        try:
+            response_data = encode_unary_response(reply.body)
+        except:
+            response_data = List[UInt8]()
+            status = GrpcStatus.err(
+                GRPC_STATUS_INTERNAL,
+                String("grpc adapter: response LPM encode failed"),
+            )
+    var trailing_copy = reply.trailing_metadata.copy()
+    return GrpcCallOutcome(
+        response_data=response_data^,
+        status=status^,
+        trailing_metadata=trailing_copy^,
+    )
+
+
 def run_unary_call[
     H: GrpcUnary
 ](
     mut handler: H,
     headers: GrpcRequestHeaders,
     request_data: Span[UInt8, _],
-) raises -> GrpcCallOutcome:
+) -> GrpcCallOutcome:
     """End-to-end driver: validate headers, stitch LPM, invoke
     the user handler, encode the response.
 
@@ -415,17 +450,45 @@ def run_unary_call[
     produces a :class:`GrpcCallOutcome` whose bytes go on the
     DATA frame and whose status / trailing metadata go on the
     trailing HEADERS frame.
+
+    The driver itself never raises -- every failure mode
+    (HEADERS validation, truncated/compressed LPM, handler
+    raising) is folded into a typed :class:`GrpcCallOutcome`
+    with the right ``grpc-status``:
+
+    * HEADERS validation failure ->
+      ``GRPC_STATUS_INVALID_ARGUMENT`` (the gRPC spec maps client
+      malformed input to this code).
+    * LPM stitch failure (truncated frame, compressed without a
+      negotiated encoding) -> ``GRPC_STATUS_INVALID_ARGUMENT``.
+    * Handler ``raises`` -> ``GRPC_STATUS_INTERNAL`` with the
+      raise message (clients see ``grpc-message`` for diagnostics
+      only; the failure mode is "server side bug, not client
+      input").
     """
-    var ctx = parse_request_headers(headers)
-    var request_bytes = stitch_request_data(request_data)
-    var reply = handler.serve_unary(ctx, Span[UInt8, _](request_bytes))
-    var response_data = List[UInt8]()
-    if reply.status.is_ok():
-        response_data = encode_unary_response(reply.body)
-    var status_copy = reply.status.copy()
-    var trailing_copy = reply.trailing_metadata.copy()
-    return GrpcCallOutcome(
-        response_data=response_data^,
-        status=status_copy^,
-        trailing_metadata=trailing_copy^,
-    )
+    var ctx: GrpcCallContext
+    try:
+        ctx = parse_request_headers(headers)
+    except e:
+        return _outcome_from_reply(
+            GrpcUnaryReply.err(
+                GrpcStatus.err(GRPC_STATUS_INVALID_ARGUMENT, String(e))
+            )
+        )
+    var request_bytes: List[UInt8]
+    try:
+        request_bytes = stitch_request_data(request_data)
+    except e:
+        return _outcome_from_reply(
+            GrpcUnaryReply.err(
+                GrpcStatus.err(GRPC_STATUS_INVALID_ARGUMENT, String(e))
+            )
+        )
+    var reply: GrpcUnaryReply
+    try:
+        reply = handler.serve_unary(ctx, Span[UInt8, _](request_bytes))
+    except e:
+        return _outcome_from_reply(
+            GrpcUnaryReply.err(GrpcStatus.err(GRPC_STATUS_INTERNAL, String(e)))
+        )
+    return _outcome_from_reply(reply^)
