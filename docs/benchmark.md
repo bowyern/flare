@@ -171,6 +171,32 @@ flare's close-after-disposition handling doesn't introduce
 tail bumps. Both servers are stable under the 3 % stdev gate
 across the 5-run measurement phase.
 
+#### No-regression attestation across the QUIC + H3 + gRPC codec additions
+
+Codec-layer additions land outside the HTTP/1.1 plaintext hot
+path (the wire that drives every row in the tables above),
+but the policy is "verify, don't assume". A re-run of the
+quick harness on the same dev box right after the codec cycle
+showed the baseline held:
+
+| Workload | Server | Workers | Peak req/s | p50 (ms) | p99 (ms) | p99.9 (ms) | p99.99 (ms) | stdev% |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| `throughput`     | **flare**         | 1 | **76,148** | 1.24 | 3.10 | 3.34 | 3.52 | 1.27 |
+| `throughput`     | Go `net/http`     | 1 | 40,444     | 1.38 | 3.22 | 3.81 | 4.53 | 1.57 |
+| `throughput_mc`  | **flare_mc**      | 4 | **234,179** | 1.22 | 2.72 | 3.07 | 5.56 | 0.18 |
+
+The single-worker `throughput` row sits at −0.7 % of the
+`9025444` smoke baseline above (76,148 vs 76,710 req/s) —
+well within the 1.27 % run σ, p99 and p99.99 within 0.04 ms /
+−0.24 ms respectively, and the flare-vs-Go ratio holds at
+1.88×. The `throughput_mc` row at 234,179 req/s is at +0.8 %
+vs the most recent stable dev-box `flare_mc` measurement
+(232,406 req/s on commit `aea7bdb`) and well above every
+intermediate run across the cycle. Conclusion: the codec
+additions don't change the steady-state hot-path shape, and
+the headline tables above remain the correct numbers to
+publish.
+
 ### Multi-worker scaling, Linux EPYC
 
 **Worker-count discipline:** the tables below show two things,
