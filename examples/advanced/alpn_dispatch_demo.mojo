@@ -100,10 +100,9 @@ def main() raises:
         print("No overlap -> reactor closes connection with TLS alert")
     print()
 
-    # Track Q5-W: HttpServer.route_alpn cross-checks the
-    # negotiated ALPN against which listeners the server has
-    # bound. A TCP-only server raises on "h3"; the bind_with_h3
-    # variant accepts it.
+    # HttpServer.route_alpn cross-checks the negotiated ALPN
+    # against which listeners the server has bound. A TCP-only
+    # server raises on "h3"; the bind_with_h3 variant accepts it.
     print("== HttpServer.route_alpn cross-checked routing ==")
     var tcp_only = HttpServer.bind(SocketAddr(IpAddr.localhost(), UInt16(0)))
     print(

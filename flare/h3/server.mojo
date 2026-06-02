@@ -21,8 +21,9 @@ HTTP/3 over QUIC uses four families of streams:
   of revision 9).
 * **Unidirectional QPACK encoder stream** (type 0x02) +
   **decoder stream** (type 0x03) -- carry dynamic-table
-  instructions. The v0.8 scaffold runs QPACK in static-table-only
-  mode (dynamic-table inserts ship in the Track Q4 follow-up).
+  instructions. The driver runs QPACK in static-table-only
+  mode; the SETTINGS we advertise tell the peer not to send
+  dynamic-table inserts. Dynamic table is a follow-up cycle.
 
 ## What ships here
 
@@ -132,7 +133,8 @@ struct H3ConnectionConfig(Copyable, Defaultable, Movable):
     var qpack_max_table_capacity: UInt64
     """RFC 9204 §3.2.2 -- maximum bytes the server is willing to
     spend on the QPACK dynamic table. Default 0 means static-
-    table-only mode (the Track Q4 scaffold default)."""
+    table-only mode; the SETTINGS we emit tell the peer not to
+    send dynamic-table inserts."""
 
     var qpack_blocked_streams: UInt64
     """RFC 9204 §3.2.3 -- maximum streams the server is willing
@@ -356,7 +358,7 @@ struct H3Connection(Defaultable, Movable):
     * Tracks the control-stream lifecycle (whether the peer's
       SETTINGS arrived yet, whether GOAWAY was emitted).
     * Carries the QPACK state. Static-table-only in v0.8;
-      dynamic-table inserts ship with the Track Q4 follow-up.
+      dynamic-table inserts are a follow-up cycle.
 
     The driver is sans-I/O: the QUIC reactor feeds reassembled
     stream chunks in via :meth:`feed_stream_chunk` and drains

@@ -23,11 +23,11 @@ The full QUIC crypto story has three slabs that compose:
    packet's frame contents, plus the AES-128-CTR-based header
    protection mask (§5.4) that hides the packet number and the
    four header low bits. The trait :trait:`QuicCrypto` names the
-   surface a backend must implement; the :class:`OpensslQuicCrypto`
-   carrier wires that surface to the OpenSSL FFI (deferred to the
-   v0.8 Phase D OpenSSL FFI wiring commit) and
-   :class:`RustlsQuicCrypto` will wire it to the rustls QUIC
-   binding once Track Q2 lands.
+   surface a backend must implement; :class:`OpenSslQuicCrypto`
+   wires that surface to the OpenSSL FFI for h3 server
+   connections (the OpenSSL-backed packet protection path), and
+   the rustls binding under :mod:`flare.tls.rustls_quic` drives
+   the TLS exchange itself.
 
 ## Backends
 
@@ -277,7 +277,7 @@ def derive_initial_secrets(dst_cid: Span[UInt8, _]) raises -> InitialSecrets:
     )
 
 
-# ── AEAD enum + trait surface (Track Q1 scaffold) ───────────────────────
+# ── AEAD enum + trait surface ──────────────────────────────────────────
 
 
 struct QuicAead:
@@ -383,11 +383,9 @@ struct StubQuicCrypto(Copyable, Movable, QuicCrypto):
     """Typed sentinel that raises ``NotImplemented`` on every
     AEAD operation.
 
-    Exists so the QUIC server reactor + H3 server can be built
-    against the :trait:`QuicCrypto` boundary in Phase D without
-    blocking on the OpenSSL FFI wiring. Tests that exercise the
-    full handshake replace this with the real
-    :class:`OpensslQuicCrypto` carrier.
+    Exists so unit tests can exercise the :trait:`QuicCrypto`
+    trait boundary without driving a real AEAD; production code
+    constructs :class:`OpenSslQuicCrypto` instead.
     """
 
     var aead_choice: Int

@@ -1,8 +1,14 @@
-"""HTTP/3 server scaffold -- the typed boundary.
+"""HTTP/3 server driver lifecycle walkthrough.
 
 Walks the :class:`flare.h3.H3Connection` driver carrier through
-the lifecycle the QUIC reactor will exercise once the full
-wiring lands. Today the example illustrates:
+the lifecycle the QUIC reactor exercises when a peer opens a
+fresh connection. This example focuses on the driver's pure
+state-machine surface; the full "open a UDP listener, accept
+QUIC connections, route to the H3 driver, dispatch to a
+Handler" walkthrough lives in
+:doc:`examples/advanced/http3_server.mojo`.
+
+This example illustrates:
 
 * Constructing an :class:`H3ConnectionConfig` with non-default
   SETTINGS (max field section size, CONNECT-Protocol advertised).
@@ -10,15 +16,9 @@ wiring lands. Today the example illustrates:
   arrive, and closing them after the response FIN.
 * Emitting GOAWAY and confirming that new request streams are
   rejected.
-* Confirming that the per-stream dispatch + response-writer
-  paths raise a clear "Track Q4 follow-up" error so callers
-  using the scaffold get a loud, immediate failure rather than
-  a silent no-op.
-
-Once the Track Q4 follow-up commit lands the full driver, this
-example evolves into a real "open a UDP listener, accept QUIC
-connections, route to the H3 driver, dispatch to a Handler"
-walkthrough.
+* Driving :meth:`H3Connection.feed_stream_chunk` against a
+  mocked request stream and reading the encoded response bytes
+  back through :meth:`H3Connection.take_response_frames`.
 """
 
 from flare.h3 import (
@@ -83,24 +83,20 @@ def main() raises:
     print("  open_request_stream after GOAWAY raised =", goaway_raised)
     print()
 
-    # Step 6: the Track Q4 follow-up wires feed_stream_chunk +
-    # take_response_frames; today both raise with a clear message
-    # so the example documents exactly what's still in flight.
-    print("Per-stream dispatch boundary (raises pending Track Q4):")
+    # Step 6: drive feed_stream_chunk + take_response_frames on
+    # an existing request stream id. The H3RequestReader is
+    # tolerant of partial frames (waits for the full frame-type
+    # + length + payload before firing the per-frame callback),
+    # so a single 0x01 byte is consumed cleanly and the reader
+    # parks waiting for more bytes. take_response_frames drains
+    # whatever the driver has queued for the stream so far.
+    print("Per-stream dispatch boundary:")
     var chunk = List[UInt8]()
     chunk.append(UInt8(0x01))
-    var feed_raised = False
-    try:
-        conn.feed_stream_chunk(4, chunk)
-    except:
-        feed_raised = True
-    print("  feed_stream_chunk raised =", feed_raised)
-    var take_raised = False
-    try:
-        var _ = conn.take_response_frames(4)
-    except:
-        take_raised = True
-    print("  take_response_frames raised =", take_raised)
+    conn.feed_stream_chunk(4, chunk^)
+    var drained = conn.take_response_frames(4)
+    print("  feed_stream_chunk(4, 0x01) consumed cleanly (partial frame)")
+    print("  take_response_frames bytes pending =", len(drained))
     print()
 
     # The four stream-type codepoints the driver dispatches on.

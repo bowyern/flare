@@ -1,13 +1,14 @@
-"""``flare.quic.server`` -- QUIC server reactor (Track Q3-W).
+"""``flare.quic.server`` -- QUIC server reactor.
 
 Wraps the sans-I/O QUIC connection state machine
 (:class:`flare.quic.state.Connection`) in a UDP listener +
-per-connection dispatcher. Commit 1/5 of Track Q3-W lands the
-UDP bind + the per-datagram dispatch loop; subsequent commits in
-the same track wire the per-packet decrypt path (2/5), the
-PTO / idle / ack-delay timer entries (3/5), the CC reactor
-hooks (4/5), and the loopback integration tests against a real
-QUIC client (5/5).
+per-connection dispatcher. The per-datagram dispatch loop
+threads bytes through :class:`OpenSslQuicCrypto` packet
+protection, the transport-frame parser, and
+:meth:`Connection.handle_frame` to produce
+:class:`ConnectionEvents` for the H3 driver above; PTO /
+idle / ack-delay timers sit on the shared TimerWheel; CC +
+pacing budget gate ``sendmmsg`` on the egress path.
 
 ## What ships here
 

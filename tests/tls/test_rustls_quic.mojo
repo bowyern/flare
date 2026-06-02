@@ -84,14 +84,15 @@ def test_error_kind_codepoints() raises:
 
 def test_not_built_error_carries_reason() raises:
     """:meth:`RustlsQuicError.not_built` returns a carrier with
-    the ``NOT_BUILT`` kind and a reason string that names the
-    follow-up commit. The reactor uses this to distinguish a
-    configuration error from a per-packet handshake failure."""
+    the ``NOT_BUILT`` kind and a reason string that points the
+    caller at the build script. The reactor uses this to
+    distinguish a configuration error from a per-packet
+    handshake failure."""
     var err = RustlsQuicError.not_built()
     assert_equal(err.kind, RustlsQuicErrorKind.NOT_BUILT)
     assert_true(
-        err.reason.startswith(String("rustls QUIC binding scaffold")),
-        "expected reason to identify the scaffold commit",
+        err.reason.startswith(String("rustls QUIC binding")),
+        "expected reason to identify the rustls QUIC binding",
     )
 
 

@@ -14,22 +14,19 @@ the h2 SETTINGS frame includes ``ENABLE_CONNECT_PROTOCOL = 1``,
 the client runs WS-over-h2; otherwise it falls back to the
 HTTP/1.1 path.
 
-The v0.7 cycle shipped the WS-over-h2 *primitive*
-(:class:`flare.ws.WsOverH2Stream` and
-:func:`flare.ws.bootstrap_ws_over_h2`). The v0.8 Phase D cycle
-absorbed the high-level ALPN-driven decision logic + carrier
-shape (the 13-case test corpus in :mod:`tests.ws.test_ws_autoclient`
-pins every observable outcome of the pure
-:func:`decide_wire` step).
+Builds on the WS-over-h2 primitive
+(:class:`flare.ws.WsOverH2Stream` +
+:func:`flare.ws.bootstrap_ws_over_h2`). The pure decision logic
+lives in :func:`decide_wire`; the 13-case test corpus in
+:mod:`tests.ws.test_ws_autoclient` pins every observable outcome.
 
-This commit (Track Q8-W commit 1/2) wires the runtime hand-off:
-:meth:`WsAutoClient.connect` now actually drives the TLS handshake,
-inspects the negotiated ALPN, and routes to
-:class:`flare.ws.WsClient` (HTTP/1.1 Upgrade) or
-:class:`flare.ws.WsOverH2Stream` (HTTP/2 Extended CONNECT). The
-caller queries :attr:`chosen_wire` after :meth:`connect` returns
-to learn which path was taken; the path-specific carrier is
-exposed via :meth:`take_h1_client` / :meth:`is_h2_path`.
+:meth:`WsAutoClient.connect` drives the TLS handshake, inspects
+the negotiated ALPN, and routes to :class:`flare.ws.WsClient`
+(HTTP/1.1 Upgrade) or :class:`flare.ws.WsOverH2Stream` (HTTP/2
+Extended CONNECT). The caller queries :attr:`chosen_wire` after
+:meth:`connect` returns to learn which path was taken; the
+path-specific carrier is exposed via :meth:`take_h1_client` /
+:meth:`take_h2_carrier`.
 
 References:
 

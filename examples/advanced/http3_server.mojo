@@ -1,7 +1,5 @@
 """HTTP/3 server -- one Handler across h1 + h2c + h2 + h3.
 
-Track Q5-W commit 2/2.
-
 Walks the production shape of an HTTP/3 server:
 
 * :meth:`flare.http.HttpServer.bind_with_h3` opens a TCP listener

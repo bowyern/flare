@@ -23,7 +23,7 @@ This module declares:
   :class:`flare.tls.acceptor.TlsAcceptor`, but produces QUIC
   sessions rather than TCP TLS streams.
 - :class:`RustlsQuicSession` -- per-connection rustls handle.
-  The QUIC reactor (Track Q3-W) feeds it CRYPTO-frame bytes per
+  The QUIC reactor feeds it CRYPTO-frame bytes per
   encryption level and pulls handshake output bytes plus
   derived keys back out.
 - :class:`RustlsQuicError` -- typed error carrier for the
@@ -81,8 +81,9 @@ struct QuicEncryptionLevel:
     first client-hello flight."""
 
     comptime EARLY_DATA: Int = 1
-    """RFC 9001 §4.1 -- 0-RTT keys. Not implemented in the v0.8
-    Phase D scaffold (see :data:`NotImplementedReason`)."""
+    """RFC 9001 §4.1 -- 0-RTT keys. Not implemented in this
+    cycle (see :data:`NotImplementedReason`); session resumption
+    + 0-RTT lands in a follow-up cycle."""
 
     comptime HANDSHAKE: Int = 2
     """RFC 9001 §4.1 -- handshake keys derived after the server
@@ -130,7 +131,7 @@ struct RustlsQuicConfig(Copyable, Defaultable, Movable):
     var max_early_data_size: UInt32
     """Maximum 0-RTT data the server will accept. Set to 0 to
     disable 0-RTT (the default). 0-RTT replay protection is
-    out of scope for this scaffold; see RFC 9001 §9.2."""
+    out of scope for this cycle; see RFC 9001 §9.2."""
 
     var session_resumption_enabled: Bool
     """Whether to issue NewSessionTicket frames for session
@@ -167,14 +168,18 @@ struct RustlsQuicError(Copyable, Movable):
     def not_built() -> Self:
         """The Rust crate is not built; the reactor should
         treat this as a configuration error (not a per-packet
-        failure)."""
+        failure). The build_rustls.sh activation script wired
+        into pixi's [activation.scripts] auto-builds the crate
+        on `pixi install`; this carrier exists for the rare
+        path where activation didn't run (e.g. a bare mojo
+        invocation outside a pixi shell)."""
         return Self(
             kind=RustlsQuicErrorKind.NOT_BUILT,
             reason=String(
-                "rustls QUIC binding scaffold: the rustls Rust"
-                " crate (flare/tls/ffi/rustls_wrapper.rs) is not"
-                " built in this commit. Track Q2 follow-up will"
-                " ship the crate plus the build_rustls.sh"
+                "rustls QUIC binding: the rustls Rust crate"
+                " (flare/tls/ffi/rustls_wrapper) is not built."
+                " Run `pixi run -e dev build-rustls-quic` to"
+                " build it, or `pixi install` to re-trigger the"
                 " activation script."
             ),
         )
@@ -189,8 +194,9 @@ struct RustlsQuicErrorKind:
     enumeration plus the local "not built" sentinel."""
 
     comptime NOT_BUILT: Int = 0
-    """The Rust crate is not built. Returned by every method
-    in the scaffold; replaced once the crate ships."""
+    """The Rust crate is not built. Returned by the constructor
+    when the FFI symbol lookup fails (the activation script
+    didn't run); resolved by re-running `pixi install`."""
 
     comptime HANDSHAKE_INCOMPLETE: Int = 1
     """The session needs more CRYPTO frame bytes before it can

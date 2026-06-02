@@ -276,23 +276,18 @@ struct HttpServer(Movable):
     """Set by ``close()`` to break the reactor loop. Read from the loop
     itself each iteration."""
     var _h3_listener: Optional[QuicListener]
-    """Optional HTTP/3 UDP listener (Track Q5-W commit 1/2).
+    """Optional HTTP/3 UDP listener.
 
     ``None`` (the default) when the server was constructed via
     :meth:`bind` or :meth:`bind_many` (TCP-only flows). Set to a
     fully-bound :class:`flare.quic.server.QuicListener` when the
     server was constructed via :meth:`bind_with_h3`; the listener
     owns its UDP socket fd, its per-listener timer wheel, and the
-    QUIC connection slab.
-
-    The reactor wiring that drains this listener -- pulling
-    inbound datagrams, dispatching through
-    :class:`flare.h3.H3Connection`, draining outbound -- is the
-    Track Q5-W commit 2/2 + the v0.7 reactor follow-up. This
-    commit ships the bind path + the ALPN routing decision +
-    the per-listener :meth:`tick_h3_once` test-only entry point
-    so the full plumbing can be wired without reshaping the
-    public surface again.
+    QUIC connection slab. The reactor drains inbound datagrams,
+    dispatches them through :class:`flare.h3.H3Connection`, and
+    drains outbound at every reactor tick. The per-listener
+    :meth:`tick_h3_once` entry point lets unit tests advance the
+    listener's timer wheel without spinning up the full reactor.
     """
 
     def __init__(
@@ -462,7 +457,7 @@ struct HttpServer(Movable):
     ) raises -> HttpServer:
         """Bind an HTTP server that speaks h1 / h2c / h2 over TCP
         on ``tcp_addr`` AND h3 over QUIC/UDP on the address in
-        ``udp_cfg``. Track Q5-W commit 1/2.
+        ``udp_cfg``.
 
         The TLS ALPN list advertised by the TCP listener (h2,
         http/1.1) and the QUIC listener (h3 only) is what tells
@@ -477,16 +472,13 @@ struct HttpServer(Movable):
           :class:`ConnHandle`.
         * h2c upgrade hint -> H2C (TCP path only).
 
-        The reactor wiring that actually drains the QUIC listener
-        ships in Track Q5-W commit 2/2 + the v0.7 reactor
-        follow-up; this commit ships the bind path + the ALPN
-        routing decision + per-listener accessors. Calling
-        :meth:`serve` on a server returned by this method runs
-        the TCP reactor exactly as before; the UDP listener is
-        held open and reachable via :meth:`local_h3_addr` /
-        :meth:`tick_h3_once` until the full reactor wiring
-        lands. Closing the server (via :meth:`close` or
-        ``__del__``) closes both listeners.
+        Calling :meth:`serve` on a server returned by this method
+        runs the TCP + UDP reactors side by side; the UDP listener
+        is also reachable via :meth:`local_h3_addr` /
+        :meth:`tick_h3_once` for tests that want to drive the
+        h3 path without spinning up the full reactor. Closing
+        the server (via :meth:`close` or ``__del__``) closes
+        both listeners.
 
         Args:
             tcp_addr: Local TCP address for h1 / h2c / h2.
