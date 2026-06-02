@@ -1,0 +1,111 @@
+"""HTTP/3 server scaffold -- the typed boundary.
+
+Walks the :class:`flare.h3.H3Connection` driver carrier through
+the lifecycle the QUIC reactor will exercise once the full
+wiring lands. Today the example illustrates:
+
+* Constructing an :class:`H3ConnectionConfig` with non-default
+  SETTINGS (max field section size, CONNECT-Protocol advertised).
+* Opening per-stream readers as new QUIC bidirectional streams
+  arrive, and closing them after the response FIN.
+* Emitting GOAWAY and confirming that new request streams are
+  rejected.
+* Confirming that the per-stream dispatch + response-writer
+  paths raise a clear "Track Q4 follow-up" error so callers
+  using the scaffold get a loud, immediate failure rather than
+  a silent no-op.
+
+Once the Track Q4 follow-up commit lands the full driver, this
+example evolves into a real "open a UDP listener, accept QUIC
+connections, route to the H3 driver, dispatch to a Handler"
+walkthrough.
+"""
+
+from flare.h3 import (
+    H3Connection,
+    H3ConnectionConfig,
+    H3StreamType,
+)
+
+
+def main() raises:
+    print("== HTTP/3 server scaffold walkthrough ==")
+    print()
+
+    # Step 1: build a config carrier with our SETTINGS.
+    var cfg = H3ConnectionConfig()
+    cfg.max_field_section_size = UInt64(8192)
+    cfg.enable_connect_protocol = True
+    print("Configured H3 with:")
+    print("  max_field_section_size = ", cfg.max_field_section_size)
+    print("  enable_connect_protocol =", cfg.enable_connect_protocol)
+    print()
+
+    # Step 2: construct the connection driver.
+    var conn = H3Connection.with_config(cfg)
+    print(
+        "Driver state: peer_settings_received =",
+        conn.peer_settings_received,
+        ", active streams =",
+        conn.active_request_count(),
+    )
+    print()
+
+    # Step 3: the reactor opens streams as datagrams arrive.
+    # QUIC bidi streams have IDs of the form 4k (client-initiated).
+    print("Opening three request streams (IDs 0, 4, 8):")
+    conn.open_request_stream(0)
+    conn.open_request_stream(4)
+    conn.open_request_stream(8)
+    print("  active streams now =", conn.active_request_count())
+    print()
+
+    # Step 4: closing happens after the response FIN. Stream 0
+    # completes; the driver releases its parser state.
+    print("Closing stream 0 (response FIN emitted):")
+    conn.close_request_stream(0)
+    print("  has_stream(0) =", conn.has_stream(0))
+    print("  has_stream(4) =", conn.has_stream(4))
+    print("  active streams now =", conn.active_request_count())
+    print()
+
+    # Step 5: GOAWAY rejects new streams. The reactor emits GOAWAY
+    # under load or on graceful shutdown; subsequent open events
+    # raise so the listener can surface the rejection to the QUIC
+    # peer with H3_REQUEST_CANCELLED.
+    print("Emitting GOAWAY:")
+    conn.goaway_emitted = True
+    var goaway_raised = False
+    try:
+        conn.open_request_stream(12)
+    except:
+        goaway_raised = True
+    print("  open_request_stream after GOAWAY raised =", goaway_raised)
+    print()
+
+    # Step 6: the Track Q4 follow-up wires feed_stream_chunk +
+    # take_response_frames; today both raise with a clear message
+    # so the example documents exactly what's still in flight.
+    print("Per-stream dispatch boundary (raises pending Track Q4):")
+    var chunk = List[UInt8]()
+    chunk.append(UInt8(0x01))
+    var feed_raised = False
+    try:
+        conn.feed_stream_chunk(4, chunk)
+    except:
+        feed_raised = True
+    print("  feed_stream_chunk raised =", feed_raised)
+    var take_raised = False
+    try:
+        var _ = conn.take_response_frames(4)
+    except:
+        take_raised = True
+    print("  take_response_frames raised =", take_raised)
+    print()
+
+    # The four stream-type codepoints the driver dispatches on.
+    print("RFC 9114 paragraph 6.2 unidirectional stream types:")
+    print("  CONTROL       =", H3StreamType.CONTROL)
+    print("  PUSH          =", H3StreamType.PUSH)
+    print("  QPACK_ENCODER =", H3StreamType.QPACK_ENCODER)
+    print("  QPACK_DECODER =", H3StreamType.QPACK_DECODER)
