@@ -1134,57 +1134,94 @@ parser regressions, not as a headline.
 
 ---
 
-## HTTP/3 throughput -- pending wiring
+## HTTP/3 throughput
 
-The HTTP/3 cross-framework throughput table is a hard release
-gate for the v0.8 Phase D cycle (per the design notebook
-``## Phase D -- absorbed v0.9 scope`` track Q7). The
-infrastructure to run that bench landed in this cycle:
+The HTTP/3 cross-framework throughput table is the hard release
+gate for the v0.8 close-wire-paths cycle (Track Q7-W). The four
+flare-side wiring follow-ups (AEAD backend, rustls QUIC binding,
+QUIC reactor, H3 driver dispatch) all landed in this cycle, so
+the dependency chain in front of the bench harness is now:
+
+- ``flare/tls/ffi/openssl_wrapper.cpp`` -- AEAD seal / open +
+  header-protection mask thunks (Track Q1-W; tested against
+  RFC 9001 Appendix A vectors + cross-validated with aioquic).
+- ``flare/tls/ffi/rustls_wrapper/`` -- rustls 0.23 ServerConnection
+  over a C ABI; idempotent build via
+  ``flare/tls/ffi/build_rustls.sh`` (Track Q2-W).
+- ``flare/quic/server.mojo`` -- UDP listener + per-datagram
+  dispatch + TimerWheel-driven PTO / idle / ack-delay + CC
+  reactor (Track Q3-W; loopback handshake -> 1-RTT -> close
+  tested vs. a vendored quinn smoke client).
+- ``flare/h3/server.mojo`` -- ``H3Connection.feed_stream_chunk``
+  through ``H3RequestReader`` -> ``Handler`` -> response writer,
+  uni-stream type dispatch, SETTINGS + GOAWAY consumption,
+  conformance round-trip vs. aioquic + quiche fixtures
+  (Track Q4-W).
+
+Infrastructure for the cross-framework bench:
 
 - ``benchmark/configs/h3_throughput.yaml`` -- workload definition
-  (h2load with ``--npn-list=h3``, 1 client x 100 streams x 100k
-  requests, 30 s duration, 5 runs, 8 % sigma honesty meter).
-- ``benchmark/baselines/quinn/`` + ``benchmark/baselines/quiche/``
-  -- scaffold directories with build / pin guidance for the two
-  external Rust reference implementations.
-- ``benchmark/scripts/bench_h3.sh`` -- the bench loop runner.
-- ``pixi run --environment bench bench-h3`` -- the task entry
-  point (wired into ``[feature.bench.tasks]`` in ``pixi.toml``).
+  (1 client x 100 streams x 100k requests, 30 s duration, 5 runs,
+  8 % sigma honesty meter -- looser than the h2-over-TCP 3 % gate
+  because QUIC pacing + RTT estimation has wider run-to-run
+  variance).
+- ``benchmark/baselines/flare_h3/`` -- flare HTTP/3 baseline
+  binary (``mojo build -D ASSERT=none``; mirrors the shape of
+  ``benchmark/baselines/flare/`` so the same harness drives
+  both).
+- ``benchmark/baselines/quinn/`` -- quinn 0.11 + h3 0.0.8 baseline
+  (``cargo build --release --locked``; serves the same route
+  surface as the hyper baseline).
+- ``benchmark/baselines/quiche/`` -- quiche 0.22 baseline
+  (``cargo build --release --locked``; boringssl-vendored).
+- ``benchmark/scripts/bench_h3.sh`` -- the bench loop runner
+  (build + start + readiness + warmup + 5x measurement +
+  aggregate + stop).
+- ``benchmark/scripts/_stat_h3.py`` -- per-percentile aggregator
+  reading h2load ``--log-file`` per-request timings + writing
+  ``benchmark/results/v0.8/h3/${TARGET}.json``.
+- ``pixi run --environment bench bench-h3 {flare,quinn,quiche,all}``
+  -- task entry points.
 
-**Status: numbers not yet published.** The flare-side HTTP/3
-server (``flare/quic/server.mojo`` + ``flare/h3/server.mojo``)
-is a typed scaffold in this cycle. Producing meaningful numbers
-requires the four wiring follow-ups telegraphed in the design
-notebook:
+**Status: bench infrastructure complete; running the gate
+requires an h2load build with HTTP/3 support on the dev-box.**
+Stock Ubuntu's ``nghttp2-client`` (1.43) predates h3 support;
+conda-forge's nghttp2 (1.68) ships without ``h2load``. To
+populate the table on the EPYC 7R32 dev-box, build nghttp2 from
+source against vendored ngtcp2 + nghttp3:
 
-- The OpenSSL AEAD backend behind the ``QuicCrypto`` trait
-  (Track Q1 follow-up; today ``StubQuicCrypto`` raises).
-- The rustls Rust crate behind ``RustlsQuicAcceptor``
-  (Track Q2 follow-up; today the binding raises ``NOT_BUILT``).
-- The QUIC reactor's UDP read loop + per-datagram dispatch
-  (Track Q3 follow-up; today ``QuicListener.run`` raises).
-- The H3 driver's per-stream ``H3RequestReader -> Handler ->
-  response-writer`` wiring (Track Q4 follow-up; today
-  ``H3Connection.feed_stream_chunk`` raises).
+```bash
+# One-time. Builds an h2load binary that links ngtcp2 +
+# nghttp3 + OpenSSL-QUIC patched/BoringSSL; takes ~10-15
+# min on the EPYC dev-box. Drops the binary on PATH ahead
+# of the distro h2load.
+git clone https://github.com/nghttp2/nghttp2
+cd nghttp2 && autoreconf -i && ./configure \
+    --enable-http3 --with-libngtcp2 --with-libnghttp3
+make -j && sudo make install
+```
 
-``bench_h3.sh`` exits 0 with a clear "not wired" banner today
-so CI can pin "infra ready, wiring deferred" as a known posture
-rather than a regression. When the four follow-ups land, the
-script's probe returns 0 + the bench loop produces real numbers
-without further script edits. The table below will be filled in
-with the same EPYC 7R32 dev-box used for the v0.6.0 / current
-HTTP/2 numbers.
+Once that's done, ``pixi run -e bench bench-h3 all`` produces
+the real EPYC 7R32 numbers and rewrites the table below
+without further script edits:
 
 | Target | req/s (median, 5 runs) | p99 (ms) | p99.9 (ms) | p99.99 (ms) | sigma % |
 |---|---|---|---|---|---|
-| flare h3 | (pending wiring) | (pending) | (pending) | (pending) | (pending) |
-| quinn (h3 0.0.x) | (pending baseline build) | (pending) | (pending) | (pending) | (pending) |
-| quiche 0.18+ | (pending baseline build) | (pending) | (pending) | (pending) | (pending) |
-| h2load (h3 client) | (pending baseline build) | (pending) | (pending) | (pending) | (pending) |
+| flare h3 | (pending h2load h3 build) | (pending) | (pending) | (pending) | (pending) |
+| quinn 0.11 + h3 0.0.8 | (pending h2load h3 build) | (pending) | (pending) | (pending) | (pending) |
+| quiche 0.22 | (pending h2load h3 build) | (pending) | (pending) | (pending) | (pending) |
 
-When the table lands, the Phase D close attestation row in
-"Server throughput (TFB plaintext)" gets a matching "HTTP/3
-floor held" entry alongside the h1 / h2 floors.
+The "pending" rows now name the dev-box prerequisite explicitly
+rather than the in-tree wiring -- the flare side of the gate
+already passes its unit + conformance + fuzz + loopback
+integration suites. When the table lands, the Phase D close
+attestation row in "Server throughput (TFB plaintext)" gets a
+matching "HTTP/3 floor held" entry alongside the h1 / h2 floors.
+
+``bench_h3.sh`` exits 0 with a clear banner today when h2load
+with h3 support isn't on PATH, so CI continues to pin
+"infrastructure ready, h3 client install pending" as a known
+posture rather than a regression.
 
 ---
 
