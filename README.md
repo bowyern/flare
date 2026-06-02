@@ -28,7 +28,7 @@ def main() raises:
 
 ## Why flare
 
-- **Batteries included:** HTTP/1.1 + HTTP/2, WebSocket (RFC 6455 + permessage-deflate with context-takeover), TLS 1.2/1.3 with ALPN, signed cookies, sessions, multipart, gzip + brotli, CORS, static files, SSE, templates with `{% block %}` / `{% extends %}` inheritance, RFC 9111 HTTP cache (`Cache[Inner, S]` middleware over `InMemoryCacheStore`, conditional revalidation), gRPC sans-I/O codec primitives (LPM framing + Status + Metadata; the HTTP/2 server adapter ships in a follow-up release), an OpenAPI 3.1 spec emitter, sans-I/O HTTP/3 + QUIC codec primitives, `Retry` + `PostHocDeadline` reliability middleware, mTLS, and the PROXY protocol all live in `flare/`. Full inventory in [`docs/features.md`](docs/features.md).
+- **Batteries included:** HTTP/1.1 + HTTP/2, WebSocket (RFC 6455 + permessage-deflate with context-takeover) with an ALPN-driven `WsAutoClient` that picks h1 vs RFC 8441 h2-tunnel, TLS 1.2/1.3 with ALPN + a wire-protocol dispatcher (`flare.http.alpn_dispatch`) for routing h1 / h2c / h2 / h3, signed cookies, sessions, multipart, gzip + brotli, CORS, static files, SSE, templates with `{% block %}` / `{% extends %}` inheritance, RFC 9111 HTTP cache (`Cache[Inner, S]` middleware over `InMemoryCacheStore`, conditional revalidation), gRPC sans-I/O codec primitives (LPM framing + Status + Metadata) with the unary server adapter on top, an OpenAPI 3.1 spec emitter, sans-I/O HTTP/3 + QUIC codec primitives plus the QUIC reactor / `H3Connection` driver / rustls QUIC binding scaffolds (the wire I/O backend behind those scaffolds is in flight; the scaffolds raise on the wire paths until it lands), `Retry` + `PostHocDeadline` reliability middleware, mTLS, and the PROXY protocol all live in `flare/`. Full inventory in [`docs/features.md`](docs/features.md).
 - **Composable by types, not callbacks:** `Handler` is a trait. `Router`, middleware, and typed extractors (`PathInt`, `QueryInt`, `Form[T]`, `Json[T]`, `Cookies`) compose by nesting structs. The compiler monomorphises the handler chain into one direct call sequence per request type — no virtual dispatch through the chain.
 - **Hard to misuse under load:** Per-request `Cancel` tokens, graceful drain, sanitized 4xx/5xx, TLS cert reload, structured logging, Prometheus metrics. A `TestClient[H]` drives handlers in-process without binding a port for fast unit tests.
 - **Fast, with a tight tail:** Thread-per-core reactor (`kqueue` / `epoll`, opt-in `io_uring`). On a 4-worker plaintext bench, flare's handler path posts the best median p99 of the pack against `hyper` / `axum` / `actix_web`. [Numbers below.](#performance)
@@ -243,7 +243,9 @@ What jumps out:
 - **actix_web** posts the highest headline of the pack (`253k req/s`) but its p99 median is `10.04 ms` and p99.99 is `37.41 ms` — the same cliff dynamic flare_mc_static shows, just at a higher rate. The σ on actix's p99 / p99.9 (`4.55 ms` / `4.31 ms`) is tight enough that this isn't measurement noise; it's a steady-state shape at that rate.
 - **axum** is the steadiest of the pack at `195k req/s` with `σ ≤ 0.02 ms` at every percentile — flat at the cost of being the lowest headline of the four. Use it as the reference for what an in-envelope p99 distribution looks like at this load.
 - **hyper** is the reference baseline — its current numbers (`216k req/s`, `2.83 ms` p99 median) move within `±0.5 %` of the prior measurement, so the same Rust binary under the same Linux kernel returns the same throughput run-over-run.
-- **flare 1w** is on par with nginx 1w. Both land within `2.8 %` of each other on req/s (`79.0k` vs `76.9k`) — the gap sits inside the combined `1σ` envelope of the two measurements (`±1.58k req/s`), and nginx itself drifted `-4.2 %` between the prior and current runs of the same binary. Median p99 is identical at `3.23 ms`. Statistically indistinguishable at single-core load. The prior measurement had flare at 89 % of nginx; the H1 parser tightening lands more aggressively at the single-worker shape (the workload runs on one core, so the ~5 % CPU reclaim from the UTF-8 bypass shows up as ~10 % throughput). Against Go `net/http` at the same worker count flare does `1.96×` the throughput with comparable tail medians.
+- **flare 1w** is on par with nginx 1w. Both land within `2.8 %` of each other on req/s (`79.0k` vs `76.9k`) — the gap sits inside the combined `1σ` envelope of the two measurements (`±1.58k req/s`), and nginx itself drifted `-4.2 %` between the prior and current runs of the same binary. Median p99 is identical at `3.23 ms`. Statistically indistinguishable at single-core load. The prior measurement had flare at 89 % of nginx; the H1 parser tightening lands more aggressively at the single-worker shape (the workload runs on one core, so the ~5 % CPU reclaim from the UTF-8 bypass shows up as ~10 % throughput). Against Go `net/http` at the same worker count flare does `1.96x` the throughput with comparable tail medians.
+
+**HTTP/3 throughput (pending wiring):** The cross-framework HTTP/3 throughput bench is set up under [`benchmark/configs/h3_throughput.yaml`](benchmark/configs/h3_throughput.yaml) + [`benchmark/scripts/bench_h3.sh`](benchmark/scripts/bench_h3.sh) and the reference baselines (`benchmark/baselines/quinn/`, `benchmark/baselines/quiche/`) carry pin guidance. The harness exits 0 with a clear "not wired" banner today: the flare h3 server is a typed scaffold pending the QUIC reactor + rustls + AEAD wiring follow-ups. The result table in [`docs/benchmark.md#http3-throughput----pending-wiring`](docs/benchmark.md) lands the numbers when the wiring clears.
 
 The matching nginx / hyper / actix_web / axum baselines built from source by the harness live under [`benchmark/baselines/`](benchmark/baselines/).
 
@@ -296,13 +298,28 @@ flare.http.cache  RFC 9111 cache: CacheControl directive parser,
                InMemoryCacheStore, Cache[Inner, S] wrapping
                middleware (freshness check, conditional revalidation)
 flare.grpc     Sans-I/O gRPC codec primitives: LPM framing, canonical
-               Status codes, Metadata carrier (HTTP/2 server adapter
-               ships in a follow-up release)
+               Status codes, Metadata carrier, plus the unary
+               server adapter (`GrpcUnary` trait + `run_unary_call`)
+               that maps an HTTP/2 stream to a typed handler;
+               server-streaming + client-streaming + bidirectional
+               + the client side are in flight.
 flare.openapi  OpenAPI 3.1 spec model + deterministic JSON emitter
-flare.quic     Sans-I/O QUIC v1 codec primitives (varint + long/short
-               packet headers; reactor + TLS + CC drive land alongside
-               the QUIC server in a follow-up release)
-flare.h3       Sans-I/O HTTP/3 frame codec + SETTINGS payload
+flare.quic     Sans-I/O QUIC v1 codec primitives: varint + long/short
+               packet headers, all 22 transport frames driven through
+               a `FrameHandler` trait, transport-parameter codec, the
+               RFC 9000 §3+§10+§13 state machine, the RFC 9001 §5 +
+               RFC 5869 HKDF key schedule behind a `QuicCrypto` trait,
+               and the `CongestionController` trait (CUBIC default +
+               Reno fallback). The `QuicListener` + `QuicConnection` +
+               `ConnectionIdTable` reactor scaffold and the
+               `RustlsQuicAcceptor` binding pin the typed boundary;
+               the UDP read loop, the OpenSSL AEAD backend, and the
+               rustls Rust crate behind those scaffolds are in flight.
+flare.h3       Sans-I/O HTTP/3 frame codec + SETTINGS payload + the
+               `H3RequestReader` state machine + response writer.
+               `H3Connection` driver scaffold mounts on the same
+               `Handler` trait the h1 / h2 paths use; per-stream feed
+               + take is in flight.
 flare.crypto   HMAC-SHA256, base64url (signed cookies, sessions)
 flare.tls      TLS 1.2/1.3 (OpenSSL, both client and server, session
                resumption via RFC 5077 tickets + RFC 8446 §4.6.1)
