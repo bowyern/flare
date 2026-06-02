@@ -67,3 +67,11 @@ from ._server_ffi import (
     server_ssl_get_sni_host,
     server_ssl_free,
 )
+from .rustls_quic import (
+    QuicEncryptionLevel,
+    RustlsQuicAcceptor,
+    RustlsQuicConfig,
+    RustlsQuicError,
+    RustlsQuicErrorKind,
+    RustlsQuicSession,
+)
