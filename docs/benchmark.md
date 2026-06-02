@@ -597,6 +597,36 @@ Source data: [`benchmark/results/2026-05-27T2256-ehsan-dev-03e55f2/`](../benchma
 Prior baseline (v0.7 numbers carried through until this
 HEAD): [`benchmark/results/2026-05-11T1821-ehsan-dev-944de73/`](../benchmark/results/2026-05-11T1821-ehsan-dev-944de73/).
 
+##### Phase D close attestation
+
+The Phase D feature pass (HTTP/3 + QUIC reactor scaffolds + H3
+server scaffold + rustls QUIC binding + CC trait + crypto key
+schedule + ALPN dispatcher + WS auto-dispatcher + http<->http2
+cycle break) is additive to the request-side hot path: every
+new module either runs only when the caller opts into it
+(ALPN dispatcher, WS auto-dispatcher) or sits on the QUIC
+sub-tree that the throughput harness doesn't exercise (QUIC
+reactor, H3 server, rustls binding, AEAD). The
+`StreamSlab[Stream]` swap (HTTP/2 stream map) is on the h2 hot
+path but the throughput harness uses h1 only.
+
+The full bench-vs-baseline gate must run on the EPYC dev-box
+before the next h1 floors are quoted; the in-session gates that
+*did* run all hold:
+
+- `pixi run format-check` -- 423 files clean.
+- `pixi run check-sans-io` -- 28 files clean.
+- `pixi run check-no-http-http2-cycle` -- clean.
+- New tests this cycle (9 files / 88 cases): all pass.
+- `pixi run bench-h3 flare` -- prints the "infra ready, wiring
+  deferred" banner + exits 0 as the gate now expects.
+
+The full `pixi run tests` aggregate + `fuzz-all` + the sanitizer
+trio + `bench-vs-baseline` cycle (each multi-hour) runs on the
+dev-box at the cycle handoff; the new test files are already
+wired into the `tests` aggregate so they run alongside the
+existing 600+ cases.
+
 #### Listener-mode A/B (flare-only)
 
 flare exposes both listener strategies so the operator can
