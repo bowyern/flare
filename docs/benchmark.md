@@ -1104,6 +1104,60 @@ parser regressions, not as a headline.
 
 ---
 
+## HTTP/3 throughput -- pending wiring
+
+The HTTP/3 cross-framework throughput table is a hard release
+gate for the v0.8 Phase D cycle (per the design notebook
+``## Phase D -- absorbed v0.9 scope`` track Q7). The
+infrastructure to run that bench landed in this cycle:
+
+- ``benchmark/configs/h3_throughput.yaml`` -- workload definition
+  (h2load with ``--npn-list=h3``, 1 client x 100 streams x 100k
+  requests, 30 s duration, 5 runs, 8 % sigma honesty meter).
+- ``benchmark/baselines/quinn/`` + ``benchmark/baselines/quiche/``
+  -- scaffold directories with build / pin guidance for the two
+  external Rust reference implementations.
+- ``benchmark/scripts/bench_h3.sh`` -- the bench loop runner.
+- ``pixi run --environment bench bench-h3`` -- the task entry
+  point (wired into ``[feature.bench.tasks]`` in ``pixi.toml``).
+
+**Status: numbers not yet published.** The flare-side HTTP/3
+server (``flare/quic/server.mojo`` + ``flare/h3/server.mojo``)
+is a typed scaffold in this cycle. Producing meaningful numbers
+requires the four wiring follow-ups telegraphed in the design
+notebook:
+
+- The OpenSSL AEAD backend behind the ``QuicCrypto`` trait
+  (Track Q1 follow-up; today ``StubQuicCrypto`` raises).
+- The rustls Rust crate behind ``RustlsQuicAcceptor``
+  (Track Q2 follow-up; today the binding raises ``NOT_BUILT``).
+- The QUIC reactor's UDP read loop + per-datagram dispatch
+  (Track Q3 follow-up; today ``QuicListener.run`` raises).
+- The H3 driver's per-stream ``H3RequestReader -> Handler ->
+  response-writer`` wiring (Track Q4 follow-up; today
+  ``H3Connection.feed_stream_chunk`` raises).
+
+``bench_h3.sh`` exits 0 with a clear "not wired" banner today
+so CI can pin "infra ready, wiring deferred" as a known posture
+rather than a regression. When the four follow-ups land, the
+script's probe returns 0 + the bench loop produces real numbers
+without further script edits. The table below will be filled in
+with the same EPYC 7R32 dev-box used for the v0.6.0 / current
+HTTP/2 numbers.
+
+| Target | req/s (median, 5 runs) | p99 (ms) | p99.9 (ms) | p99.99 (ms) | sigma % |
+|---|---|---|---|---|---|
+| flare h3 | (pending wiring) | (pending) | (pending) | (pending) | (pending) |
+| quinn (h3 0.0.x) | (pending baseline build) | (pending) | (pending) | (pending) | (pending) |
+| quiche 0.18+ | (pending baseline build) | (pending) | (pending) | (pending) | (pending) |
+| h2load (h3 client) | (pending baseline build) | (pending) | (pending) | (pending) | (pending) |
+
+When the table lands, the Phase D close attestation row in
+"Server throughput (TFB plaintext)" gets a matching "HTTP/3
+floor held" entry alongside the h1 / h2 floors.
+
+---
+
 ## WebSocket SIMD masking
 
 RFC 6455 requires XOR-masking every client-to-server byte. SIMD gives

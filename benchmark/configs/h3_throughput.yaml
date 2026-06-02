@@ -1,0 +1,35 @@
+# HTTP/3 throughput configuration (v0.8 Phase D, Track Q7 HARD GATE).
+#
+# Drives ``h2load --npn-list=h3`` (or ``quiche-client``) against the
+# flare HTTP/3 server adapter over UDP. The structure mirrors the
+# v0.6 Track J ``h2_throughput.yaml`` so cross-protocol comparisons
+# share the same harness shape; the wire is the only difference.
+#
+# Status: published as infrastructure in this commit.  The
+# in-tree h3 server (flare/quic/server.mojo + flare/h3/server.mojo)
+# is a typed scaffold today; the actual request-response round-trip
+# requires the rustls QUIC binding (Track Q2 follow-up) plus the
+# OpenSSL AEAD wiring (Track Q1 follow-up) before bench_h3.sh can
+# produce a meaningful number.  ``docs/benchmark.md`` carries the
+# matching ``HTTP/3 throughput -- pending wiring`` row so the
+# table is honest about what's ready vs in-flight.
+#
+# When the wiring lands, this config is the one bench_h3.sh consults
+# without further edits.
+
+name: h3_throughput
+h2load_clients: 1
+h2load_streams: 100
+h2load_requests: 100000
+h2load_duration_seconds: 30
+warmup_seconds: 10
+runs: 5
+quiet_seconds: 5
+# Wider variance gate than h2 -- QUIC pacing + RTT estimation
+# adds run-to-run variability that h2 over TCP doesn't see.
+stdev_pct_gate: 8.0
+
+# QUIC-specific knobs that h2load --npn-list=h3 exercises.
+udp_payload_max_bytes: 1452
+initial_congestion_window_packets: 10
+max_idle_timeout_ms: 30000
