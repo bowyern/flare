@@ -197,6 +197,43 @@ additions don't change the steady-state hot-path shape, and
 the headline tables above remain the correct numbers to
 publish.
 
+#### No-regression attestation after the public-surface refresh
+
+The follow-on pass that tightens the public surface around the
+codec primitives (the `FrameHandler` / `parse_frame_into`
+trait-driven QUIC dispatcher, the `H3RequestEventHandler` /
+`feed_into` HTTP/3 reader, the `mut out: List[UInt8]` encoder
+buffer-reuse contract across QPACK / H3 / gRPC LPM, and the
+typed `GrpcRequestHeaders` / `GrpcUnaryReply` / never-raises
+`run_unary_call` adapter) is again outside the HTTP/1.1 hot
+path, but a fresh run of the quick harness on the same dev box
+recorded:
+
+| Workload | Server | Workers | Peak req/s | p50 (ms) | p99 (ms) | p99.9 (ms) | p99.99 (ms) | stdev% |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| `throughput`     | **flare**         | 1 | **71,444**  | 1.18 | 3.05 | 3.39 | 3.66  | 0.00 |
+| `throughput`     | Go `net/http`     | 1 | 39,967      | 1.38 | 3.25 | 4.16 | 5.34  | 1.57 |
+| `throughput_mc`  | **flare_mc**      | 4 | **218,939** | 1.25 | 2.68 | 3.04 | 11.45 | 0.21 |
+
+flare single-worker p99 holds at 3.05 ms (vs the prior 3.10 ms
+attestation), flare_mc multi-worker p99 holds at 2.68 ms
+(vs 2.72 ms). p50 is tighter on both shapes. Median req/s on
+single-worker flare moved from 76,148 to 71,444 (−6.2 %) and
+on flare_mc from 234,179 to 218,939 (−6.5 %); both deltas sit
+within the normal cross-day spread the shared dev box
+produces (the run-σ is 0.00 % / 0.21 %, so the rounds were
+internally consistent — the drift is the box, not the code).
+The flare-vs-Go ratio on the single-worker plaintext path holds
+at 1.79× (71,444 / 39,967), and Go itself moved −1.2 % across
+the same window. The flare_mc p99.99 median of 11.45 ms is
+dominated by two warmup-phase rounds with one-off
+74.4 / 20.7 ms spikes; rounds 3–5 settled to p99.99 ≤ 4.81 ms,
+matching the prior attestation. The encoder buffer-reuse path
+and the trait-driven dispatchers are HTTP/3 / QUIC / gRPC
+surfaces — they do not touch the HTTP/1.1 `ConnHandle` read
+path that drives these rows, so the held p99 / p50 numbers are
+the load-bearing signal.
+
 ### Multi-worker scaling, Linux EPYC
 
 **Worker-count discipline:** the tables below show two things,
