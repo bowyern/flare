@@ -68,3 +68,8 @@ from .response_writer import (
     encode_response_headers,
     encode_response_trailers,
 )
+from .server import (
+    H3Connection,
+    H3ConnectionConfig,
+    H3StreamType,
+)
