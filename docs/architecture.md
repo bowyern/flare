@@ -112,15 +112,25 @@ flare.quic     Sans-I/O QUIC v1 codec primitives + pure state
                trait + the `OpenSslQuicCrypto` AEAD backend
                (AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305,
                header-protection masks per RFC 9001 §5.3 /
-               §5.4). `flare.quic.server` runs the UDP reactor:
+               §5.4); `flare.quic.protection` wraps the AEAD
+               backend in the per-level `unprotect_initial` /
+               `protect_initial` / `unprotect_handshake` /
+               `protect_handshake` / `unprotect_1rtt` /
+               `protect_1rtt` helpers per RFC 9001 §5.4.
+               `flare.quic.server` runs the live UDP reactor
+               loop per Phase E Track Q11-W:
                `QuicListener.run` binds, `recvmmsg` + `UDP_GRO`
                feed `ConnectionIdTable.lookup`, the per-datagram
                bytes flow through `OpenSslQuicCrypto.decrypt` ->
                `parse_frame_into[H]` -> `Connection.handle_frame`
-               -> `ConnectionEvents`; PTO + idle + ack-delay
-               timers sit on the shared `flare.runtime.TimerWheel`;
-               CC + pacing budget gate `sendmmsg` on the egress
-               path. ECN is echoed per RFC 9002 §A.4.
+               -> `ConnectionEvents`; each tick drains the
+               per-connection `tls_egress_queues` via
+               `_drain_and_send` + `_build_initial_response` ->
+               header-protection -> `send_to(peer)`; PTO + idle
+               + ack-delay timers sit on the shared
+               `flare.runtime.TimerWheel`; CC + pacing budget
+               gate `sendmmsg` on the egress path. ECN is
+               echoed per RFC 9002 §A.4.
 flare.h3       Sans-I/O HTTP/3 codec primitives: frame codec +
                SETTINGS payload (RFC 9114 §7); request-stream
                state machine (`H3RequestReader` + the
@@ -142,7 +152,16 @@ flare.h3       Sans-I/O HTTP/3 codec primitives: frame codec +
                and CONTROL + QPACK uni-stream type dispatch per
                RFC 9114 §6.2 (SETTINGS / GOAWAY / MAX_PUSH_ID
                consumed; QPACK dynamic-table inserts rejected
-               per the SETTINGS we advertise).
+               per the SETTINGS we advertise). Per Phase E
+               Track Q12-W the `H3Connection` is slot-allocated
+               on `QuicListener.h3_connections` per
+               `QuicConnection`; decrypted STREAM payloads route
+               through `QuicListener._route_h3_stream_chunks`
+               using the extended `ConnectionEvents.stream_chunks`,
+               and `HttpServer.serve_h3[H]` walks
+               `take_h3_completed_streams -> take_h3_request ->
+               handler.serve -> emit_h3_response ->
+               take_h3_response_egress` every reactor tick.
 flare.qpack    Sans-I/O static-only QPACK encoder + decoder
                (RFC 9204). Static table per Appendix A (99
                entries), literal field lines with literal

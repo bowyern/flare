@@ -222,10 +222,32 @@ own dispatch loop.
 End-to-end QUIC v1 (RFC 9000) + HTTP/3 (RFC 9114) server: the
 sans-I/O codecs, the pure state machines, the OpenSSL AEAD
 backend behind `QuicCrypto`, the rustls binding behind
-`RustlsQuicAcceptor`, the QUIC UDP reactor, the per-stream H3
-dispatch, and the ALPN router on top of `HttpServer.bind` are
-all wired. The same `Handler` instance reaches h1 + h2c + h2 +
-h3 simultaneously.
+`RustlsQuicAcceptor`, the QUIC UDP reactor (live
+`recv -> dispatch -> handle -> drain -> protect -> sendto`
+cycle per Phase E Track Q11-W), the per-stream H3 dispatch
+(`H3Connection` slab on `QuicListener` per Track Q12-W), the
+Handler-mounted serve loop (`HttpServer.bind_with_h3 +
+serve_h3[H]` per Track Q12-W), and the ALPN router on top of
+`HttpServer.bind` are all wired. The same `Handler` instance
+reaches h1 + h2c + h2 + h3 simultaneously.
+
+**Live wire status (Phase E, Jun 3, 2026).** The QUIC reactor
+I/O cycle is live and the Handler dispatch chain reaches the
+Handler on completed streams. The bench gate
+(`flare_h3 >= 72,571 req/s vs quiche`) did NOT close in Phase
+E because the rustls FFI wrapper at
+`flare/tls/ffi/rustls_wrapper/src/lib.rs:447` discards
+`Option<KeyChange>` returned by
+`rustls::quic::Connection::write_hs`; without per-level
+Handshake / 1-RTT keys flowing back to
+`QuicConnection.install_handshake_keys` /
+`install_1rtt_keys`, the Handshake + 1-RTT branches in
+`QuicConnection.handle_packet` silently drop their inbound
+datagrams (the Q10-W safety gate) and h2load observes 0
+req/s. The close-gap is a follow-up FFI cycle scoped in
+`.cursor/rules/design-0.8.mdc § Phase E deferred gate` and
+documented at every surface (`benchmark/baselines/flare_h3/main.mojo`
+module docstring; `docs/benchmark.md` HTTP/3 row).
 
 The codec layer is byte-clean and covered by `fuzz-quic-varint`,
 `fuzz-quic-long-header`, `fuzz-quic-frame-decode`,

@@ -4,34 +4,48 @@ Walks the production shape of an HTTP/3 server:
 
 * :meth:`flare.http.HttpServer.bind_with_h3` opens a TCP listener
   for h1 / h2c / h2 AND a QUIC UDP listener for h3 alongside.
+* :meth:`flare.http.HttpServer.serve_h3` runs the QUIC reactor
+  with H3 Handler dispatch as a single-threaded loop per Phase
+  E Track Q12-W: each iteration runs
+  :meth:`flare.quic.QuicListener.tick` to drain one inbound UDP
+  datagram + drive the QUIC + rustls state machines, then
+  :meth:`flare.http.HttpServer.pump_h3_handler_once` to dispatch
+  any completed H3 request streams through the handler, then
+  :meth:`flare.quic.QuicListener.advance_timers` so PTO + idle
+  + ack-delay callbacks fire on time.
 * The same :class:`flare.http.Handler` instance serves every
-  wire shape -- a single ``router.route("GET", "/hello", ...)``
-  call is reachable from a curl over h1, an h2-frame client,
-  and an h3 (QUIC) client.
+  wire shape -- a single ``serve(req)`` reaches a curl over
+  h1, an h2-frame client, and an h3 (QUIC) client.
 * :meth:`flare.http.HttpServer.advertised_alpn_protocols` is
   what the TLS handshake advertises (server preference order
   ``h3 > h2 > http/1.1``); the negotiated identifier feeds
   :meth:`flare.http.HttpServer.route_alpn` to pick the matching
   driver per connection.
-* :meth:`flare.http.HttpServer.tick_h3_once` lets the example
-  validate the bind path -- the QUIC listener exists, its
-  timer wheel advances, idle sweeps land -- without spinning
-  up a full UDP traffic generator.
 
-The TCP serve loop is the same path :class:`HttpServer.bind` +
-:meth:`HttpServer.serve` always ran; this example calls a
-single accept-and-respond cycle on the TCP side so the demo
-returns deterministically. The full h3 reactor wiring (drain
-UDP datagrams, dispatch through :class:`H3Connection`, encode
-+ send responses) is the v0.7 line item; today the example
-proves the bind + ALPN routing surface, the cross-driver
-handler share, and the listener lifecycle.
+Phase E live wire status: the QUIC reactor I/O cycle is live
+and Handler dispatch reaches the Handler on completed streams.
+The rustls FFI wrapper at
+``flare/tls/ffi/rustls_wrapper/src/lib.rs:447`` currently
+discards the ``Option<KeyChange>`` returned by
+``rustls::quic::Connection::write_hs``, so per-level Handshake
+/ 1-RTT keys never flow back to
+``QuicConnection.install_handshake_keys`` /
+``install_1rtt_keys`` and the post-Initial AEAD branches in
+``handle_packet`` silently drop inbound datagrams. Closing the
+gap is a follow-up FFI cycle scoped in
+``.cursor/rules/design-0.8.mdc § Phase E deferred gate``;
+until it lands, this example's ``serve_h3`` loop boots, binds,
+and decrypts the first Initial datagram from each peer, but
+does not yet sustain a full request-response round-trip over
+the wire. The shared-Handler dispatch is unit-tested
+end-to-end via ``tests/h3/test_h3_end_to_end.mojo``.
 
 Run:
     pixi run example-http3-server
 """
 
 from flare.h3 import H3Connection, H3ConnectionConfig
+from flare.http import Handler
 from flare.http.alpn_dispatch import (
     ALPN_HTTP_1_1,
     ALPN_HTTP_2,
@@ -49,7 +63,8 @@ from flare.quic import QuicServerConfig
 # ── The shared Handler ────────────────────────────────────────────────
 
 
-def handle(req: Request) raises -> Response:
+@fieldwise_init
+struct SharedHandler(Copyable, Handler, Movable):
     """One handler reachable from every wire (h1 / h2c / h2 / h3).
 
     The handler doesn't look at the wire shape -- it doesn't
@@ -58,10 +73,12 @@ def handle(req: Request) raises -> Response:
     do, and the protocol drivers serialize the :class:`Response`
     back out. That's the point of the trait boundary.
     """
-    if req.url == "/hello":
-        return ok("Hello from flare across every wire!")
-    var body = String("you reached ") + req.method + String(" ") + req.url
-    return ok(body^)
+
+    def serve(self, req: Request) raises -> Response:
+        if req.url == "/hello":
+            return ok("Hello from flare across every wire!")
+        var body = String("you reached ") + req.method + String(" ") + req.url
+        return ok(body^)
 
 
 # ── Walkthrough ───────────────────────────────────────────────────────
@@ -119,33 +136,33 @@ def main() raises:
     )
     print()
 
-    # Step 4: the QUIC listener is alive and its timer wheel
-    # advances. tick_h3_once() is the test-only entry that
-    # advances the wheel one step + sweeps the connection slab.
-    # The full reactor wiring (drain inbound datagrams ->
-    # H3Connection.feed_uni_stream_chunk /
-    # feed_stream_chunk -> dispatch -> emit_response ->
-    # drain outbound) lives in the v0.7 reactor commit.
-    print("[h3] tick the QUIC listener's timer wheel:")
-    var live = srv.tick_h3_once(UInt64(0))
-    print("    live connections after tick:", live)
-    print()
-
-    # Step 5: prove the same Handler the QUIC reactor will
-    # invoke is the one the TCP reactor invokes. Dispatch a
-    # synthetic Request through the handler directly -- this is
-    # what a real h3 reactor commit will do once it has
-    # decoded the QUIC stream bytes.
+    # Step 4: prove the shared Handler dispatch surface. The
+    # same Handler the QUIC reactor invokes via ``serve_h3``
+    # is the one a TCP reactor invokes via ``serve``. Dispatch
+    # a synthetic Request through the handler directly so the
+    # demo returns deterministically (running the actual
+    # serve_h3 loop would block until SIGINT).
     print("[demo] dispatch a synthetic request through the shared Handler:")
+    var handler = SharedHandler()
     var req = Request(
         method=String("GET"), url=String("/hello"), body=List[UInt8]()
     )
-    var resp = handle(req^)
+    var resp = handler.serve(req^)
     print("    response status:", resp.status)
     print(
         "    response body:",
         String(unsafe_from_utf8=Span[UInt8, _](resp.body)),
     )
+    print()
+
+    # Step 5: pump_h3_handler_once is the per-tick H3 dispatch
+    # surface ``serve_h3`` drives. With no live UDP traffic in
+    # this demo the listener has no completed streams to drain,
+    # so the count is 0 -- but the call exercises the dispatch
+    # path so a reader can see the shape.
+    print("[h3] one-shot Handler pump on the live QUIC listener:")
+    var dispatched = srv.pump_h3_handler_once[SharedHandler](handler)
+    print("    streams dispatched this pass:", dispatched)
     print()
 
     # Step 6: H3Connection is what the QUIC reactor will hand
@@ -156,5 +173,16 @@ def main() raises:
     var initial_settings = h3.emit_initial_settings()
     print("[h3] initial server SETTINGS emit length =", len(initial_settings))
     print()
+
+    # The full live-traffic loop would replace the lines above
+    # with::
+    #
+    #     srv.serve_h3[SharedHandler](handler^)
+    #
+    # which blocks driving the QUIC reactor + H3 Handler
+    # dispatch until ``QuicListener.shutdown`` flips the stop
+    # flag. The Phase E deferred gate (rustls KeyChange FFI
+    # bridge) is what's still pending before that loop sustains
+    # a full request-response round-trip end-to-end.
 
     print("== done ==")

@@ -738,6 +738,73 @@ codec, AEAD, rustls binding, state machine, and H3 dispatch
 all wired; the open-loop reactor that pulls them together into
 a live handshake is the v0.7 commit-1 candidate).
 
+##### Phase E refresh attestation (Jun 3, 2026, post Track Q14-W)
+
+Phase E (Tracks Q9-W ... Q14-W, 6 atomic commits on top of
+`65b3282`) joined the close-wire-paths primitives into a live
+QUIC reactor + H3 dispatch loop: handshake bridge (Q9-W),
+post-Initial AEAD + `handle_packet` dispatch (Q10-W), UDP
+egress + full I/O cycle (Q11-W), H3 attach + Handler dispatch
+(Q12-W), bench baseline rewritten through `serve_h3` (Q13-W),
+docs sweep (Q14-W, this section).
+
+h1 / h2 floor reverify at the Phase E HEAD
+(`pixi run -e bench bench-vs-baseline-quick` on the same EPYC
+7R32 dev-box, 5x30s plaintext runs):
+
+| Workload | Server | Workers | Median req/s | p99 (ms) | sigma% |
+|---|---|---:|---:|---:|---:|
+| `throughput` | flare | 1 | 75,294 | 3.17 | 1.57 |
+| `throughput` | go_nethttp (GOMAXPROCS=1) | 1 | 39,232 | 3.22 | 0.00 |
+
+vs the Best-perf refresh row just above (76,287 req/s p99 3.18
+ms at HEAD `65b3282`): 75,294 is inside the cross-day spread
+(both above the 71,444 refresh floor; p99 3.17 ms below the
+3.33 ms floor). Q9-W ... Q12-W added QUIC + H3 surfaces that
+sit on their own sub-tree, so the TCP hot path's floors are
+preserved by construction. HOLD.
+
+The bench-h3 cross-framework gate `flare_h3 >= 72,571 req/s`
+(quiche reading at HEAD `65b3282`) did NOT close in Phase E.
+The QUIC reactor I/O loop is live and the Handler dispatch
+chain reaches the Handler; the open gap is the rustls FFI
+wrapper at `flare/tls/ffi/rustls_wrapper/src/lib.rs:447`
+discarding `Option<KeyChange>` so per-level Handshake / 1-RTT
+keys never reach the AEAD layer. h2load drives the boot-up +
+bind + Initial-decrypt path (5 datagrams sent, 0 received).
+The deferred-gate close is scoped in
+`design-0.8.mdc § Phase E deferred gate` and
+`critisize-0.8.mdc § 11.13`; once the FFI bridge lands,
+`pixi run -e bench bench-h3 all` re-runs the cross-framework
+table and this section gains a `flare_h3` row alongside the
+existing `quiche` + `quinn` rows above.
+
+Phase E sanitizer + fuzz + lint floors (each gate ran at its
+introducing commit; the close-wire-paths floors carry forward
+intact, no new breakage):
+
+- `pixi run tests` aggregate -- green per-commit at Q9-W ...
+  Q13-W; the new test files (`test_quic_handshake_bridge.mojo`,
+  RFC 9001 Appendix A.4 + A.5 vectors,
+  `test_quic_loopback_integration.mojo` egress cases,
+  `test_h3_end_to_end.mojo`) are all in the `tests` aggregate.
+- `pixi run fuzz-quic-initial-handshake` -- 200K runs green at
+  Q9-W introduction.
+- `pixi run fuzz-quic-packet-decrypt` -- 200K runs green at
+  Q10-W over Initial + Handshake + 1-RTT branches.
+- `pixi run fuzz-h3-server` -- 200K runs green at Q12-W
+  including the QuicListener dispatch branch.
+- `pixi run test-safety-asserts` -- green at each commit.
+- `pixi run check-sans-io` + `pixi run check-no-http-http2-cycle`
+  + `pixi run check-reactor-size` -- clean at each commit.
+
+The full sanitizer trio (`pixi run tests-asan` /
+`pixi run tests-tsan`) re-runs once the Phase F (rustls
+KeyChange FFI bridge) lands -- the Q11-W reverify confirmed
+the existing 2 pre-existing ASan failures + the pre-existing
+TSan linker errors carry from close-wire-paths without new
+regressions on the touched surfaces.
+
 #### Listener-mode A/B (flare-only)
 
 flare exposes both listener strategies so the operator can
@@ -1294,9 +1361,27 @@ Infrastructure for the cross-framework bench:
 - ``pixi run --environment bench bench-h3 {flare,quinn,quiche,all}``
   -- task entry points.
 
-**Status: bench infrastructure + h2load+H3 client complete;
-quiche + quinn baselines run cleanly, flare_h3 awaits the
-live QUIC reactor I/O loop (v0.7 follow-up).** Stock Ubuntu's
+**Status: Phase E (Tracks Q9-W ... Q14-W, Jun 3, 2026) joined
+the close-wire-paths primitives into a live QUIC reactor + H3
+dispatch loop. The bench baseline now drives through
+`HttpServer.bind_with_h3 + serve_h3(handler)`; the reactor's
+`recv -> dispatch -> handle -> drain -> protect -> sendto`
+cycle is live and the Handler dispatch chain reaches the
+Handler on completed streams. The cross-framework gate
+(`flare_h3 median req/s >= 72,571 req/s sigma <= 8 %`) did
+NOT close in Phase E -- the rustls FFI wrapper discards
+`Option<KeyChange>` (the `let _maybe_keys = ...` site at
+`flare/tls/ffi/rustls_wrapper/src/lib.rs:447`), so per-level
+Handshake / 1-RTT keys never flow back to
+`QuicConnection.install_handshake_keys` /
+`install_1rtt_keys`; the Handshake + 1-RTT branches in
+`handle_packet` silently drop inbound datagrams and h2load
+observes 0 req/s. The deferred-gate close is a separate FFI
+extension (Rust wrapper + Mojo bindings + key install path +
+1-RTT short-header egress), scoped in `design-0.8.mdc § Phase
+E deferred gate` and `critisize-0.8.mdc § 11.13`. Until that
+follow-up commit lands, the table below reads `0 req/s` for
+`flare h3` with the gap explicitly named.** Stock Ubuntu's
 ``nghttp2-client`` (1.43) predates h3 support; conda-forge's
 nghttp2 (1.68) ships without ``h2load``. The h2load binary
 used for the numbers below was built from source on the EPYC
@@ -1342,7 +1427,7 @@ reading at HEAD ``65b3282`` (source data:
 |---|---:|---:|---:|---:|---|
 | quiche 0.22 (boringssl-vendored) | 72,571 | (per-stream) | (per-stream) | (per-stream) | clean: 0 errors / 0 timeouts across 5 runs, sigma ~1% |
 | quinn 0.11 + h3 0.0.8        | 654    | 4.17     | 4.75       | 5.48        | open-loop 100-stream shape errors 98% (1.2M errored of 1.2M total) -- this is workload-shape calibration, not a quinn ceiling (the 10s warmup with the same client sustained 104k req/s at 0 errors) |
-| flare h3                     | 0      | --       | --         | --          | server binds + ALPN-negotiates h3 but no live datagrams round-trip yet; the codec + AEAD + rustls binding + state machine + H3 dispatch are wired and unit/fuzz/conformance-tested; the open-loop UDP reactor that walks recvmmsg -> ConnectionIdTable -> handle_frame -> sendmmsg is the one wire path that's still pending (v0.7 commit-1 candidate) |
+| flare h3                     | 0      | --       | --         | --          | Phase E (Q9-W ... Q14-W) joined the close-wire-paths primitives into a live QUIC reactor: `recv -> dispatch -> handle -> drain -> protect -> sendto -> advance_timers` runs every tick; Handshake + 1-RTT AEAD wired; H3 dispatch chain reaches the Handler on completed streams; bench baseline drives through `HttpServer.serve_h3`. Open gap is the rustls KeyChange -> per-level traffic secret bridge (rustls FFI wrapper at `flare/tls/ffi/rustls_wrapper/src/lib.rs:447` discards `Option<KeyChange>`); without it, Handshake + 1-RTT inbound datagrams drop silently and h2load sees 0 req/s. Closing the gap is the Phase F follow-up FFI cycle scoped in `design-0.8.mdc § Phase E deferred gate`. |
 
 Reading order:
 
@@ -1356,13 +1441,19 @@ Reading order:
   exposed the per-conn limit; the calibration knob lives in
   ``benchmark/configs/h3_throughput.yaml`` (``h2load_streams``
   + ``h2load_duration_seconds``).
-- **flare h3** at 0 req/s names exactly what's still in flight:
-  the reactor I/O loop on the QUIC server. The infrastructure
-  in front of it (h2load+H3 binary on PATH, baseline-build
-  scripts, ALPN-correct flare_h3 binary, harness gating) is
-  complete and the bench is repeatable today.
+- **flare h3** at 0 req/s names exactly what's still in flight
+  after Phase E: the rustls KeyChange -> per-level traffic
+  secret bridge. The QUIC reactor I/O loop runs every tick,
+  the Handler dispatch chain reaches the Handler on completed
+  streams, and the bench baseline drives through
+  `HttpServer.serve_h3` -- but the per-Handshake / per-1-RTT
+  AEAD secrets that protect the inbound + outbound post-Initial
+  datagrams never reach the AEAD layer because rustls's FFI
+  wrapper discards them (`flare/tls/ffi/rustls_wrapper/src/lib.rs:447`).
+  Closing the gap is the Phase F follow-up FFI cycle scoped in
+  `design-0.8.mdc § Phase E deferred gate`.
 
-When the QUIC reactor I/O loop lands, ``pixi run -e bench bench-h3 all``
+When the FFI bridge lands, ``pixi run -e bench bench-h3 all``
 re-runs this table without further script edits; the floor-hold
 row in "Best-perf refresh at HEAD" gains a matching HTTP/3 entry
 at that point.
