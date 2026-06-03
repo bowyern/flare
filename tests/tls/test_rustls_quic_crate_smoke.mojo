@@ -66,10 +66,19 @@ def _call_acceptor_new(
 
 
 def test_abi_version() raises:
+    # ABI v2 is the Phase F surface: the original
+    # acceptor/session/feed-crypto/take-crypto/ALPN thunks plus
+    # the new KeyChange-driven per-level AEAD + header-protection
+    # thunks (`flare_rustls_quic_have_keys`,
+    # `flare_rustls_quic_packet_{encrypt,decrypt}`,
+    # `flare_rustls_quic_header_{encrypt,decrypt}`). The
+    # activation script keys off this number, so a stale .so on
+    # a developer machine surfaces as a hard mismatch on
+    # `pixi install` rather than a silent run-time confusion.
     var path = _find_rustls_lib()
     var lib = OwnedDLHandle(path)
     var v = _call_abi_version(lib)
-    assert_equal(v, 1)
+    assert_equal(v, 2)
 
 
 def test_acceptor_new_rejects_empty_pem() raises:
