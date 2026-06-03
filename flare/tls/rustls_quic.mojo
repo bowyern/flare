@@ -57,6 +57,11 @@ from ._rustls_quic_ffi import (
     _do_take_crypto,
     _do_is_handshake_complete,
     _do_alpn,
+    _do_have_keys,
+    _do_packet_encrypt,
+    _do_packet_decrypt,
+    _do_header_encrypt,
+    _do_header_decrypt,
     _do_last_error,
     _find_rustls_quic_lib,
     _encode_alpn_wire,
@@ -513,3 +518,134 @@ struct RustlsQuicSession(Movable):
         confirming the level machine compiles even before the
         Rust crate lands."""
         return self._level
+
+    # ── Per-level AEAD + header protection (Phase F commit 2/6) ────────
+
+    def have_keys(self, level: Int) -> Bool:
+        """Whether rustls has installed per-level keys at the
+        given encryption level (2 = Handshake, 3 = 1-RTT).
+
+        Initial-level keys never flow through rustls's
+        ``KeyChange`` (they derive from the connection ID per
+        RFC 9001 §5.2 and the flare side runs Initial AEAD
+        through :class:`flare.quic.crypto.OpenSslQuicCrypto`),
+        so this returns False for level 0. The reactor polls
+        :meth:`have_keys` after every :meth:`take_crypto` pump to
+        learn when to install Handshake / 1-RTT keys onto the
+        owning :class:`flare.quic.server.QuicConnection`.
+
+        NULL session handles (the test-only constructor path)
+        return False without raising.
+        """
+        if self._opaque_session_handle == 0:
+            return False
+        return _do_have_keys(self._lib, self._opaque_session_handle, level) == 1
+
+    def packet_encrypt(
+        self,
+        level: Int,
+        packet_number: UInt64,
+        header: List[UInt8],
+        mut payload: List[UInt8],
+    ) raises -> List[UInt8]:
+        """Encrypt ``payload`` in place at ``level`` via rustls's
+        ``Keys.local.packet.encrypt_in_place`` (RFC 9001 §5.3).
+
+        ``header`` is the QUIC packet header (used as AEAD AAD);
+        the returned tag is the 16-byte authentication tag the
+        caller appends to the on-wire packet. Raises if the FFI
+        rejects (e.g. keys not yet installed at ``level``); the
+        rustls error text is in :func:`_do_last_error`.
+        """
+        if self._opaque_session_handle == 0:
+            raise Error("RustlsQuicSession.packet_encrypt: NULL session handle")
+        return _do_packet_encrypt(
+            self._lib,
+            self._opaque_session_handle,
+            level,
+            packet_number,
+            header,
+            payload,
+        )
+
+    def packet_decrypt(
+        self,
+        level: Int,
+        packet_number: UInt64,
+        header: List[UInt8],
+        mut payload: List[UInt8],
+    ) raises -> Int:
+        """Verify + strip the AEAD tag from ``payload`` in place
+        at ``level`` via rustls's
+        ``Keys.remote.packet.decrypt_in_place`` (RFC 9001 §5.3).
+
+        Returns the plaintext length (always ``len(payload) - 16``
+        for the AEAD-GCM / ChaCha20-Poly1305 suites rustls speaks);
+        raises if rustls rejects the tag (the typical wrong-keys-
+        at-this-level symptom -- the Phase E QUIC safety gate).
+        """
+        if self._opaque_session_handle == 0:
+            raise Error("RustlsQuicSession.packet_decrypt: NULL session handle")
+        return _do_packet_decrypt(
+            self._lib,
+            self._opaque_session_handle,
+            level,
+            packet_number,
+            header,
+            payload,
+        )
+
+    def header_encrypt(
+        self,
+        level: Int,
+        sample: List[UInt8],
+        first_byte_addr: Int,
+        pn_addr: Int,
+        pn_len: Int,
+    ) raises:
+        """Apply QUIC header protection (RFC 9001 §5.4) to the
+        packet's first byte + packet-number bytes via rustls's
+        ``Keys.local.header.encrypt_in_place``.
+
+        ``sample`` MUST be a 16-byte slice of the encrypted
+        payload (4 bytes past the start of the packet-number
+        field). ``first_byte_addr`` / ``pn_addr`` are raw pointer
+        values (as Int) so the caller can keep the byte cells on
+        the stack and let rustls write through.
+        """
+        if self._opaque_session_handle == 0:
+            raise Error("RustlsQuicSession.header_encrypt: NULL session handle")
+        _do_header_encrypt(
+            self._lib,
+            self._opaque_session_handle,
+            level,
+            sample,
+            first_byte_addr,
+            pn_addr,
+            pn_len,
+        )
+
+    def header_decrypt(
+        self,
+        level: Int,
+        sample: List[UInt8],
+        first_byte_addr: Int,
+        pn_addr: Int,
+        pn_len: Int,
+    ) raises:
+        """Remove QUIC header protection (RFC 9001 §5.4) from
+        the packet's first byte + packet-number bytes via
+        rustls's ``Keys.remote.header.decrypt_in_place``. Same
+        sample contract as :meth:`header_encrypt`.
+        """
+        if self._opaque_session_handle == 0:
+            raise Error("RustlsQuicSession.header_decrypt: NULL session handle")
+        _do_header_decrypt(
+            self._lib,
+            self._opaque_session_handle,
+            level,
+            sample,
+            first_byte_addr,
+            pn_addr,
+            pn_len,
+        )

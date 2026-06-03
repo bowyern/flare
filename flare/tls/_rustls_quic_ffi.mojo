@@ -257,6 +257,205 @@ def _do_alpn(read lib: OwnedDLHandle, session: Int) raises -> String:
     return String(unsafe_from_utf8=Span[UInt8, _](buf[:written]))
 
 
+# ── Per-level AEAD + header protection (Phase F commit 2/6) ────────────────
+
+
+def _do_have_keys(read lib: OwnedDLHandle, session: Int, level: Int) -> Int:
+    """``flare_rustls_quic_have_keys``: 1 if rustls has installed
+    keys at ``level``, 0 otherwise, -1 on bad pointer / level out
+    of range.
+
+    Phase F: the QuicListener reactor calls this after every
+    take_crypto pump to learn whether the Handshake (2) or 1-RTT
+    (3) `Keys` slot has flipped from None to Some(_). Once
+    installed, the matching packet/header thunks below dispatch
+    AEAD + HP through rustls's already-derived `Keys` instead of
+    re-deriving them from a traffic secret on the flare side
+    (rustls's `quic::Secrets` is `pub(crate)`-sealed).
+    """
+    if session == 0:
+        return -1
+    var f = lib.get_function[def(Int, c_int) thin abi("C") -> c_int](
+        "flare_rustls_quic_have_keys"
+    )
+    return Int(f(session, c_int(level)))
+
+
+def _do_packet_encrypt(
+    read lib: OwnedDLHandle,
+    session: Int,
+    level: Int,
+    packet_number: UInt64,
+    read header: List[UInt8],
+    mut payload: List[UInt8],
+) raises -> List[UInt8]:
+    """``flare_rustls_quic_packet_encrypt``: encrypt ``payload``
+    in place at the given encryption level and return the
+    16-byte authentication tag.
+
+    ``header`` is the QUIC packet header (used as AEAD AAD per
+    RFC 9001 §5.3). ``payload`` is mutated in place; the caller
+    appends the returned tag to the on-wire packet.
+
+    Raises if the FFI returns a non-zero code: rustls error
+    text is in :func:`_do_last_error`.
+    """
+    var f = lib.get_function[
+        def(
+            Int, c_int, UInt64, Int, Int, Int, Int, Int, Int, Int
+        ) thin abi("C") -> c_int
+    ]("flare_rustls_quic_packet_encrypt")
+    var tag = List[UInt8](capacity=16)
+    for _ in range(16):
+        tag.append(UInt8(0))
+    var written: Int = 0
+    var written_addr = Int(UnsafePointer(to=written))
+    var rc = Int(
+        f(
+            session,
+            c_int(level),
+            packet_number,
+            Int(header.unsafe_ptr()),
+            len(header),
+            Int(payload.unsafe_ptr()),
+            len(payload),
+            Int(tag.unsafe_ptr()),
+            len(tag),
+            written_addr,
+        )
+    )
+    if rc != 0:
+        raise Error(
+            String("flare_rustls_quic_packet_encrypt returned ") + String(rc)
+        )
+    # Truncate the tag to the actual length the FFI wrote (rustls
+    # always emits a 16-byte tag for the suites we speak, but the
+    # FFI surface reports the length so the binding doesn't have
+    # to hard-code the assumption).
+    if written < len(tag):
+        var resized = List[UInt8]()
+        for i in range(written):
+            resized.append(tag[i])
+        return resized^
+    return tag^
+
+
+def _do_packet_decrypt(
+    read lib: OwnedDLHandle,
+    session: Int,
+    level: Int,
+    packet_number: UInt64,
+    read header: List[UInt8],
+    mut payload: List[UInt8],
+) raises -> Int:
+    """``flare_rustls_quic_packet_decrypt``: verify + strip the
+    AEAD tag from ``payload`` in place at the given encryption
+    level. Returns the plaintext length (always
+    ``len(payload) - 16`` for AEAD-GCM / ChaCha20-Poly1305).
+
+    Raises if rustls rejects the tag (the typical "wrong keys at
+    this level" symptom -- the Phase E QUIC safety gate).
+    """
+    var f = lib.get_function[
+        def(Int, c_int, UInt64, Int, Int, Int, Int, Int) thin abi("C") -> c_int
+    ]("flare_rustls_quic_packet_decrypt")
+    var plaintext_len: Int = 0
+    var addr = Int(UnsafePointer(to=plaintext_len))
+    var rc = Int(
+        f(
+            session,
+            c_int(level),
+            packet_number,
+            Int(header.unsafe_ptr()),
+            len(header),
+            Int(payload.unsafe_ptr()),
+            len(payload),
+            addr,
+        )
+    )
+    if rc != 0:
+        raise Error(
+            String("flare_rustls_quic_packet_decrypt returned ") + String(rc)
+        )
+    return plaintext_len
+
+
+def _do_header_encrypt(
+    read lib: OwnedDLHandle,
+    session: Int,
+    level: Int,
+    read sample: List[UInt8],
+    first_byte_addr: Int,
+    pn_addr: Int,
+    pn_len: Int,
+) raises:
+    """``flare_rustls_quic_header_encrypt``: apply QUIC header
+    protection (RFC 9001 §5.4) to the packet's first byte +
+    packet-number bytes using rustls's
+    ``Keys.local.header.encrypt_in_place``.
+
+    ``sample`` MUST be 16 bytes from the encrypted payload (the
+    region starting 4 bytes after the start of the packet-number
+    field, regardless of declared pn length -- rustls samples
+    exactly 16 bytes for the cipher suites we speak).
+    ``first_byte_addr`` / ``pn_addr`` are raw pointer values (as
+    Int) so the caller can keep the byte cells on the stack and
+    let rustls write through.
+    """
+    var f = lib.get_function[
+        def(Int, c_int, Int, Int, Int, Int, Int) thin abi("C") -> c_int
+    ]("flare_rustls_quic_header_encrypt")
+    var rc = Int(
+        f(
+            session,
+            c_int(level),
+            Int(sample.unsafe_ptr()),
+            len(sample),
+            first_byte_addr,
+            pn_addr,
+            pn_len,
+        )
+    )
+    if rc != 0:
+        raise Error(
+            String("flare_rustls_quic_header_encrypt returned ") + String(rc)
+        )
+
+
+def _do_header_decrypt(
+    read lib: OwnedDLHandle,
+    session: Int,
+    level: Int,
+    read sample: List[UInt8],
+    first_byte_addr: Int,
+    pn_addr: Int,
+    pn_len: Int,
+) raises:
+    """``flare_rustls_quic_header_decrypt``: remove QUIC header
+    protection from the packet's first byte + packet-number
+    bytes using rustls's ``Keys.remote.header.decrypt_in_place``.
+    Same sample contract as :func:`_do_header_encrypt`.
+    """
+    var f = lib.get_function[
+        def(Int, c_int, Int, Int, Int, Int, Int) thin abi("C") -> c_int
+    ]("flare_rustls_quic_header_decrypt")
+    var rc = Int(
+        f(
+            session,
+            c_int(level),
+            Int(sample.unsafe_ptr()),
+            len(sample),
+            first_byte_addr,
+            pn_addr,
+            pn_len,
+        )
+    )
+    if rc != 0:
+        raise Error(
+            String("flare_rustls_quic_header_decrypt returned ") + String(rc)
+        )
+
+
 def _do_last_error(read lib: OwnedDLHandle) -> String:
     """Read the thread-local last-error message set by the
     rustls FFI. Returns an empty string when no message is
