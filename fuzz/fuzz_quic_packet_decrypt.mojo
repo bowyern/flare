@@ -45,6 +45,14 @@ from flare.quic.protection import (
     unprotect_handshake_packet,
 )
 
+# Phase F commit 4/6 -- the egress builders that now route
+# Handshake + 1-RTT through rustls AEAD share their inbound
+# level-derivation helper with the dispatch pump; the helper
+# must never panic on arbitrary first bytes, since it's the
+# very first thing the reactor calls per datagram.
+from flare.quic.server import _inbound_level_for_datagram
+from flare.tls import QuicEncryptionLevel
+
 
 def _bytes(s: StringLiteral) -> List[UInt8]:
     var b = s.as_bytes()
@@ -173,6 +181,24 @@ def target(data: List[UInt8]) raises:
         )
     except _:
         pass
+
+    # Phase F commit 4/6 -- exercise the inbound level
+    # classifier over the same fuzz datagram.  Property: the
+    # classifier MUST return one of the four valid QUIC
+    # encryption-level codepoints, and MUST NOT panic on any
+    # first-byte combination (including the long-header bit
+    # flipped with otherwise garbage type bits).
+    var lvl = _inbound_level_for_datagram(Span[UInt8, _](data))
+    if (
+        lvl != QuicEncryptionLevel.INITIAL
+        and lvl != QuicEncryptionLevel.EARLY_DATA
+        and lvl != QuicEncryptionLevel.HANDSHAKE
+        and lvl != QuicEncryptionLevel.APPLICATION
+    ):
+        raise Error(
+            "fuzz: _inbound_level_for_datagram returned out-of-range level "
+            + String(lvl)
+        )
 
 
 def main() raises:

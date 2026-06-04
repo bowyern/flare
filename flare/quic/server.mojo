@@ -73,6 +73,7 @@ from .packet import (
     MAX_CID_LENGTH,
     PACKET_TYPE_INITIAL,
     QUIC_VERSION_1,
+    PACKET_TYPE_HANDSHAKE,
     encode_long_header,
     parse_long_header,
     parse_short_header,
@@ -113,10 +114,13 @@ from ..tls._rustls_quic_ffi import (
     _do_accept,
     _do_feed_crypto,
     _do_have_keys,
+    _do_header_encrypt,
     _do_is_handshake_complete,
+    _do_packet_encrypt,
     _do_session_free,
     _do_take_crypto,
 )
+from .packet import encode_short_header
 
 
 def _inbound_level_for_datagram(datagram: Span[UInt8, _]) -> Int:
@@ -1539,67 +1543,150 @@ struct QuicListener(Movable):
         return emitted
 
     def _drain_and_send(mut self, slot: Int) raises -> Bool:
-        """Drain ``tls_egress_queues[slot]`` into a single
-        server-side Initial datagram and emit it.
+        """Drain every pending egress queue for ``slot`` onto
+        the wire.
 
-        Returns ``True`` if a datagram was actually sent.
-        Returns ``False`` (no-op) when:
+        Returns ``True`` if at least one datagram was emitted.
+        Per-level queues drained (each is independent and any
+        subset can be non-empty at a given tick):
 
-        * The slot is out of range.
-        * The egress queue is empty (nothing to flush).
-        * The connection is no longer ``alive`` (closed slots
-          stop sending).
+        * ``tls_egress_queues[slot]`` -- Initial-level CRYPTO
+          (rustls ServerHello + EncryptedExtensions before the
+          KeyChange::Handshake fires).
+          Encrypted via flare's :func:`protect_initial_packet`
+          (DCID-derived OpenSSL secret per RFC 9001 §5.2).
+        * ``tls_handshake_egress_queues[slot]`` -- Handshake-
+          level CRYPTO (rustls Certificate + CertificateVerify
+          + Finished, between KeyChange::Handshake and
+          KeyChange::OneRtt).
+          Encrypted via :meth:`_build_handshake_response`
+          which routes through rustls's
+          ``Keys.local.packet.encrypt_in_place`` (Phase F
+          commit 4/6).
+        * ``tls_1rtt_egress_queues[slot]`` -- 1-RTT CRYPTO
+          (rustls post-handshake messages like
+          NewSessionTicket).
+          Encrypted via :meth:`_build_1rtt_handshake_crypto`.
+        * ``h3_response_egress`` -- 1-RTT STREAM frames carrying
+          H3 response bytes (the live H3 reactor's actual
+          payload). Encrypted via
+          :meth:`_build_1rtt_h3_stream`.
 
-        The path is:
-
-        1. Build a QUIC CRYPTO frame (``offset =
-           tx_initial_offset``) wrapping the queued TLS bytes
-           per RFC 9000 §19.6.
-        2. Build the Initial-level long-header prefix --
-           ``encode_long_header`` (DCID = peer's SCID, SCID =
-           server's local CID, type-specific bits encode
-           pn_length-1) + zero-length token varint + payload-
-           length varint.
-        3. ``protect_initial_packet`` -- AEAD-seal the CRYPTO
-           frame with the unprotected header as AAD and the
-           server-side Initial secret derived from the
-           connection's ``local_cid`` (RFC 9001 §5.2).
-        4. ``send_to(peer_addr)`` -- single-datagram emit per
-           Q11-W; recvmmsg + sendmmsg batching is the Q13-W
-           perf-pass follow-up.
-        5. Advance ``tx_initial_offset`` by the CRYPTO frame
-           length and ``tx_initial_pn`` by one so the next
-           drain produces a fresh pn + offset pair.
+        Each builder is a no-op (returns empty) when its
+        respective queue is empty OR the matching per-level
+        readiness sentinel hasn't been installed yet by the
+        :meth:`_dispatch_crypto_frames` pump.  Slots whose
+        connection is closed (`alive == False`) skip every
+        level entirely.
 
         Errors during build/protect short-circuit to ``False``
         without raising; the silent-drop discipline mirrors the
-        inbound side (RFC 9001 §5.2). Once the Handshake +
-        1-RTT branches are wired (Q11-W follow-up commit), this
-        method will switch encryption level based on the slot's
-        rustls KeyChange state.
+        inbound side (RFC 9001 §5.2).
         """
         if slot < 0 or slot >= len(self.connections):
             return False
-        if slot >= len(self.tls_egress_queues):
-            return False
         if slot >= len(self.peer_addrs):
-            return False
-        if len(self.tls_egress_queues[slot]) == 0:
             return False
         if not self.connections[slot].alive:
             return False
-        var datagram = self._build_initial_response(slot)
-        if len(datagram) == 0:
-            return False
+        var emitted = False
         var peer = self.peer_addrs[slot]
-        _ = self.send_to(Span[UInt8, _](datagram), peer)
-        # Successful emit -- clear the queue. Retransmission is
-        # the rustls session's responsibility (RFC 9001 §5.3 +
-        # rustls QUIC API: rustls only emits each chunk once and
-        # relies on the QUIC layer to retransmit; that's a Q11-W
-        # follow-up commit, gated on PTO timer wiring).
-        self.tls_egress_queues[slot] = List[UInt8]()
-        return True
+        # Initial-level (legacy OpenSSL path).
+        if (
+            slot < len(self.tls_egress_queues)
+            and len(self.tls_egress_queues[slot]) > 0
+        ):
+            var initial_dg = self._build_initial_response(slot)
+            if len(initial_dg) > 0:
+                _ = self.send_to(Span[UInt8, _](initial_dg), peer)
+                self.tls_egress_queues[slot] = List[UInt8]()
+                emitted = True
+        # Handshake-level (rustls path; gated on the readiness
+        # sentinel via _build_handshake_response).
+        if (
+            slot < len(self.tls_handshake_egress_queues)
+            and len(self.tls_handshake_egress_queues[slot]) > 0
+        ):
+            var hs_dg = self._build_handshake_response(slot)
+            if len(hs_dg) > 0:
+                _ = self.send_to(Span[UInt8, _](hs_dg), peer)
+                self.tls_handshake_egress_queues[slot] = List[UInt8]()
+                emitted = True
+        # 1-RTT-level CRYPTO (rustls post-handshake; gated on
+        # the 1-RTT readiness sentinel).
+        if (
+            slot < len(self.tls_1rtt_egress_queues)
+            and len(self.tls_1rtt_egress_queues[slot]) > 0
+        ):
+            var rtt_dg = self._build_1rtt_handshake_crypto(slot)
+            if len(rtt_dg) > 0:
+                _ = self.send_to(Span[UInt8, _](rtt_dg), peer)
+                self.tls_1rtt_egress_queues[slot] = List[UInt8]()
+                emitted = True
+        # H3 response STREAM frames at 1-RTT (the user-visible
+        # response path).  Drain each pending (slot, stream_id)
+        # entry, wrap in a STREAM frame, encode into a 1-RTT
+        # packet via rustls AEAD, send_to.
+        if self._drain_h3_response_egress(slot, peer):
+            emitted = True
+        return emitted
+
+    def _drain_h3_response_egress(
+        mut self, slot: Int, peer: SocketAddr
+    ) raises -> Bool:
+        """Drain every ``(slot, stream_id)`` entry in
+        :attr:`h3_response_egress` matching ``slot`` and emit
+        one 1-RTT short-header packet per stream.
+
+        Returns True iff at least one packet was sent.
+
+        Each stream's bytes are wrapped in a STREAM frame
+        (RFC 9000 §19.8) via :meth:`_build_1rtt_h3_stream`,
+        protected at 1-RTT via the slot's rustls session, and
+        emitted with ``fin=True`` because the H3 driver's
+        ``take_response_frames`` finalizes the response when
+        the handler returns (we don't chunk responses across
+        packets in this commit -- v0.9's flow-controlled
+        chunker lands in a follow-up).
+        """
+        var slot_prefix = String(slot) + ":"
+        var emitted = False
+        var keys_to_drain = List[String]()
+        for entry in self.h3_response_egress.items():
+            var k = entry.key
+            if k.startswith(slot_prefix):
+                keys_to_drain.append(k)
+        for i in range(len(keys_to_drain)):
+            var k = keys_to_drain[i]
+            var bytes = self.h3_response_egress[k].copy()
+            if len(bytes) == 0:
+                continue
+            # Parse the stream_id back out of the key (format
+            # is "<slot>:<stream_id>", ascii only, so byte-
+            # level iteration is safe).
+            var key_bytes = k.as_bytes()
+            var sid: UInt64 = UInt64(0)
+            var found_colon = False
+            var any_digit = False
+            for j in range(len(key_bytes)):
+                var b = Int(key_bytes[j])
+                if not found_colon:
+                    if b == 0x3A:  # ':'
+                        found_colon = True
+                    continue
+                if b < 0x30 or b > 0x39:
+                    continue
+                sid = sid * UInt64(10) + UInt64(b - 0x30)
+                any_digit = True
+            if not found_colon or not any_digit:
+                continue
+            var dg = self._build_1rtt_h3_stream(slot, sid, bytes^, fin=True)
+            if len(dg) == 0:
+                continue
+            _ = self.send_to(Span[UInt8, _](dg), peer)
+            _ = self.h3_response_egress.pop(k)
+            emitted = True
+        return emitted
 
     def _build_initial_response(
         mut self, slot: Int, pn_length: Int = 2
@@ -1668,6 +1755,348 @@ struct QuicListener(Movable):
         conn.tx_initial_offset = conn.tx_initial_offset + UInt64(len(qbytes))
         self.connections[slot] = conn^
         return datagram^
+
+    # -- Phase F commit 4/6 -- Handshake + 1-RTT egress via rustls ----------
+
+    def _build_handshake_response(
+        mut self, slot: Int, pn_length: Int = 2
+    ) raises -> List[UInt8]:
+        """Wrap the slot's pending Handshake-level CRYPTO bytes
+        into a long-header Handshake packet, AEAD-protected via
+        the slot's rustls session's
+        ``Keys.local.packet.encrypt_in_place`` + header-
+        protected via ``Keys.local.header.encrypt_in_place``
+        (RFC 9001 §5.3 + §5.4).
+
+        Splits cleanly from :meth:`_drain_and_send` so unit
+        tests can exercise the wire-format builder without
+        binding a UDP socket.  Returns the protected datagram
+        bytes ready for :meth:`send_to`; empty list if the
+        slot is out of range, the per-slot Handshake queue is
+        empty, or rustls hasn't installed level-2 keys yet
+        (the post-handshake-bridge sentinel gate).
+
+        The flow mirrors :meth:`_build_initial_response` but:
+
+        * The header omits the Initial-level token field
+          (RFC 9000 §17.2.4 -- Handshake long headers carry
+          only the payload-length varint after the SCID).
+        * The AEAD + HP routes through
+          :func:`_do_packet_encrypt` and
+          :func:`_do_header_encrypt` at
+          :data:`QuicEncryptionLevel.HANDSHAKE` instead of
+          flare's :func:`protect_initial_packet` (the DCID-
+          derived OpenSSL Initial path doesn't apply at
+          Handshake -- the keys come from rustls's
+          ``KeyChange::Handshake`` at the matching session
+          slot).
+        * The per-connection ``tx_handshake_pn`` +
+          ``tx_handshake_offset`` counters advance on success.
+        """
+        if slot < 0 or slot >= len(self.connections):
+            return List[UInt8]()
+        if slot >= len(self.tls_handshake_egress_queues):
+            return List[UInt8]()
+        if len(self.tls_handshake_egress_queues[slot]) == 0:
+            return List[UInt8]()
+        var conn = self.connections[slot].copy()
+        # Per-direction sentinel gates the egress: if rustls
+        # hasn't yet emitted KeyChange::Handshake then tx_handshake
+        # keys aren't ready.  The pump in `_dispatch_crypto_frames`
+        # stamps both rx + tx sentinels together; checking the tx
+        # side here keeps the egress aligned with the inbound gate
+        # on the same level.
+        if len(conn.tx_handshake_secret) == 0:
+            return List[UInt8]()
+        var handle = self.tls_sessions[slot].handle
+        if handle == 0:
+            return List[UInt8]()
+        if pn_length < 1 or pn_length > 4:
+            raise Error(
+                "_build_handshake_response: pn_length out of [1, 4]: "
+                + String(pn_length)
+            )
+        # 1. Encode the CRYPTO frame body that wraps the
+        # rustls take_crypto output at Handshake level.
+        var qbytes = self.tls_handshake_egress_queues[slot].copy()
+        var crypto = CryptoFrame(
+            offset=conn.tx_handshake_offset, data=qbytes.copy()
+        )
+        var payload = List[UInt8]()
+        encode_crypto(crypto, payload)
+        # 2. Build the long-header prefix (no token varint at
+        # Handshake level per RFC 9000 §17.2.4).
+        var first_bits = (pn_length - 1) & 0x3
+        var prefix = encode_long_header(
+            PACKET_TYPE_HANDSHAKE,
+            QUIC_VERSION_1,
+            conn.peer_cid,
+            conn.local_cid,
+            type_specific_bits=first_bits,
+        )
+        var payload_total = UInt64(len(payload) + pn_length + 16)
+        var len_var = encode_varint(payload_total)
+        for i in range(len(len_var)):
+            prefix.append(len_var[i])
+        # 3. Build the unprotected header = prefix + pn bytes.
+        var pn = conn.tx_handshake_pn
+        var unprotected_header = List[UInt8]()
+        for i in range(len(prefix)):
+            unprotected_header.append(prefix[i])
+        for i in range(pn_length):
+            var shift = (pn_length - 1 - i) * 8
+            unprotected_header.append(UInt8((Int(pn) >> shift) & 0xFF))
+        # 4. AEAD-encrypt the payload via rustls at level 2.
+        # The payload buffer is mutated in place; the returned
+        # tag is appended afterward.  The FFI binding helpers
+        # take `read lib: OwnedDLHandle`, which borrows without
+        # moving, so we pass `self.tls_acceptor._lib` directly
+        # at each callsite (the OwnedDLHandle itself is not
+        # ImplicitlyCopyable and cannot be aliased into a local).
+        var encrypted_payload = payload.copy()
+        var tag = _do_packet_encrypt(
+            self.tls_acceptor._lib,
+            handle,
+            QuicEncryptionLevel.HANDSHAKE,
+            pn,
+            unprotected_header,
+            encrypted_payload,
+        )
+        # 5. Assemble the protected datagram = header + ciphertext + tag.
+        var protected = List[UInt8]()
+        for i in range(len(unprotected_header)):
+            protected.append(unprotected_header[i])
+        for i in range(len(encrypted_payload)):
+            protected.append(encrypted_payload[i])
+        for i in range(len(tag)):
+            protected.append(tag[i])
+        # 6. Apply header protection via rustls at level 2.
+        var pn_offset = len(unprotected_header) - pn_length
+        var sample_offset = pn_offset + 4
+        if sample_offset + 16 > len(protected):
+            raise Error(
+                "_build_handshake_response: ciphertext too short for HP sample"
+            )
+        var sample = List[UInt8]()
+        for i in range(16):
+            sample.append(protected[sample_offset + i])
+        # Stage the first byte + pn bytes on the stack so rustls
+        # can XOR them in place; copy back afterward.
+        var first_local: UInt8 = protected[0]
+        var pn_local = List[UInt8]()
+        for i in range(pn_length):
+            pn_local.append(protected[pn_offset + i])
+        var first_addr = Int(UnsafePointer(to=first_local))
+        _do_header_encrypt(
+            self.tls_acceptor._lib,
+            handle,
+            QuicEncryptionLevel.HANDSHAKE,
+            sample,
+            first_addr,
+            Int(pn_local.unsafe_ptr()),
+            pn_length,
+        )
+        protected[0] = first_local
+        for i in range(pn_length):
+            protected[pn_offset + i] = pn_local[i]
+        # 7. Advance the per-connection Handshake counters.
+        conn.tx_handshake_pn = pn + UInt64(1)
+        conn.tx_handshake_offset = conn.tx_handshake_offset + UInt64(
+            len(qbytes)
+        )
+        self.connections[slot] = conn^
+        return protected^
+
+    def _build_1rtt_response(
+        mut self,
+        slot: Int,
+        var plaintext: List[UInt8],
+        pn_length: Int = 2,
+    ) raises -> List[UInt8]:
+        """Wrap an arbitrary 1-RTT plaintext payload (CRYPTO
+        bytes from rustls's post-handshake KeyChange::OneRtt
+        path, OR STREAM-frame H3 response bytes) into a
+        short-header 1-RTT packet, AEAD-protected via the
+        slot's rustls session's
+        ``Keys.local.packet.encrypt_in_place`` + header-
+        protected via ``Keys.local.header.encrypt_in_place``
+        at :data:`QuicEncryptionLevel.APPLICATION`.
+
+        ``plaintext`` is the in-place buffer of plaintext
+        bytes the caller has already encoded into QUIC frames
+        (CRYPTO at level 3 for post-handshake NEW_TOKEN /
+        HANDSHAKE_DONE / NEW_CONNECTION_ID, or STREAM for H3).
+        The function consumes it.  Returns the protected
+        datagram bytes ready for :meth:`send_to`; empty list
+        if the slot is out of range, rustls hasn't installed
+        1-RTT keys yet, or the session handle is NULL.
+        """
+        if slot < 0 or slot >= len(self.connections):
+            return List[UInt8]()
+        var conn = self.connections[slot].copy()
+        if len(conn.tx_1rtt_secret) == 0:
+            return List[UInt8]()
+        if slot >= len(self.tls_sessions):
+            return List[UInt8]()
+        var handle = self.tls_sessions[slot].handle
+        if handle == 0:
+            return List[UInt8]()
+        if pn_length < 1 or pn_length > 4:
+            raise Error(
+                "_build_1rtt_response: pn_length out of [1, 4]: "
+                + String(pn_length)
+            )
+        # 1. Build the unprotected short-header prefix.
+        # spin_bit + key_phase stay 0 in this commit -- v0.9
+        # adds key-update + spin-bit honesty.
+        var prefix = encode_short_header(
+            conn.peer_cid,
+            spin_bit=False,
+            key_phase=False,
+            pn_length=pn_length,
+        )
+        # 2. Build unprotected header = prefix + pn bytes.
+        var pn = conn.tx_1rtt_pn
+        var unprotected_header = List[UInt8]()
+        for i in range(len(prefix)):
+            unprotected_header.append(prefix[i])
+        for i in range(pn_length):
+            var shift = (pn_length - 1 - i) * 8
+            unprotected_header.append(UInt8((Int(pn) >> shift) & 0xFF))
+        # 3. AEAD-encrypt via rustls at level 3.  See the
+        # _build_handshake_response comment for why we pass
+        # `self.tls_acceptor._lib` directly at each call.
+        var encrypted_payload = plaintext^
+        var tag = _do_packet_encrypt(
+            self.tls_acceptor._lib,
+            handle,
+            QuicEncryptionLevel.APPLICATION,
+            pn,
+            unprotected_header,
+            encrypted_payload,
+        )
+        # 4. Assemble the protected datagram.
+        var protected = List[UInt8]()
+        for i in range(len(unprotected_header)):
+            protected.append(unprotected_header[i])
+        for i in range(len(encrypted_payload)):
+            protected.append(encrypted_payload[i])
+        for i in range(len(tag)):
+            protected.append(tag[i])
+        # 5. Apply header protection via rustls at level 3.
+        var pn_offset = len(unprotected_header) - pn_length
+        var sample_offset = pn_offset + 4
+        if sample_offset + 16 > len(protected):
+            raise Error(
+                "_build_1rtt_response: ciphertext too short for HP sample"
+            )
+        var sample = List[UInt8]()
+        for i in range(16):
+            sample.append(protected[sample_offset + i])
+        var first_local: UInt8 = protected[0]
+        var pn_local = List[UInt8]()
+        for i in range(pn_length):
+            pn_local.append(protected[pn_offset + i])
+        var first_addr = Int(UnsafePointer(to=first_local))
+        _do_header_encrypt(
+            self.tls_acceptor._lib,
+            handle,
+            QuicEncryptionLevel.APPLICATION,
+            sample,
+            first_addr,
+            Int(pn_local.unsafe_ptr()),
+            pn_length,
+        )
+        protected[0] = first_local
+        for i in range(pn_length):
+            protected[pn_offset + i] = pn_local[i]
+        # 6. Advance the 1-RTT pn counter (no offset counter at
+        # 1-RTT -- per-stream offsets live on each STREAM frame
+        # encoded into the plaintext).
+        conn.tx_1rtt_pn = pn + UInt64(1)
+        self.connections[slot] = conn^
+        return protected^
+
+    def _build_1rtt_handshake_crypto(
+        mut self, slot: Int, pn_length: Int = 2
+    ) raises -> List[UInt8]:
+        """Wrap the slot's pending 1-RTT-level CRYPTO bytes
+        (rustls post-handshake messages: NewSessionTicket etc.)
+        into a 1-RTT packet via :meth:`_build_1rtt_response`.
+
+        Distinct from H3 STREAM-frame egress which lives under
+        :meth:`_build_1rtt_h3_stream`; both end up calling
+        :meth:`_build_1rtt_response` with the appropriate
+        plaintext.
+        """
+        if slot >= len(self.tls_1rtt_egress_queues):
+            return List[UInt8]()
+        if len(self.tls_1rtt_egress_queues[slot]) == 0:
+            return List[UInt8]()
+        if slot < 0 or slot >= len(self.connections):
+            return List[UInt8]()
+        # Wrap the bytes in a CRYPTO frame -- the offset is
+        # tracked per-stream-id at the 1-RTT level, but for the
+        # CRYPTO frame stream the offset is just a monotonic
+        # counter.  rustls's post-handshake messages are small
+        # and infrequent so a fresh CryptoFrame(offset=0) per
+        # drain is correct as long as the egress queue gets
+        # cleared every flush (which it does in `_drain_and_send`).
+        var qbytes = self.tls_1rtt_egress_queues[slot].copy()
+        var crypto = CryptoFrame(offset=UInt64(0), data=qbytes^)
+        var plaintext = List[UInt8]()
+        encode_crypto(crypto, plaintext)
+        return self._build_1rtt_response(slot, plaintext^, pn_length)
+
+    def _build_1rtt_h3_stream(
+        mut self,
+        slot: Int,
+        stream_id: UInt64,
+        var stream_bytes: List[UInt8],
+        fin: Bool,
+        pn_length: Int = 2,
+    ) raises -> List[UInt8]:
+        """Wrap a STREAM frame carrying ``stream_bytes`` for
+        the given QUIC stream id into a 1-RTT short-header
+        packet.
+
+        H3 response bytes (HEADERS + DATA frames already
+        encoded by the H3 driver) get framed here into the
+        QUIC STREAM frame shape per RFC 9000 §19.8 + RFC 9000
+        §17.3.1 short-header encryption.
+
+        ``fin`` flips the STREAM frame's FIN bit; the H3
+        driver sets True when the response is complete.
+        ``stream_id`` is the QUIC stream id, monotonically
+        increasing per RFC 9000 §2.1 numbering rules.
+        """
+        if len(stream_bytes) == 0 and not fin:
+            return List[UInt8]()
+        # Encode the STREAM frame body inline.  Frame type
+        # bits per RFC 9000 §19.8:
+        #
+        #   0b00001 | OFF | LEN | FIN
+        #
+        # We always set OFF (we encode an offset) + LEN (we
+        # encode a length) so the frame is self-describing for
+        # interleaved STREAMs; FIN per the caller's flag.
+        var frame_type: Int = 0x08 | 0x04 | 0x02
+        if fin:
+            frame_type |= 0x01
+        var plaintext = List[UInt8]()
+        plaintext.append(UInt8(frame_type))
+        var sid_var = encode_varint(stream_id)
+        for i in range(len(sid_var)):
+            plaintext.append(sid_var[i])
+        var off_var = encode_varint(UInt64(0))
+        for i in range(len(off_var)):
+            plaintext.append(off_var[i])
+        var len_var = encode_varint(UInt64(len(stream_bytes)))
+        for i in range(len(len_var)):
+            plaintext.append(len_var[i])
+        for i in range(len(stream_bytes)):
+            plaintext.append(stream_bytes[i])
+        return self._build_1rtt_response(slot, plaintext^, pn_length)
 
     def run(mut self) raises:
         """Run the listener's event loop. Blocks until
