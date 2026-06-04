@@ -731,12 +731,12 @@ attestations.
 The cross-framework HTTP/3 row now has the h2load+H3 client
 landed on the dev-box -- see the
 [HTTP/3 throughput](#http3-throughput) table below for the
-quiche / quinn / flare_h3 reading at this HEAD. flare_h3 still
-sits at 0 req/s because the QUIC reactor's live datagram I/O
-loop is the one wire path that didn't land in this cycle (the
-codec, AEAD, rustls binding, state machine, and H3 dispatch
-all wired; the open-loop reactor that pulls them together into
-a live handshake is the v0.7 commit-1 candidate).
+quiche / quinn / flare_h3 reading at this HEAD. As of Phase E
+flare_h3 sat at 0 req/s because the inbound post-Initial decrypt
+path had not landed; Phase F (Jun 4, 2026) closed it and the
+table now reads a stable 351 req/s. The gate is still unmet --
+the remaining bottleneck is the un-coalesced, un-batched egress
+path, not the handshake (see the table notes below).
 
 ##### Phase E refresh attestation (Jun 3, 2026, post Track Q14-W)
 
@@ -778,6 +778,25 @@ The deferred-gate close is scoped in
 `pixi run -e bench bench-h3 all` re-runs the cross-framework
 table and this section gains a `flare_h3` row alongside the
 existing `quiche` + `quinn` rows above.
+
+##### Phase F update (Jun 4, 2026): decrypt gap closed, gate egress-bound
+
+Phase F landed the rustls `KeyChange` bridge (Rust wrapper +
+Mojo bindings + per-level key install), the listener-level
+Handshake + 1-RTT header-protection + AEAD decrypt, a
+packet-number-space split (an inbound ACK advances
+`largest_acked_by_peer`, never the inbound pn-decode base),
+ACK ranges built from actually-received pns, and inbound
+datagram batching. The handshake now completes and h2load
+sustains a stable `351 req/s` (sigma 3.19 %, p50 255 ms) at
+1 client x 100 streams. The `>= 72,571 req/s` gate is still
+unmet, but the bottleneck has moved off the handshake: the
+single-stream path runs at 2,145 req/s with 105 us RTT, while
+the 100-stream gate workload is egress-bound -- one un-coalesced
+UDP datagram per H3 response, each built byte-by-byte through an
+AEAD + header-protection FFI crossing, with no sendmmsg/GSO.
+Closing the gate is the egress coalescing + sendmmsg/GSO
+milestone tracked in `design-0.8.mdc`.
 
 Phase E sanitizer + fuzz + lint floors (each gate ran at its
 introducing commit; the close-wire-paths floors carry forward
@@ -1367,21 +1386,25 @@ dispatch loop. The bench baseline now drives through
 `HttpServer.bind_with_h3 + serve_h3(handler)`; the reactor's
 `recv -> dispatch -> handle -> drain -> protect -> sendto`
 cycle is live and the Handler dispatch chain reaches the
-Handler on completed streams. The cross-framework gate
-(`flare_h3 median req/s >= 72,571 req/s sigma <= 8 %`) did
-NOT close in Phase E -- the rustls FFI wrapper discards
-`Option<KeyChange>` (the `let _maybe_keys = ...` site at
-`flare/tls/ffi/rustls_wrapper/src/lib.rs:447`), so per-level
-Handshake / 1-RTT keys never flow back to
-`QuicConnection.install_handshake_keys` /
-`install_1rtt_keys`; the Handshake + 1-RTT branches in
-`handle_packet` silently drop inbound datagrams and h2load
-observes 0 req/s. The deferred-gate close is a separate FFI
-extension (Rust wrapper + Mojo bindings + key install path +
-1-RTT short-header egress), scoped in `design-0.8.mdc § Phase
-E deferred gate` and `critisize-0.8.mdc § 11.13`. Until that
-follow-up commit lands, the table below reads `0 req/s` for
-`flare h3` with the gap explicitly named.** Stock Ubuntu's
+Handler on completed streams. Phase F (Jun 4, 2026) then closed
+the inbound post-Initial decrypt path the gate depended on: the
+rustls FFI wrapper now returns `KeyChange`, per-level Handshake /
+1-RTT keys reach `install_handshake_keys` / `install_1rtt_keys`,
+and the listener strips header protection + AEAD-decrypts
+Handshake + 1-RTT datagrams through the slot's rustls session.
+With the packet-number-space split (an inbound ACK advances
+`largest_acked_by_peer`, never the inbound pn-decode base) the
+handshake completes and h2load sustains a stable reading. The
+cross-framework gate
+(`flare_h3 median req/s >= 72,571 req/s sigma <= 8 %`) is still
+NOT met: the deficit is now egress, not the handshake. Every H3
+response leaves as its own UDP datagram with no coalescing, each
+built byte-by-byte with an AEAD + header-protection FFI crossing,
+and there is no sendmmsg/GSO batching, so the 100-stream gate
+workload is egress-bound (single-stream runs healthy at 2,145
+req/s / 105 us RTT). Closing it is the egress coalescing +
+sendmmsg/GSO milestone scoped in `design-0.8.mdc`.** Stock
+Ubuntu's
 ``nghttp2-client`` (1.43) predates h3 support; conda-forge's
 nghttp2 (1.68) ships without ``h2load``. The h2load binary
 used for the numbers below was built from source on the EPYC
@@ -1419,7 +1442,7 @@ sudo cp nghttp2/src/.libs/h2load /usr/local/bin/h2load
 
 Once the binary is on ``PATH``, ``pixi run -e bench bench-h3 all``
 populates the cross-framework table below directly. Current
-reading at HEAD ``65b3282`` (source data:
+reading at HEAD ``b9aeeef`` (source data:
 [`benchmark/results/v0.8/h3/`](../benchmark/results/v0.8/h3/),
 5x30s runs, 1 client x 100 concurrent streams per run):
 
@@ -1427,7 +1450,7 @@ reading at HEAD ``65b3282`` (source data:
 |---|---:|---:|---:|---:|---|
 | quiche 0.22 (boringssl-vendored) | 72,571 | (per-stream) | (per-stream) | (per-stream) | clean: 0 errors / 0 timeouts across 5 runs, sigma ~1% |
 | quinn 0.11 + h3 0.0.8        | 654    | 4.17     | 4.75       | 5.48        | open-loop 100-stream shape errors 98% (1.2M errored of 1.2M total) -- this is workload-shape calibration, not a quinn ceiling (the 10s warmup with the same client sustained 104k req/s at 0 errors) |
-| flare h3                     | 0      | --       | --         | --          | Phase E (Q9-W ... Q14-W) joined the close-wire-paths primitives into a live QUIC reactor: `recv -> dispatch -> handle -> drain -> protect -> sendto -> advance_timers` runs every tick; Handshake + 1-RTT AEAD wired; H3 dispatch chain reaches the Handler on completed streams; bench baseline drives through `HttpServer.serve_h3`. Open gap is the rustls KeyChange -> per-level traffic secret bridge (rustls FFI wrapper at `flare/tls/ffi/rustls_wrapper/src/lib.rs:447` discards `Option<KeyChange>`); without it, Handshake + 1-RTT inbound datagrams drop silently and h2load sees 0 req/s. Closing the gap is the Phase F follow-up FFI cycle scoped in `design-0.8.mdc § Phase E deferred gate`. |
+| flare h3                     | 351    | 506.86   | 674.46     | 674.50      | Phase F closed the inbound post-Initial decrypt path (rustls KeyChange -> per-level keys, Handshake + 1-RTT AEAD/HP decrypt, ACK packet-number-space split): the handshake completes and h2load sustains a stable 351 req/s (sigma 3.19%, p50 255 ms) at 1 client x 100 streams. The gate (>= 72,571) is NOT met. The egress path emits one UDP datagram per H3 response with no packet coalescing and no sendmmsg/GSO, and each packet is built byte-by-byte with two FFI crossings (AEAD + header protection). Single-stream (`-c1 -m1`) runs at 2,145 req/s with 105 us RTT, so the fast path is healthy; the deficit is egress-bound under concurrency. Closing the gate is the egress-coalescing + sendmmsg/GSO milestone tracked in `design-0.8.mdc`. |
 
 Reading order:
 
@@ -1441,19 +1464,22 @@ Reading order:
   exposed the per-conn limit; the calibration knob lives in
   ``benchmark/configs/h3_throughput.yaml`` (``h2load_streams``
   + ``h2load_duration_seconds``).
-- **flare h3** at 0 req/s names exactly what's still in flight
-  after Phase E: the rustls KeyChange -> per-level traffic
-  secret bridge. The QUIC reactor I/O loop runs every tick,
-  the Handler dispatch chain reaches the Handler on completed
-  streams, and the bench baseline drives through
-  `HttpServer.serve_h3` -- but the per-Handshake / per-1-RTT
-  AEAD secrets that protect the inbound + outbound post-Initial
-  datagrams never reach the AEAD layer because rustls's FFI
-  wrapper discards them (`flare/tls/ffi/rustls_wrapper/src/lib.rs:447`).
-  Closing the gap is the Phase F follow-up FFI cycle scoped in
-  `design-0.8.mdc § Phase E deferred gate`.
+- **flare h3** at 351 req/s reflects the post-Phase-F state: the
+  inbound post-Initial decrypt path is live (rustls KeyChange ->
+  per-level keys, Handshake + 1-RTT AEAD/HP decrypt), the
+  packet-number-space split removed the optimistic-ACK
+  PROTOCOL_VIOLATION the client raised, and the handshake now
+  completes and stays stable across the full 5x30s run. The
+  remaining gap to the 72,571 req/s gate is egress, not the
+  handshake: every H3 response leaves as its own UDP datagram
+  (no coalescing), each built byte-by-byte with an AEAD + a
+  header-protection FFI crossing, and there is no sendmmsg/GSO
+  batching. The single-stream path is healthy (2,145 req/s,
+  105 us RTT); throughput collapses only under the 100-stream
+  concurrency the gate measures. Closing it is the egress
+  coalescing + sendmmsg/GSO milestone tracked in `design-0.8.mdc`.
 
-When the FFI bridge lands, ``pixi run -e bench bench-h3 all``
+When the egress milestone lands, ``pixi run -e bench bench-h3 all``
 re-runs this table without further script edits; the floor-hold
 row in "Best-perf refresh at HEAD" gains a matching HTTP/3 entry
 at that point.
