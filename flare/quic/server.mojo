@@ -40,6 +40,7 @@ References:
 from std.collections import Dict, List, Optional
 from std.ffi import c_int, external_call
 from std.memory import Span, stack_allocation
+from std.os import getenv
 
 from ..net.address import IpAddr, SocketAddr
 from ..udp import UdpSocket
@@ -138,11 +139,47 @@ from .packet import encode_short_header
 comptime _MAX_DATA_WINDOW: UInt64 = 64 * 1024 * 1024
 comptime _MAX_STREAMS_BIDI_WINDOW: UInt64 = 4096
 
-# Max datagrams drained per reactor tick. Bounds the time spent in
-# one tick so a single hot connection cannot starve the serve loop's
-# H3 pump / timer pass, while amortizing that per-tick work over a
-# burst of inbound datagrams.
+# Max datagrams drained per reactor tick. Bounds the time spent in one
+# tick so a single hot connection cannot starve the serve loop's H3
+# pump / timer / egress pass, while amortizing that per-tick work over
+# a burst of inbound datagrams. Measured sweet spot for the -m100 h3
+# workload: draining too aggressively (e.g. 1024) delays egress within
+# a tick and lowers throughput; 64 keeps RX and egress interleaved.
 comptime _RX_BATCH: Int = 64
+
+# Kernel UDP buffer sizes. Default 0 == leave the kernel default in
+# place. Counter-intuitively, raising SO_RCVBUF on the single-reactor
+# loopback h3 bench HURT both throughput and the p99.9 tail: a deeper
+# kernel queue lets the reactor fall further behind during a burst, so
+# queued datagrams age (bufferbloat) and median dropped ~3% while
+# p99.9 doubled. The default-small buffer applies backpressure earlier
+# and keeps the reactor closer to real time. The knob is still exposed
+# for real-network deployments where the default rmem causes genuine
+# drops -- set FLARE_QUIC_RCVBUF / FLARE_QUIC_SNDBUF (bytes) to raise
+# it. The kernel doubles the request and clamps to
+# net.core.{rmem,wmem}_max, so the effective size may be smaller.
+comptime _DEFAULT_QUIC_RCVBUF: Int = 0
+comptime _DEFAULT_QUIC_SNDBUF: Int = 0
+
+
+def _bufsize_from_env(name: String, default: Int) -> Int:
+    """Read a byte-count override from environment ``name``.
+
+    Returns ``default`` when the variable is unset or not a valid
+    non-negative integer. A value of ``0`` is honored and means "leave
+    the kernel default in place".
+    """
+    var raw = getenv(name)
+    if raw.byte_length() == 0:
+        return default
+    try:
+        var v = Int(raw)
+        if v < 0:
+            return default
+        return v
+    except:
+        return default
+
 
 # Cap on the number of disjoint ACK ranges tracked per connection.
 # Bounds the per-slot memory; the oldest (lowest) ranges are dropped
@@ -232,6 +269,63 @@ def _ack_from_ranges(flat: List[UInt64], ack_delay: UInt64) raises -> AckFrame:
         ranges=ranges^,
         ecn=List[EcnCounts](),
     )
+
+
+def _encode_h3_stream_frame(
+    mut out: List[UInt8],
+    stream_id: UInt64,
+    stream_bytes: Span[UInt8, _],
+    fin: Bool,
+) raises:
+    """Append one QUIC STREAM frame (RFC 9000 sec 19.8) carrying
+    ``stream_bytes`` for ``stream_id`` to ``out``.
+
+    Frame type bits: ``0b00001 | OFF | LEN | FIN``. OFF + LEN are
+    always set (offset 0, explicit length) so multiple STREAM
+    frames coalesce unambiguously into one packet payload; FIN
+    per the caller's flag. Factored out of
+    :meth:`QuicListener._build_1rtt_h3_stream` so the coalescing
+    drain can pack many responses into a single 1-RTT datagram.
+    """
+    var frame_type: Int = 0x08 | 0x04 | 0x02
+    if fin:
+        frame_type |= 0x01
+    out.append(UInt8(frame_type))
+    var sid_var = encode_varint(stream_id)
+    for i in range(len(sid_var)):
+        out.append(sid_var[i])
+    var off_var = encode_varint(UInt64(0))
+    for i in range(len(off_var)):
+        out.append(off_var[i])
+    var len_var = encode_varint(UInt64(len(stream_bytes)))
+    for i in range(len(len_var)):
+        out.append(len_var[i])
+    out.extend(stream_bytes)
+
+
+def _stream_id_from_key(k: String) -> Int:
+    """Parse the QUIC stream id out of an ``h3_response_egress``
+    key of the form ``"<slot>:<stream_id>"`` (ASCII only, so
+    byte-level iteration is safe). Returns -1 if the key has no
+    colon or no digits after it.
+    """
+    var key_bytes = k.as_bytes()
+    var sid = 0
+    var found_colon = False
+    var any_digit = False
+    for j in range(len(key_bytes)):
+        var b = Int(key_bytes[j])
+        if not found_colon:
+            if b == 0x3A:  # ':'
+                found_colon = True
+            continue
+        if b < 0x30 or b > 0x39:
+            continue
+        sid = sid * 10 + (b - 0x30)
+        any_digit = True
+    if not found_colon or not any_digit:
+        return -1
+    return sid
 
 
 def _inbound_level_for_datagram(datagram: Span[UInt8, _]) -> Int:
@@ -1250,6 +1344,27 @@ struct QuicListener(Movable):
         var ip = IpAddr.parse(config.host)
         var addr = SocketAddr(ip, config.port)
         var sock = UdpSocket.bind(addr)
+        # UDP buffer sizing is opt-in (default keeps the kernel
+        # default; see _DEFAULT_QUIC_RCVBUF for why raising it hurt the
+        # loopback bench). When the env knob requests a non-zero size we
+        # apply it; the kernel clamps to net.core.{rmem,wmem}_max, so a
+        # failure (or a smaller effective size) is non-fatal.
+        var rcvbuf = _bufsize_from_env(
+            "FLARE_QUIC_RCVBUF", _DEFAULT_QUIC_RCVBUF
+        )
+        if rcvbuf > 0:
+            try:
+                sock.set_recv_buffer(rcvbuf)
+            except:
+                pass
+        var sndbuf = _bufsize_from_env(
+            "FLARE_QUIC_SNDBUF", _DEFAULT_QUIC_SNDBUF
+        )
+        if sndbuf > 0:
+            try:
+                sock.set_send_buffer(sndbuf)
+            except:
+                pass
         var actual = sock.local_addr()
         var acceptor = RustlsQuicAcceptor(config.rustls_config.copy())
         return QuicListener(config, sock^, actual, acceptor^)
@@ -1384,39 +1499,44 @@ struct QuicListener(Movable):
         connection; Handshake + 1-RTT decrypt through the slot's
         rustls session. Failures drop silently per RFC 9001 sec 5.2.
         """
-        var conn = self.connections[slot].copy()
+        # Read the local CID length up front so the rustls decrypt
+        # helper (which takes ``mut self``) doesn't have to alias a
+        # held ref into the connection slab. Everything below mutates
+        # ``self.connections[slot]`` in place -- no whole-connection
+        # deep copy on the per-packet hot path.
+        var local_cid_len = self.connections[slot].local_cid.length()
         var events = empty_events()
         var ok = True
         if inbound_lvl == QuicEncryptionLevel.INITIAL:
             try:
-                events = conn.handle_packet(packet, now_us)
+                events = self.connections[slot].handle_packet(packet, now_us)
             except:
                 ok = False
         elif inbound_lvl == QuicEncryptionLevel.HANDSHAKE:
-            if len(conn.rx_handshake_secret) == 0:
+            if len(self.connections[slot].rx_handshake_secret) == 0:
                 ok = False  # keys not installed yet; drop
             else:
                 try:
                     var dec = self._decrypt_post_initial(
-                        slot, packet, inbound_lvl, conn.local_cid.length()
+                        slot, packet, inbound_lvl, local_cid_len
                     )
-                    events = conn.dispatch_plaintext(
+                    events = self.connections[slot].dispatch_plaintext(
                         Span[UInt8, _](dec[0]), now_us, dec[1]
                     )
                 except:
                     ok = False
         elif inbound_lvl == QuicEncryptionLevel.APPLICATION:
-            if len(conn.rx_1rtt_secret) == 0:
+            if len(self.connections[slot].rx_1rtt_secret) == 0:
                 ok = False
             else:
                 try:
                     var dec = self._decrypt_post_initial(
-                        slot, packet, inbound_lvl, conn.local_cid.length()
+                        slot, packet, inbound_lvl, local_cid_len
                     )
                     # Clear the state-machine ack-eliciting marker so
                     # it reflects only THIS packet after dispatch.
-                    conn.conn.ack_pending = False
-                    events = conn.dispatch_plaintext(
+                    self.connections[slot].conn.ack_pending = False
+                    events = self.connections[slot].dispatch_plaintext(
                         Span[UInt8, _](dec[0]), now_us, dec[1]
                     )
                     # Record the received pn into the ACK ranges so
@@ -1431,13 +1551,12 @@ struct QuicListener(Movable):
                     # also carries MAX_DATA/MAX_STREAMS (ack-
                     # eliciting), provoke an endless ack-of-ack storm
                     # (RFC 9000 sec 13.2.1).
-                    if conn.conn.ack_pending:
+                    if self.connections[slot].conn.ack_pending:
                         self.rx_1rtt_ack_pending[slot] = True
                 except:
                     ok = False
         else:
             ok = False  # 0-RTT / Retry not handled here
-        self.connections[slot] = conn^
         if not ok:
             return
         self._dispatch_crypto_frames(slot, events, inbound_lvl)
@@ -1608,19 +1727,33 @@ struct QuicListener(Movable):
         # the gap ahead of them fills. All frames in one batch
         # share the parent packet's encryption level (RFC 9001
         # sec 4.1.3), so the caller supplies that level.
-        if inbound_lvl >= 0 and inbound_lvl < 4:
-            var reasm = self.crypto_reasm[slot].copy()
+        var fed_crypto = False
+        if (
+            len(events.crypto_frames) > 0
+            and inbound_lvl >= 0
+            and inbound_lvl < 4
+        ):
+            ref reasm = self.crypto_reasm[slot]
             for i in range(len(events.crypto_frames)):
                 reasm.levels[inbound_lvl].insert(
                     events.crypto_frames[i].offset,
                     events.crypto_frames[i].data,
                 )
             var ordered = reasm.levels[inbound_lvl].drain_contiguous()
-            self.crypto_reasm[slot] = reasm^
             if len(ordered) > 0:
                 _ = _do_feed_crypto(
                     self.tls_acceptor._lib, handle, inbound_lvl, ordered
                 )
+                fed_crypto = True
+
+        # Steady-state fast path: once 1-RTT keys are installed and
+        # this packet fed no new CRYPTO, rustls has nothing to drain
+        # or re-key, so skip the five per-packet FFI crossings below.
+        # The handshake-completing packet always feeds CRYPTO, so the
+        # post-handshake outbound drain (session tickets) still runs
+        # on that turn.
+        if not fed_crypto and len(self.connections[slot].rx_1rtt_secret) != 0:
+            return
 
         # Drain rustls's outbound CRYPTO bytes at every level
         # rustls might have buffered for us. The KeyChange-driven
@@ -1680,17 +1813,18 @@ struct QuicListener(Movable):
             )
             == 1
         )
-        if have_hs or have_1rtt:
-            var conn_copy = self.connections[slot].copy()
-            if have_hs and len(conn_copy.rx_handshake_secret) == 0:
-                conn_copy.install_handshake_keys(
-                    _ready_sentinel(), _ready_sentinel()
-                )
-            if have_1rtt and len(conn_copy.rx_1rtt_secret) == 0:
-                conn_copy.install_1rtt_keys(
-                    _ready_sentinel(), _ready_sentinel()
-                )
-            self.connections[slot] = conn_copy^
+        # Install once per direction, in place. The guard conditions
+        # stay false after the first install, so post-handshake
+        # packets (where have_1rtt is always true) don't pay a
+        # whole-connection deep copy here.
+        if have_hs and len(self.connections[slot].rx_handshake_secret) == 0:
+            self.connections[slot].install_handshake_keys(
+                _ready_sentinel(), _ready_sentinel()
+            )
+        if have_1rtt and len(self.connections[slot].rx_1rtt_secret) == 0:
+            self.connections[slot].install_1rtt_keys(
+                _ready_sentinel(), _ready_sentinel()
+            )
 
     # -- H3 dispatch surface ----------------------------------------------
 
@@ -1717,23 +1851,33 @@ struct QuicListener(Movable):
             return
         if len(events.stream_chunks) == 0:
             return
-        var h3 = self.h3_connections[slot].copy()
+        # Pass 1: connection + stream flow-control accounting (RFC
+        # 9000 sec 4). Track total inbound stream bytes for MAX_DATA
+        # and the client bidi-stream high-water mark (id & 3 == 0)
+        # for MAX_STREAMS_BIDI; both are advertised on the next ACK
+        # so the peer never blocks over a long run. Done first so the
+        # in-place H3 feed below can hold one mutable ref into the
+        # slab without aliasing these rx_* counters.
+        for i in range(len(events.stream_chunks)):
+            var sid = Int(events.stream_chunks[i].stream_id)
+            var is_uni = (sid & 0x2) != 0
+            var plen = len(events.stream_chunks[i].data)
+            if slot < len(self.rx_stream_bytes):
+                self.rx_stream_bytes[slot] += UInt64(plen)
+            if not is_uni and slot < len(self.rx_bidi_stream_count):
+                var count = UInt64((sid >> 2) + 1)
+                if count > self.rx_bidi_stream_count[slot]:
+                    self.rx_bidi_stream_count[slot] = count
+        # Pass 2: feed H3 in place. Mutating the slot through a ref
+        # avoids deep-copying the whole H3Connection (its per-stream
+        # state Dict) on every inbound datagram -- the dominant
+        # per-request CPU cost under stream concurrency.
+        ref h3 = self.h3_connections[slot]
         for i in range(len(events.stream_chunks)):
             var sid = Int(events.stream_chunks[i].stream_id)
             var is_uni = (sid & 0x2) != 0
             var is_fin = events.stream_chunks[i].fin
             var payload = events.stream_chunks[i].data.copy()
-            # Connection + stream flow-control accounting (RFC 9000
-            # sec 4). Track total inbound stream bytes for MAX_DATA
-            # and the client bidi-stream high-water mark (id & 3 == 0)
-            # for MAX_STREAMS_BIDI; both are advertised on the next
-            # ACK so the peer never blocks over a long run.
-            if slot < len(self.rx_stream_bytes):
-                self.rx_stream_bytes[slot] += UInt64(len(payload))
-            if not is_uni and slot < len(self.rx_bidi_stream_count):
-                var count = UInt64((sid >> 2) + 1)
-                if count > self.rx_bidi_stream_count[slot]:
-                    self.rx_bidi_stream_count[slot] = count
             if len(payload) > 0:
                 if is_uni:
                     h3.feed_uni_stream_chunk(sid, payload^)
@@ -1741,7 +1885,6 @@ struct QuicListener(Movable):
                     h3.feed_stream_chunk(sid, payload^)
             if is_fin and not is_uni:
                 h3.signal_end_of_stream(sid)
-        self.h3_connections[slot] = h3^
 
     def take_h3_completed_streams(self, slot: Int) raises -> List[Int]:
         """Return the stream ids ready for handler dispatch on
@@ -1767,10 +1910,8 @@ struct QuicListener(Movable):
             raise Error(
                 "take_h3_request: slot " + String(slot) + " out of range"
             )
-        var h3 = self.h3_connections[slot].copy()
-        var req = h3.take_request(stream_id)
-        self.h3_connections[slot] = h3^
-        return req^
+        ref h3 = self.h3_connections[slot]
+        return h3.take_request(stream_id)
 
     def emit_h3_response(
         mut self, slot: Int, stream_id: Int, var response: Response
@@ -1787,10 +1928,9 @@ struct QuicListener(Movable):
             raise Error(
                 "emit_h3_response: slot " + String(slot) + " out of range"
             )
-        var h3 = self.h3_connections[slot].copy()
+        ref h3 = self.h3_connections[slot]
         h3.emit_response(stream_id, response^)
         var frames = h3.take_response_frames(stream_id)
-        self.h3_connections[slot] = h3^
         var key = String(slot) + ":" + String(stream_id)
         if key in self.h3_response_egress:
             var existing = self.h3_response_egress[key].copy()
@@ -2131,18 +2271,12 @@ struct QuicListener(Movable):
         # retransmits forever (sec 13.2). HANDSHAKE_DONE (sec 19.20)
         # rides the first ACK to confirm the handshake so the peer
         # discards Handshake keys.
-        if self._has_1rtt_keys(slot) and self.rx_1rtt_ack_pending[slot]:
-            var ack_dg = self._build_1rtt_ack(slot)
-            if len(ack_dg) > 0:
-                _ = self.send_to(Span[UInt8, _](ack_dg), peer)
-                self.rx_1rtt_ack_pending[slot] = False
-                self.handshake_done_sent[slot] = True
-                emitted = True
-        # H3 response STREAM frames at 1-RTT (the user-visible
-        # response path).  Drain each pending (slot, stream_id)
-        # entry, wrap in a STREAM frame, encode into a 1-RTT
-        # packet via rustls AEAD, send_to.
-        if self._drain_h3_response_egress(slot, peer):
+        # Coalesced 1-RTT egress: the pending ACK (+ HANDSHAKE_DONE
+        # once + flow-control credit) and every ready H3 response
+        # STREAM frame are packed into as few datagrams as the MTU
+        # allows -- one AEAD encrypt + one sendto per datagram
+        # instead of one per response plus a separate ACK packet.
+        if self._drain_1rtt_coalesced(slot, peer):
             emitted = True
         return emitted
 
@@ -2238,6 +2372,103 @@ struct QuicListener(Movable):
             _ = self.send_to(Span[UInt8, _](dg), peer)
             _ = self.h3_response_egress.pop(k)
             emitted = True
+        return emitted
+
+    def _drain_1rtt_coalesced(
+        mut self, slot: Int, peer: SocketAddr
+    ) raises -> Bool:
+        """Coalesced 1-RTT egress: pack the pending ACK frame and
+        every ready H3 response STREAM frame for ``slot`` into as
+        few short-header datagrams as the path MTU allows, one
+        AEAD encrypt + one ``sendto`` per datagram.
+
+        This replaces the prior one-datagram-per-response (plus a
+        separate ACK datagram) scheme. Under stream concurrency the
+        old scheme issued ~2 syscalls + 2 rustls crossings per
+        request; coalescing collapses a whole batch of responses
+        into a handful of full-size datagrams, which is the dominant
+        win for matching the Rust h3 baselines (RFC 9000 sec 12.2
+        permits any number of frames per packet).
+
+        Returns True iff at least one datagram was sent.
+        """
+        if not self._has_1rtt_keys(slot):
+            return False
+        # Plaintext budget: leave headroom for the short header
+        # (1 + dcid) + packet number + AEAD tag so the protected
+        # datagram stays within max_udp_payload_size.
+        var budget = Int(self.config.max_udp_payload_size) - 64
+        if budget < 64:
+            budget = 64
+        var plaintext = List[UInt8](capacity=budget + 64)
+        var emitted = False
+
+        # ACK (+ HANDSHAKE_DONE once + flow-control credit) leads
+        # the first datagram. These frames are small and always fit.
+        if (
+            self.rx_1rtt_ack_pending[slot]
+            and len(self.rx_1rtt_ranges[slot]) >= 2
+        ):
+            var ack = _ack_from_ranges(self.rx_1rtt_ranges[slot], UInt64(0))
+            encode_ack(ack, plaintext)
+            if not self.handshake_done_sent[slot]:
+                encode_handshake_done(plaintext)
+            var max_data = MaxDataFrame(
+                maximum_data=self.rx_stream_bytes[slot] + _MAX_DATA_WINDOW
+            )
+            encode_max_data(max_data, plaintext)
+            var max_streams = MaxStreamsFrame(
+                unidirectional=False,
+                maximum_streams=self.rx_bidi_stream_count[slot]
+                + _MAX_STREAMS_BIDI_WINDOW,
+            )
+            encode_max_streams(max_streams, plaintext)
+            self.rx_1rtt_ack_pending[slot] = False
+            self.handshake_done_sent[slot] = True
+
+        # Collect this slot's ready responses.
+        var slot_prefix = String(slot) + ":"
+        var keys_to_drain = List[String]()
+        for entry in self.h3_response_egress.items():
+            if entry.key.startswith(slot_prefix):
+                keys_to_drain.append(entry.key)
+
+        for i in range(len(keys_to_drain)):
+            var k = keys_to_drain[i]
+            var bytes = self.h3_response_egress.pop(k)
+            if len(bytes) == 0:
+                continue
+            var sid = _stream_id_from_key(k)
+            if sid < 0:
+                continue
+            # STREAM frame overhead is <= ~16 bytes (type + 3
+            # varints). Flush the in-progress datagram first if this
+            # response would push it past the MTU budget.
+            var frame_cost = len(bytes) + 16
+            if len(plaintext) > 0 and len(plaintext) + frame_cost > budget:
+                var dg = self._build_1rtt_response(slot, plaintext^)
+                if len(dg) > 0:
+                    _ = self.send_to(Span[UInt8, _](dg), peer)
+                    emitted = True
+                plaintext = List[UInt8](capacity=budget + 64)
+            _encode_h3_stream_frame(
+                plaintext, UInt64(sid), Span[UInt8, _](bytes), fin=True
+            )
+            # The response is complete (fin=True), so reclaim the
+            # per-stream carriers now. Without this, completed
+            # streams pile up in both the H3 driver's stream Dict
+            # and the QUIC connection's stream Dict, and the
+            # per-tick `take_completed_streams` scan degrades to
+            # O(streams-ever-opened) -- quadratic over a long run.
+            self.h3_connections[slot].close_request_stream(sid)
+            if UInt64(sid) in self.connections[slot].conn.streams:
+                _ = self.connections[slot].conn.streams.pop(UInt64(sid))
+
+        if len(plaintext) > 0:
+            var dg = self._build_1rtt_response(slot, plaintext^)
+            if len(dg) > 0:
+                _ = self.send_to(Span[UInt8, _](dg), peer)
+                emitted = True
         return emitted
 
     def _build_initial_response(
@@ -2484,8 +2715,11 @@ struct QuicListener(Movable):
         """
         if slot < 0 or slot >= len(self.connections):
             return List[UInt8]()
-        var conn = self.connections[slot].copy()
-        if len(conn.tx_1rtt_secret) == 0:
+        # Read only the fields this builder needs and bump the pn
+        # counter in place at the end -- deep-copying the whole
+        # QuicConnection (its streams Dict) per outbound packet is
+        # the dominant egress-side CPU cost under concurrency.
+        if len(self.connections[slot].tx_1rtt_secret) == 0:
             return List[UInt8]()
         if slot >= len(self.tls_sessions):
             return List[UInt8]()
@@ -2497,17 +2731,18 @@ struct QuicListener(Movable):
                 "_build_1rtt_response: pn_length out of [1, 4]: "
                 + String(pn_length)
             )
+        var peer_cid = self.connections[slot].peer_cid.copy()
         # 1. Build the unprotected short-header prefix.
         # spin_bit + key_phase stay 0 (no key-update yet).
         var prefix = encode_short_header(
-            conn.peer_cid,
+            peer_cid,
             spin_bit=False,
             key_phase=False,
             pn_length=pn_length,
         )
         # 2. Build unprotected header = prefix + pn bytes.
-        var pn = conn.tx_1rtt_pn
-        var unprotected_header = List[UInt8]()
+        var pn = self.connections[slot].tx_1rtt_pn
+        var unprotected_header = List[UInt8](capacity=len(prefix) + pn_length)
         for i in range(len(prefix)):
             unprotected_header.append(prefix[i])
         for i in range(pn_length):
@@ -2525,26 +2760,30 @@ struct QuicListener(Movable):
             unprotected_header,
             encrypted_payload,
         )
-        # 4. Assemble the protected datagram.
-        var protected = List[UInt8]()
-        for i in range(len(unprotected_header)):
-            protected.append(unprotected_header[i])
+        # 4. Assemble the protected datagram. Move the header buffer in
+        # as the base (it is no longer needed standalone) and reserve
+        # the full datagram length so the payload + tag append in one
+        # allocation -- the per-byte grow loop here was a top _realloc /
+        # allocator-TLS cost under request concurrency.
+        var header_len = len(unprotected_header)
+        var protected = unprotected_header^
+        protected.reserve(header_len + len(encrypted_payload) + len(tag))
         for i in range(len(encrypted_payload)):
             protected.append(encrypted_payload[i])
         for i in range(len(tag)):
             protected.append(tag[i])
         # 5. Apply header protection via rustls at level 3.
-        var pn_offset = len(unprotected_header) - pn_length
+        var pn_offset = header_len - pn_length
         var sample_offset = pn_offset + 4
         if sample_offset + 16 > len(protected):
             raise Error(
                 "_build_1rtt_response: ciphertext too short for HP sample"
             )
-        var sample = List[UInt8]()
+        var sample = List[UInt8](capacity=16)
         for i in range(16):
             sample.append(protected[sample_offset + i])
         var first_local: UInt8 = protected[0]
-        var pn_local = List[UInt8]()
+        var pn_local = List[UInt8](capacity=pn_length)
         for i in range(pn_length):
             pn_local.append(protected[pn_offset + i])
         var first_addr = Int(UnsafePointer(to=first_local))
@@ -2563,8 +2802,7 @@ struct QuicListener(Movable):
         # 6. Advance the 1-RTT pn counter (no offset counter at
         # 1-RTT -- per-stream offsets live on each STREAM frame
         # encoded into the plaintext).
-        conn.tx_1rtt_pn = pn + UInt64(1)
-        self.connections[slot] = conn^
+        self.connections[slot].tx_1rtt_pn = pn + UInt64(1)
         return protected^
 
     def _build_1rtt_handshake_crypto(
@@ -2622,30 +2860,10 @@ struct QuicListener(Movable):
         """
         if len(stream_bytes) == 0 and not fin:
             return List[UInt8]()
-        # Encode the STREAM frame body inline.  Frame type
-        # bits per RFC 9000 §19.8:
-        #
-        #   0b00001 | OFF | LEN | FIN
-        #
-        # We always set OFF (we encode an offset) + LEN (we
-        # encode a length) so the frame is self-describing for
-        # interleaved STREAMs; FIN per the caller's flag.
-        var frame_type: Int = 0x08 | 0x04 | 0x02
-        if fin:
-            frame_type |= 0x01
         var plaintext = List[UInt8]()
-        plaintext.append(UInt8(frame_type))
-        var sid_var = encode_varint(stream_id)
-        for i in range(len(sid_var)):
-            plaintext.append(sid_var[i])
-        var off_var = encode_varint(UInt64(0))
-        for i in range(len(off_var)):
-            plaintext.append(off_var[i])
-        var len_var = encode_varint(UInt64(len(stream_bytes)))
-        for i in range(len(len_var)):
-            plaintext.append(len_var[i])
-        for i in range(len(stream_bytes)):
-            plaintext.append(stream_bytes[i])
+        _encode_h3_stream_frame(
+            plaintext, stream_id, Span[UInt8, _](stream_bytes), fin
+        )
         return self._build_1rtt_response(slot, plaintext^, pn_length)
 
     def run(mut self) raises:
@@ -2695,15 +2913,16 @@ struct QuicListener(Movable):
             raise Error(
                 "schedule_idle_timeout: slot " + String(slot) + " out of range"
             )
-        var conn = self.connections[slot].copy()
-        if conn.idle_timer_id != UInt64(0):
-            _ = self.timer_wheel.cancel(conn.idle_timer_id)
-            conn.idle_timer_id = UInt64(0)
+        # Touch only the idle_timer_id field; this runs once per
+        # inbound datagram, so a whole-connection deep copy here is
+        # pure overhead.
+        var old_id = self.connections[slot].idle_timer_id
+        if old_id != UInt64(0):
+            _ = self.timer_wheel.cancel(old_id)
         var token = encode_timer_token(TIMER_KIND_IDLE, slot)
         var after_ms = Int(self.config.max_idle_timeout_ms)
         var id = self.timer_wheel.schedule(after_ms=after_ms, token=token)
-        conn.idle_timer_id = id
-        self.connections[slot] = conn^
+        self.connections[slot].idle_timer_id = id
         return id
 
     def schedule_pto(mut self, slot: Int, after_ms: Int) raises -> UInt64:
@@ -2712,14 +2931,12 @@ struct QuicListener(Movable):
         doesn't pile up wheel entries."""
         if slot < 0 or slot >= len(self.connections):
             raise Error("schedule_pto: slot " + String(slot) + " out of range")
-        var conn = self.connections[slot].copy()
-        if conn.pto_timer_id != UInt64(0):
-            _ = self.timer_wheel.cancel(conn.pto_timer_id)
-            conn.pto_timer_id = UInt64(0)
+        var old_id = self.connections[slot].pto_timer_id
+        if old_id != UInt64(0):
+            _ = self.timer_wheel.cancel(old_id)
         var token = encode_timer_token(TIMER_KIND_PTO, slot)
         var id = self.timer_wheel.schedule(after_ms=after_ms, token=token)
-        conn.pto_timer_id = id
-        self.connections[slot] = conn^
+        self.connections[slot].pto_timer_id = id
         return id
 
     def schedule_ack_delay(mut self, slot: Int, after_ms: Int) raises -> UInt64:
@@ -2732,13 +2949,12 @@ struct QuicListener(Movable):
             raise Error(
                 "schedule_ack_delay: slot " + String(slot) + " out of range"
             )
-        var conn = self.connections[slot].copy()
-        if conn.ack_delay_timer_id != UInt64(0):
-            return conn.ack_delay_timer_id
+        var existing = self.connections[slot].ack_delay_timer_id
+        if existing != UInt64(0):
+            return existing
         var token = encode_timer_token(TIMER_KIND_ACK_DELAY, slot)
         var id = self.timer_wheel.schedule(after_ms=after_ms, token=token)
-        conn.ack_delay_timer_id = id
-        self.connections[slot] = conn^
+        self.connections[slot].ack_delay_timer_id = id
         return id
 
     def advance_timers(mut self, now_ms: UInt64) raises -> Int:
@@ -2760,14 +2976,12 @@ struct QuicListener(Movable):
             var slot = decoded.slot
             if slot < 0 or slot >= len(self.connections):
                 continue
-            var conn = self.connections[slot].copy()
             if decoded.kind == TIMER_KIND_IDLE:
-                conn.on_idle_expired()
+                self.connections[slot].on_idle_expired()
             elif decoded.kind == TIMER_KIND_PTO:
-                conn.on_pto_expired()
+                self.connections[slot].on_pto_expired()
             elif decoded.kind == TIMER_KIND_ACK_DELAY:
-                conn.on_ack_delay_expired()
-            self.connections[slot] = conn^
+                self.connections[slot].on_ack_delay_expired()
             if not self.connections[slot].alive:
                 self._retire_slot_cids(slot)
         return len(fired)

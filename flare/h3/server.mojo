@@ -562,7 +562,10 @@ struct H3Connection(Copyable, Defaultable, Movable):
         """
         if stream_id not in self.streams:
             self.open_request_stream(stream_id)
-        var state = self.streams[stream_id].copy()
+        # Mutate the stream state in place; deep-copying the whole
+        # _H3StreamState (inbox + headers + body) on every inbound
+        # chunk is the dominant per-request cost under concurrency.
+        ref state = self.streams[stream_id]
         for i in range(len(chunk)):
             state.inbox.append(chunk[i])
         var cursor = 0
@@ -608,7 +611,6 @@ struct H3Connection(Copyable, Defaultable, Movable):
             for k in range(cursor, len(state.inbox)):
                 rest.append(state.inbox[k])
             state.inbox = rest^
-        self.streams[stream_id] = state^
 
     def signal_end_of_stream(mut self, stream_id: Int) raises:
         """Signal that the QUIC layer observed FIN on
@@ -620,9 +622,8 @@ struct H3Connection(Copyable, Defaultable, Movable):
         been fully reassembled."""
         if stream_id not in self.streams:
             return
-        var state = self.streams[stream_id].copy()
+        ref state = self.streams[stream_id]
         state.fin_received = True
-        self.streams[stream_id] = state^
 
     def take_completed_streams(self) raises -> List[Int]:
         """Return the IDs of streams that have a request ready
@@ -640,15 +641,17 @@ struct H3Connection(Copyable, Defaultable, Movable):
         """
         var ready = List[Int]()
         for entry in self.streams.items():
-            var state = entry.value.copy()
-            if state.request_taken:
+            # Read fields through the dict ref; copying each
+            # _H3StreamState here just to test four flags would be
+            # O(open streams) deep copies every tick.
+            if entry.value.request_taken:
                 continue
-            if not state.headers_complete:
+            if not entry.value.headers_complete:
                 continue
-            if state.protocol_error.byte_length() != 0:
+            if entry.value.protocol_error.byte_length() != 0:
                 continue
-            var done = state.fin_received or (
-                state.reader.state == H3_REQUEST_STATE_DONE
+            var done = entry.value.fin_received or (
+                entry.value.reader.state == H3_REQUEST_STATE_DONE
             )
             if not done:
                 continue
@@ -665,7 +668,7 @@ struct H3Connection(Copyable, Defaultable, Movable):
                 "H3Connection.take_request: stream not tracked: "
                 + String(stream_id)
             )
-        var state = self.streams[stream_id].copy()
+        ref state = self.streams[stream_id]
         if state.request_taken:
             raise Error(
                 "H3Connection.take_request: request already taken on stream "
@@ -698,7 +701,6 @@ struct H3Connection(Copyable, Defaultable, Movable):
                 continue
             req.headers.set(state.headers[i].name, state.headers[i].value)
         state.request_taken = True
-        self.streams[stream_id] = state^
         return req^
 
     def emit_response(mut self, stream_id: Int, var response: Response) raises:
@@ -717,7 +719,7 @@ struct H3Connection(Copyable, Defaultable, Movable):
                 "H3Connection.emit_response: stream not tracked: "
                 + String(stream_id)
             )
-        var state = self.streams[stream_id].copy()
+        ref state = self.streams[stream_id]
         if state.response_emitted:
             raise Error(
                 "H3Connection.emit_response: response already emitted on"
@@ -733,7 +735,6 @@ struct H3Connection(Copyable, Defaultable, Movable):
         if len(response.body) != 0:
             encode_response_data(Span[UInt8, _](response.body), state.outbox)
         state.response_emitted = True
-        self.streams[stream_id] = state^
 
     # -- Unidirectional stream type dispatch (RFC 9114 §6.2) ----------
 
@@ -992,8 +993,10 @@ struct H3Connection(Copyable, Defaultable, Movable):
                 "H3Connection.take_response_frames: stream not tracked: "
                 + String(stream_id)
             )
-        var state = self.streams[stream_id].copy()
-        var drained = state.outbox^
-        state.outbox = List[UInt8]()
-        self.streams[stream_id] = state^
+        ref state = self.streams[stream_id]
+        # Swap the outbox out through the ref (a transfer-move out of
+        # a ref-bound field isn't allowed); leaves an empty list in
+        # the stream state and hands the bytes to the caller.
+        var drained = List[UInt8]()
+        swap(drained, state.outbox)
         return drained^
