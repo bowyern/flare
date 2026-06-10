@@ -710,7 +710,7 @@ struct HttpClient(Movable):
         # Forward caller-supplied headers (skip Host — already set)
         for i in range(extra_headers.len()):
             var k = extra_headers._keys[i]
-            if k.lower() != "host" and k.lower() != "authorization":
+            if k.lower() != "host":
                 wire += k + ": " + extra_headers._values[i] + "\r\n"
 
         if len(body) > 0:
