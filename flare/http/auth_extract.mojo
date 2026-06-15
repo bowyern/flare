@@ -248,22 +248,6 @@ def _b64_value(b: Int) -> Int:
     return -1
 
 
-def _b64url_value(b: Int) -> Int:
-    """Same as :func:`_b64_value` but for URL-safe base64
-    (RFC 4648 §5: ``-_`` replace ``+/``)."""
-    if b >= ord("A") and b <= ord("Z"):
-        return b - ord("A")
-    if b >= ord("a") and b <= ord("z"):
-        return b - ord("a") + 26
-    if b >= ord("0") and b <= ord("9"):
-        return b - ord("0") + 52
-    if b == ord("-"):
-        return 62
-    if b == ord("_"):
-        return 63
-    return -1
-
-
 # ── Header parsers ─────────────────────────────────────────────────────────
 
 

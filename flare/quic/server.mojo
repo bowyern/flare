@@ -283,9 +283,9 @@ def _encode_h3_stream_frame(
     Frame type bits: ``0b00001 | OFF | LEN | FIN``. OFF + LEN are
     always set (offset 0, explicit length) so multiple STREAM
     frames coalesce unambiguously into one packet payload; FIN
-    per the caller's flag. Factored out of
-    :meth:`QuicListener._build_1rtt_h3_stream` so the coalescing
-    drain can pack many responses into a single 1-RTT datagram.
+    per the caller's flag. Used by the coalescing 1-RTT drain
+    (:meth:`QuicListener._drain_1rtt_coalesced`) so it can pack
+    many responses into a single 1-RTT datagram.
     """
     var frame_type: Int = 0x08 | 0x04 | 0x02
     if fin:
@@ -431,12 +431,6 @@ struct _SessionSlot(Copyable, Movable):
     """Raw ``Box<Session>*`` (as ``Int``); 0 = NULL sentinel
     (empty-PEM config or acceptor-rejected accept). The dispatcher
     treats 0 as the silent-drop path per RFC 9001 §5.2."""
-
-    var level: Int
-    """Current outbound encryption level (one of the
-    :class:`flare.tls.rustls_quic.QuicEncryptionLevel` codepoints).
-    Starts at ``INITIAL``; advances as the rustls KeyChange enum
-    surfaces handshake + 1-RTT keys."""
 
 
 struct _CryptoStream(Copyable, Defaultable, Movable):
@@ -1200,11 +1194,6 @@ struct QuicListener(Movable):
     from the inbound datagram's sender. The egress path reads
     this to call :meth:`send_to(slot, ...)` without re-parsing
     the inbound datagram."""
-    var rx_1rtt_largest: List[UInt64]
-    """Per-slot largest 1-RTT packet number received. Parallel
-    slab to :attr:`connections`; feeds the ACK frame the egress
-    path emits so the peer's loss detection advances (RFC 9000
-    sec 13.2)."""
     var rx_1rtt_ranges: List[List[UInt64]]
     """Per-slot received 1-RTT packet numbers, stored as disjoint
     ranges (flat [low, high] pairs, descending by high). The ACK
@@ -1293,7 +1282,6 @@ struct QuicListener(Movable):
         self.crypto_reasm = List[_CryptoReasm]()
         self.tls_1rtt_egress_queues = List[List[UInt8]]()
         self.peer_addrs = List[SocketAddr]()
-        self.rx_1rtt_largest = List[UInt64]()
         self.rx_1rtt_ranges = List[List[UInt64]]()
         self.rx_1rtt_ack_pending = List[Bool]()
         self.handshake_done_sent = List[Bool]()
@@ -1542,8 +1530,6 @@ struct QuicListener(Movable):
                     # Record the received pn into the ACK ranges so
                     # the egress ACK reflects exactly what arrived,
                     # gaps and all (RFC 9000 sec 13.2 / 21.4).
-                    if dec[1] >= self.rx_1rtt_largest[slot]:
-                        self.rx_1rtt_largest[slot] = dec[1]
                     _ack_record(self.rx_1rtt_ranges[slot], dec[1])
                     # Only owe an ACK for ack-eliciting packets (a
                     # request's STREAM/CRYPTO frames). Acking the
@@ -1921,7 +1907,7 @@ struct QuicListener(Movable):
         :attr:`h3_response_egress` keyed by ``slot:stream_id``.
 
         The byte buffer feeds the 1-RTT STREAM-frame egress pass
-        in :meth:`_drain_h3_response_egress`, which emits on the
+        in :meth:`_drain_1rtt_coalesced`, which emits on the
         wire once the slot's 1-RTT keys are installed.
         """
         if slot < 0 or slot >= len(self.h3_connections):
@@ -2019,7 +2005,6 @@ struct QuicListener(Movable):
         self.crypto_reasm.append(_CryptoReasm())
         self.tls_1rtt_egress_queues.append(List[UInt8]())
         self.peer_addrs.append(peer)
-        self.rx_1rtt_largest.append(UInt64(0))
         self.rx_1rtt_ranges.append(List[UInt64]())
         self.rx_1rtt_ack_pending.append(False)
         self.handshake_done_sent.append(False)
@@ -2046,16 +2031,16 @@ struct QuicListener(Movable):
         :attr:`connections`.
         """
         if self.tls_acceptor._opaque_handle == 0:
-            return _SessionSlot(handle=0, level=QuicEncryptionLevel.INITIAL)
+            return _SessionSlot(handle=0)
         var tp_blob: List[UInt8]
         try:
             tp_blob = self._encode_server_transport_params(local_cid)
         except:
-            return _SessionSlot(handle=0, level=QuicEncryptionLevel.INITIAL)
+            return _SessionSlot(handle=0)
         var handle = _do_accept(
             self.tls_acceptor._lib, self.tls_acceptor._opaque_handle, tp_blob
         )
-        return _SessionSlot(handle=handle, level=QuicEncryptionLevel.INITIAL)
+        return _SessionSlot(handle=handle)
 
     def _encode_server_transport_params(
         self, local_cid: ConnectionId
@@ -2210,8 +2195,8 @@ struct QuicListener(Movable):
           Encrypted via :meth:`_build_1rtt_handshake_crypto`.
         * ``h3_response_egress`` -- 1-RTT STREAM frames carrying
           H3 response bytes (the live H3 reactor's actual
-          payload). Encrypted via
-          :meth:`_build_1rtt_h3_stream`.
+          payload). Encrypted via the coalescing 1-RTT drain
+          (:meth:`_drain_1rtt_coalesced`).
 
         Each builder is a no-op (returns empty) when its
         respective queue is empty OR the matching per-level
@@ -2287,92 +2272,6 @@ struct QuicListener(Movable):
         if slot < 0 or slot >= len(self.connections):
             return False
         return len(self.connections[slot].tx_1rtt_secret) > 0
-
-    def _build_1rtt_ack(mut self, slot: Int) raises -> List[UInt8]:
-        """Build a protected 1-RTT packet carrying an ACK of the
-        largest received 1-RTT pn, plus HANDSHAKE_DONE the first
-        time. Empty list when keys aren't installed yet.
-        """
-        if slot < 0 or slot >= len(self.connections):
-            return List[UInt8]()
-        if len(self.rx_1rtt_ranges[slot]) < 2:
-            return List[UInt8]()
-        var ack = _ack_from_ranges(self.rx_1rtt_ranges[slot], UInt64(0))
-        var plaintext = List[UInt8]()
-        encode_ack(ack, plaintext)
-        if not self.handshake_done_sent[slot]:
-            encode_handshake_done(plaintext)
-        # Advertise flow-control credit well ahead of consumption so
-        # the peer never blocks (RFC 9000 sec 19.9 / 19.11). Both
-        # ceilings are monotonic: rx_stream_bytes and
-        # rx_bidi_stream_count only grow.
-        var max_data = MaxDataFrame(
-            maximum_data=self.rx_stream_bytes[slot] + _MAX_DATA_WINDOW
-        )
-        encode_max_data(max_data, plaintext)
-        var max_streams = MaxStreamsFrame(
-            unidirectional=False,
-            maximum_streams=self.rx_bidi_stream_count[slot]
-            + _MAX_STREAMS_BIDI_WINDOW,
-        )
-        encode_max_streams(max_streams, plaintext)
-        return self._build_1rtt_response(slot, plaintext^)
-
-    def _drain_h3_response_egress(
-        mut self, slot: Int, peer: SocketAddr
-    ) raises -> Bool:
-        """Drain every ``(slot, stream_id)`` entry in
-        :attr:`h3_response_egress` matching ``slot`` and emit
-        one 1-RTT short-header packet per stream.
-
-        Returns True iff at least one packet was sent.
-
-        Each stream's bytes are wrapped in a STREAM frame
-        (RFC 9000 §19.8) via :meth:`_build_1rtt_h3_stream`,
-        protected at 1-RTT via the slot's rustls session, and
-        emitted with ``fin=True`` because the H3 driver's
-        ``take_response_frames`` finalizes the response when
-        the handler returns (responses are not chunked across
-        packets).
-        """
-        var slot_prefix = String(slot) + ":"
-        var emitted = False
-        var keys_to_drain = List[String]()
-        for entry in self.h3_response_egress.items():
-            var k = entry.key
-            if k.startswith(slot_prefix):
-                keys_to_drain.append(k)
-        for i in range(len(keys_to_drain)):
-            var k = keys_to_drain[i]
-            var bytes = self.h3_response_egress[k].copy()
-            if len(bytes) == 0:
-                continue
-            # Parse the stream_id back out of the key (format
-            # is "<slot>:<stream_id>", ascii only, so byte-
-            # level iteration is safe).
-            var key_bytes = k.as_bytes()
-            var sid: UInt64 = UInt64(0)
-            var found_colon = False
-            var any_digit = False
-            for j in range(len(key_bytes)):
-                var b = Int(key_bytes[j])
-                if not found_colon:
-                    if b == 0x3A:  # ':'
-                        found_colon = True
-                    continue
-                if b < 0x30 or b > 0x39:
-                    continue
-                sid = sid * UInt64(10) + UInt64(b - 0x30)
-                any_digit = True
-            if not found_colon or not any_digit:
-                continue
-            var dg = self._build_1rtt_h3_stream(slot, sid, bytes^, fin=True)
-            if len(dg) == 0:
-                continue
-            _ = self.send_to(Span[UInt8, _](dg), peer)
-            _ = self.h3_response_egress.pop(k)
-            emitted = True
-        return emitted
 
     def _drain_1rtt_coalesced(
         mut self, slot: Int, peer: SocketAddr
@@ -2812,8 +2711,9 @@ struct QuicListener(Movable):
         (rustls post-handshake messages: NewSessionTicket etc.)
         into a 1-RTT packet via :meth:`_build_1rtt_response`.
 
-        Distinct from H3 STREAM-frame egress which lives under
-        :meth:`_build_1rtt_h3_stream`; both end up calling
+        Distinct from H3 STREAM-frame egress, which the
+        coalescing drain (:meth:`_drain_1rtt_coalesced`) encodes
+        via :func:`_encode_h3_stream_frame`; both end up calling
         :meth:`_build_1rtt_response` with the appropriate
         plaintext.
         """
@@ -2834,36 +2734,6 @@ struct QuicListener(Movable):
         var crypto = CryptoFrame(offset=UInt64(0), data=qbytes^)
         var plaintext = List[UInt8]()
         encode_crypto(crypto, plaintext)
-        return self._build_1rtt_response(slot, plaintext^, pn_length)
-
-    def _build_1rtt_h3_stream(
-        mut self,
-        slot: Int,
-        stream_id: UInt64,
-        var stream_bytes: List[UInt8],
-        fin: Bool,
-        pn_length: Int = 2,
-    ) raises -> List[UInt8]:
-        """Wrap a STREAM frame carrying ``stream_bytes`` for
-        the given QUIC stream id into a 1-RTT short-header
-        packet.
-
-        H3 response bytes (HEADERS + DATA frames already
-        encoded by the H3 driver) get framed here into the
-        QUIC STREAM frame shape per RFC 9000 §19.8 + RFC 9000
-        §17.3.1 short-header encryption.
-
-        ``fin`` flips the STREAM frame's FIN bit; the H3
-        driver sets True when the response is complete.
-        ``stream_id`` is the QUIC stream id, monotonically
-        increasing per RFC 9000 §2.1 numbering rules.
-        """
-        if len(stream_bytes) == 0 and not fin:
-            return List[UInt8]()
-        var plaintext = List[UInt8]()
-        _encode_h3_stream_frame(
-            plaintext, stream_id, Span[UInt8, _](stream_bytes), fin
-        )
         return self._build_1rtt_response(slot, plaintext^, pn_length)
 
     def run(mut self) raises:

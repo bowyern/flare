@@ -57,7 +57,7 @@ from flare.quic import (
     protect_initial_packet,
 )
 from flare.quic.state import empty_events
-from flare.tls import QuicEncryptionLevel, RustlsQuicConfig
+from flare.tls import RustlsQuicConfig
 from flare.udp import UdpSocket
 
 
@@ -291,11 +291,6 @@ def test_accept_initial_materializes_real_session() raises:
     assert_true(
         listener.tls_sessions[0].handle != 0,
         "real-PEM accept must materialize a non-zero session handle",
-    )
-    assert_equal(
-        listener.tls_sessions[0].level,
-        QuicEncryptionLevel.INITIAL,
-        "fresh session starts at the INITIAL encryption level",
     )
     listener.shutdown()
     listener.close()

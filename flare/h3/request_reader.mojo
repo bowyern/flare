@@ -58,7 +58,6 @@ from .frame import (
     H3_FRAME_TYPE_MAX_PUSH_ID,
     H3_FRAME_TYPE_PUSH_PROMISE,
     H3_FRAME_TYPE_SETTINGS,
-    H3FrameType,
 )
 
 

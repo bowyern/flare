@@ -75,7 +75,6 @@ from flare.h3.request_reader import (
 from flare.h3.response_writer import (
     encode_response_data,
     encode_response_headers,
-    encode_response_trailers,
 )
 from flare.http.request import Request
 from flare.http.response import Response

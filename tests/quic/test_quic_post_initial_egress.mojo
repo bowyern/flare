@@ -1,9 +1,8 @@
 """Phase F commit 4/6 -- Handshake + 1-RTT egress builders.
 
-Exercises the new :meth:`QuicListener._build_handshake_response` /
-`._build_1rtt_response` / `._build_1rtt_handshake_crypto` /
-`._build_1rtt_h3_stream` builders added to
-``flare/quic/server.mojo``.
+Exercises the :meth:`QuicListener._build_handshake_response` /
+`._build_1rtt_response` builders and the per-level
+`._drain_and_send` pass in ``flare/quic/server.mojo``.
 
 These tests are STRUCTURAL: they verify the gating logic
 (empty-queue / out-of-range-slot / missing-readiness-sentinel
@@ -22,7 +21,7 @@ once rustls's KeyChange::Handshake / KeyChange::OneRtt fires.
 
 from std.collections import List
 from std.pathlib import Path
-from std.testing import assert_equal, assert_false, assert_true
+from std.testing import assert_equal, assert_false
 
 from flare.net import IpAddr, SocketAddr
 from flare.quic import (
@@ -189,26 +188,6 @@ def test_handshake_response_empty_when_queue_empty() raises:
     listener.close()
 
 
-def test_1rtt_h3_stream_empty_without_readiness_sentinel() raises:
-    """The H3 STREAM-frame wrapper short-circuits the same way
-    as the raw 1-RTT builder: empty bytes while the 1-RTT
-    readiness sentinel is missing."""
-    var listener = _bind_real_pem()
-    _ = listener._accept_initial(
-        _synth_long_header(3),
-        SocketAddr(IpAddr.localhost(), UInt16(0)),
-    )
-    var bytes = List[UInt8]()
-    bytes.append(UInt8(0xDE))
-    bytes.append(UInt8(0xAD))
-    bytes.append(UInt8(0xBE))
-    bytes.append(UInt8(0xEF))
-    var dg = listener._build_1rtt_h3_stream(0, UInt64(0), bytes^, fin=True)
-    assert_equal(len(dg), 0)
-    listener.shutdown()
-    listener.close()
-
-
 def test_drain_and_send_noop_on_closed_slot() raises:
     """The refactored :meth:`_drain_and_send` walks every per-
     level queue; closing the slot must short-circuit ALL levels
@@ -238,47 +217,11 @@ def test_drain_and_send_noop_on_closed_slot() raises:
     listener.close()
 
 
-def test_drain_h3_response_egress_skips_unmatched_slots() raises:
-    """:meth:`_drain_h3_response_egress` filters by the slot's
-    ``"<slot>:"`` prefix on the response-egress dict.  Entries
-    belonging to a different slot MUST stay untouched."""
-    var listener = _bind_real_pem()
-    _ = listener._accept_initial(
-        _synth_long_header(5),
-        SocketAddr(IpAddr.localhost(), UInt16(0)),
-    )
-    _ = listener._accept_initial(
-        _synth_long_header(6),
-        SocketAddr(IpAddr.localhost(), UInt16(1)),
-    )
-    # Stamp readiness on slot 0 only (so the builder would fire
-    # if the prefix filter were broken).
-    var conn0 = listener.connections[0].copy()
-    conn0.tx_1rtt_secret.append(UInt8(0xFF))
-    listener.connections[0] = conn0^
-    # Put a response for slot 1 in the dict.
-    var resp = List[UInt8]()
-    resp.append(UInt8(0xAB))
-    listener.h3_response_egress[String("1:0")] = resp^
-    # Drain slot 0 -- must NOT touch the slot-1 entry.
-    var fake_peer = SocketAddr(IpAddr.localhost(), UInt16(0))
-    var any_sent = listener._drain_h3_response_egress(0, fake_peer)
-    assert_false(any_sent)
-    assert_true(
-        String("1:0") in listener.h3_response_egress,
-        "slot-1 response must remain in the dict",
-    )
-    listener.shutdown()
-    listener.close()
-
-
 def main() raises:
     test_handshake_response_empty_when_slot_out_of_range()
     test_1rtt_response_empty_when_slot_out_of_range()
     test_handshake_response_empty_without_readiness_sentinel()
     test_1rtt_response_empty_without_readiness_sentinel()
     test_handshake_response_empty_when_queue_empty()
-    test_1rtt_h3_stream_empty_without_readiness_sentinel()
     test_drain_and_send_noop_on_closed_slot()
-    test_drain_h3_response_egress_skips_unmatched_slots()
-    print("test_quic_post_initial_egress: 8 passed")
+    print("test_quic_post_initial_egress: 6 passed")
