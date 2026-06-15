@@ -335,13 +335,15 @@ def test_no_duplicate_authorization_h1() raises:
         exit()
     usleep(200000)
 
-    var base = String("http://127.0.0.1:") + String(Int(port))
+    var url = String("http://127.0.0.1:", Int(port), "/")
     var got = String("")
     var raised = False
     try:
-        # Client credential is set, caller also sets one — stored wins
-        with HttpClient(base, BearerAuth("stored-cred")) as c:
-            var req = Request(method="GET", url="/")
+        # Client credential is set, caller also sets one - stored wins.
+        # Use a full request URL (not base_url + relative): send() takes
+        # req.url as absolute, base_url joining only happens in get/post.
+        with HttpClient(BearerAuth("stored-cred")) as c:
+            var req = Request(method="GET", url=url)
             req.headers.set("Authorization", "Bearer caller-cred")
             got = c.send(req).text()
     except:
