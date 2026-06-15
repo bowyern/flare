@@ -27,40 +27,16 @@ from flare.http import (
 # ── Response.ok() ─────────────────────────────────────────────────────────────
 
 
-def test_ok_200() raises:
-    """HTTP status 200 must be ok."""
-    var r = Response(status=200)
-    assert_true(r.ok())
+def test_ok_2xx() raises:
+    """Every 2xx status is ok() (lower / mid / upper edge)."""
+    for code in [200, 201, 299]:
+        assert_true(Response(status=code).ok())
 
 
-def test_ok_201() raises:
-    """HTTP status 201 must be ok."""
-    var r = Response(status=201)
-    assert_true(r.ok())
-
-
-def test_ok_299() raises:
-    """HTTP status 299 must be ok."""
-    var r = Response(status=299)
-    assert_true(r.ok())
-
-
-def test_not_ok_400() raises:
-    """HTTP status 400 must not be ok."""
-    var r = Response(status=400)
-    assert_false(r.ok())
-
-
-def test_not_ok_404() raises:
-    """HTTP status 404 must not be ok."""
-    var r = Response(status=404)
-    assert_false(r.ok())
-
-
-def test_not_ok_500() raises:
-    """HTTP status 500 must not be ok."""
-    var r = Response(status=500)
-    assert_false(r.ok())
+def test_not_ok_non2xx() raises:
+    """4xx + 5xx statuses are not ok()."""
+    for code in [400, 404, 500]:
+        assert_false(Response(status=code).ok())
 
 
 # ── Response.text() ───────────────────────────────────────────────────────────
@@ -87,29 +63,13 @@ def test_response_text_ascii() raises:
 # ── Status constants ───────────────────────────────────────────────────────────
 
 
-def test_status_ok() raises:
-    """Status.OK must equal 200."""
+def test_status_constants() raises:
+    """The named Status constants map to their RFC codes."""
     assert_equal(Status.OK, 200)
-
-
-def test_status_not_found() raises:
-    """Status.NOT_FOUND must equal 404."""
-    assert_equal(Status.NOT_FOUND, 404)
-
-
-def test_status_internal_server_error() raises:
-    """Status.INTERNAL_SERVER_ERROR must equal 500."""
-    assert_equal(Status.INTERNAL_SERVER_ERROR, 500)
-
-
-def test_status_created() raises:
-    """Status.CREATED must equal 201."""
     assert_equal(Status.CREATED, 201)
-
-
-def test_status_bad_request() raises:
-    """Status.BAD_REQUEST must equal 400."""
     assert_equal(Status.BAD_REQUEST, 400)
+    assert_equal(Status.NOT_FOUND, 404)
+    assert_equal(Status.INTERNAL_SERVER_ERROR, 500)
 
 
 # ── HeaderMap ─────────────────────────────────────────────────────────────────

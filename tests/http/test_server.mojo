@@ -133,21 +133,21 @@ def test_scan_content_length_absent() raises:
 
 
 def test_scan_content_length_case_insensitive() raises:
-    var raw = "GET / HTTP/1.1\r\ncontent-length: 100\r\n\r\n"
-    var data = List[UInt8]()
-    for b in raw.as_bytes():
-        data.append(b)
-    var header_end = _find_crlfcrlf(data, 0)
-    assert_equal(_scan_content_length(data, header_end), 100)
-
-
-def test_scan_content_length_mixed_case() raises:
-    var raw = "GET / HTTP/1.1\r\nCONTENT-LENGTH: 256\r\n\r\n"
-    var data = List[UInt8]()
-    for b in raw.as_bytes():
-        data.append(b)
-    var header_end = _find_crlfcrlf(data, 0)
-    assert_equal(_scan_content_length(data, header_end), 256)
+    """The field-name match ignores case (lower + upper forms)."""
+    var lower = "GET / HTTP/1.1\r\ncontent-length: 100\r\n\r\n"
+    var lower_data = List[UInt8]()
+    for b in lower.as_bytes():
+        lower_data.append(b)
+    assert_equal(
+        _scan_content_length(lower_data, _find_crlfcrlf(lower_data, 0)), 100
+    )
+    var upper = "GET / HTTP/1.1\r\nCONTENT-LENGTH: 256\r\n\r\n"
+    var upper_data = List[UInt8]()
+    for b in upper.as_bytes():
+        upper_data.append(b)
+    assert_equal(
+        _scan_content_length(upper_data, _find_crlfcrlf(upper_data, 0)), 256
+    )
 
 
 # ── Token validation tests ────────────────────────────────────────────────────
@@ -322,27 +322,14 @@ def test_parse_bytes_options_method() raises:
 # ── Status reason phrases ─────────────────────────────────────────────────────
 
 
-def test_status_reason_200() raises:
+def test_status_reason_mappings() raises:
+    """Each status code maps to its RFC reason phrase; an
+    unmapped code falls back to "Unknown"."""
     assert_equal(_status_reason(200), "OK")
-
-
-def test_status_reason_404() raises:
     assert_equal(_status_reason(404), "Not Found")
-
-
-def test_status_reason_413() raises:
     assert_equal(_status_reason(413), "Content Too Large")
-
-
-def test_status_reason_414() raises:
     assert_equal(_status_reason(414), "URI Too Long")
-
-
-def test_status_reason_500() raises:
     assert_equal(_status_reason(500), "Internal Server Error")
-
-
-def test_status_reason_unknown() raises:
     assert_equal(_status_reason(999), "Unknown")
 
 
@@ -821,36 +808,20 @@ def test_server_empty_body_response() raises:
 # ── _eq_icase tests ───────────────────────────────────────────────────────────
 
 
-def test_eq_icase_same() raises:
-    """_eq_icase matches identical strings."""
+def test_eq_icase() raises:
+    """_eq_icase matches case-insensitively (including the
+    empty/empty case) and rejects differing strings + length
+    mismatches."""
     from flare.http.headers import _eq_icase
 
     assert_true(_eq_icase("Content-Type", "Content-Type"))
-
-
-def test_eq_icase_different_case() raises:
-    """_eq_icase is case-insensitive."""
-    from flare.http.headers import _eq_icase
-
     assert_true(_eq_icase("Content-Type", "content-type"))
     assert_true(_eq_icase("CONTENT-TYPE", "content-type"))
     assert_true(_eq_icase("Host", "HOST"))
-
-
-def test_eq_icase_different_strings() raises:
-    """_eq_icase rejects different strings."""
-    from flare.http.headers import _eq_icase
-
+    assert_true(_eq_icase("", ""))
     assert_false(_eq_icase("Content-Type", "Content-Length"))
     assert_false(_eq_icase("Host", "Hos"))
     assert_false(_eq_icase("", "x"))
-
-
-def test_eq_icase_empty() raises:
-    """_eq_icase matches two empty strings."""
-    from flare.http.headers import _eq_icase
-
-    assert_true(_eq_icase("", ""))
 
 
 # ── encode_to tests ──────────────────────────────────────────────────────────
