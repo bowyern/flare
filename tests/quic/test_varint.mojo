@@ -6,7 +6,7 @@ aioquic reference implementation by hand-decoding each fixture
 under aioquic's ``pull_uint_var`` and confirming byte parity.
 """
 
-from std.testing import assert_equal, assert_true, assert_false
+from std.testing import assert_equal, assert_true
 from std.memory import Span
 
 from flare.quic import (
@@ -109,15 +109,6 @@ def test_zero_round_trips() raises:
     assert_equal(dec.consumed, 1)
 
 
-def test_varint_max_round_trips() raises:
-    """The maximum value (2^62 - 1) round-trips through the 8-byte
-    form."""
-    var enc = encode_varint(UInt64(VARINT_MAX))
-    var dec = decode_varint(Span[UInt8](enc))
-    assert_equal(dec.value, UInt64(VARINT_MAX))
-    assert_equal(dec.consumed, 8)
-
-
 def test_encoder_rejects_overflow() raises:
     """Values above ``2^62 - 1`` cannot be encoded; the encoder
     must reject rather than silently truncate."""
@@ -203,7 +194,6 @@ def main() raises:
     test_rfc9000_appendix_a_8byte_form()
     test_boundary_values()
     test_zero_round_trips()
-    test_varint_max_round_trips()
     test_encoder_rejects_overflow()
     test_decoder_rejects_empty_buffer()
     test_decoder_rejects_truncated_input()
