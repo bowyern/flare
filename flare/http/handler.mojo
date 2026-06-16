@@ -13,7 +13,7 @@ from flare.http import Handler, Request, Response, ok
 struct Greeter(Handler):
     var greeting: String
 
-    fn serve(self, req: Request) raises -> Response:
+    def serve(self, req: Request) raises -> Response:
         return ok(self.greeting + " " + req.url)
 ```
 
@@ -45,7 +45,7 @@ struct Logged[Inner: Handler](Handler):
     var inner: Inner
     var prefix: String
 
-    fn serve(self, req: Request) raises -> Response:
+    def serve(self, req: Request) raises -> Response:
         print(self.prefix, req.method, req.url)
         return self.inner.serve(req)
 ```
@@ -352,7 +352,7 @@ trait CancelHandler(ImplicitlyDestructible, Movable):
 
         @fieldwise_init
         struct SlowHandler(CancelHandler, Copyable, Movable):
-            fn serve(self, req: Request, cancel: Cancel) raises -> Response:
+            def serve(self, req: Request, cancel: Cancel) raises -> Response:
                 for i in range(100):
                     if cancel.cancelled():
                         return ok("partial: " + String(i))
@@ -416,7 +416,7 @@ trait ViewHandler(ImplicitlyDestructible, Movable):
 
         @fieldwise_init
         struct UploadEcho(ViewHandler, Copyable, Movable):
-            fn serve_view[
+            def serve_view[
                 origin: Origin
             ](self, req: RequestView[origin], cancel: Cancel) raises -> Response:
                 # ``req.body()`` returns Span[UInt8, origin] —

@@ -183,7 +183,7 @@ struct Cancel(Copyable, ImplicitlyCopyable, Movable):
 
         @fieldwise_init
         struct SlowHandler(CancelHandler, Copyable, Movable):
-            fn serve(self, req: Request, cancel: Cancel) raises -> Response:
+            def serve(self, req: Request, cancel: Cancel) raises -> Response:
                 for i in range(100):
                     if cancel.cancelled():
                         return ok("partial: " + String(i))

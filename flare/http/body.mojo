@@ -182,7 +182,7 @@ struct ChunkedBody[Source: ChunkSource](Body, Movable):
             var i: Int
             var buf: String
 
-            fn next(mut self, cancel: Cancel) raises -> Optional[List[UInt8]]:
+            def next(mut self, cancel: Cancel) raises -> Optional[List[UInt8]]:
                 if cancel.cancelled() or self.i >= 100:
                     return Optional[List[UInt8]]()
                 self.buf = "data: " + String(self.i) + "\\n\\n"
