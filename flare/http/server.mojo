@@ -63,18 +63,17 @@ struct ServerConfig(Copyable, Movable):
             local development. **Default ``False``** so production
             servers send a fixed status reason and log the message
             (with any user-controlled bytes) to stderr instead of
-            echoing it back. Closes criticism §2.7.
+            echoing it back.
         read_body_timeout_ms: Max ms allowed between headers-end and the
-            last body byte (default 30_000). 0 disables. Closes the
-            slow-body-upload variant of the slow-client DoS surface
-            described in criticism §2.2. Mirrors nginx's
-            ``client_body_timeout``.
+            last body byte (default 30_000). 0 disables. Guards the
+            slow-body-upload variant of the slow-client DoS surface.
+            Mirrors nginx's ``client_body_timeout``.
         handler_timeout_ms: Max ms ``Handler.serve`` (or
             ``CancelHandler.serve``) is allowed to run before the
             reactor flips ``Cancel.TIMEOUT`` (default 30_000). 0
             disables. Cooperative — the handler observes the flip on
-            its next ``cancel.cancelled()`` poll. Closes the
-            handler-watchdog variant of criticism §2.2.
+            its next ``cancel.cancelled()`` poll. Guards the
+            handler-watchdog variant of the slow-client DoS surface.
         request_timeout_ms: Max ms wall-time from request line in to
             response bytes out (default 60_000). 0 disables. The
             reactor enforces this as the outermost deadline; the
@@ -566,9 +565,8 @@ struct HttpServer(Movable):
 
     def tick_h3_once(mut self, now_ms: UInt64) raises -> Int:
         """Advance the h3 listener's timer wheel one tick. Test-
-        only entry point used to validate the bind path before
-        the v0.7 reactor wiring lands; returns the number of
-        connections still alive after the sweep.
+        only entry point used to validate the bind path; returns
+        the number of connections still alive after the sweep.
 
         Raises:
             Error: If no h3 listener is bound.
@@ -1333,9 +1331,8 @@ struct HttpServer(Movable):
         window and force-closes everything else when the deadline
         elapses.
 
-        Wires ``ServerConfig.shutdown_timeout_ms`` (a stub field
-        through ) into a real wait-for-drain loop. Closes
-        criticism §2.12.
+        Wires ``ServerConfig.shutdown_timeout_ms`` into a real
+        wait-for-drain loop.
 
         Args:
             timeout_ms: Maximum ms to wait. ``0`` is a hard stop
@@ -1438,6 +1435,7 @@ from ._server.parse import (
     _parse_http_request_bytes_minimal,
 )
 from ._server.parse_util import (
+    _ascii_safe,
     _ascii_strip_slice,
     _ascii_unchecked_string,
     _find_crlfcrlf,

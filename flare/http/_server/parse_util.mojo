@@ -21,7 +21,7 @@ def _ascii_unchecked_string(span: Span[UInt8, _]) -> String:
     kept under this module's namespace because the H1 reactor
     code throughout :mod:`flare.http._server_reactor_impl` and
     the parser imports it locally; the canonical helper lives in
-    the sans-I/O parser layer (closes critique register §C4).
+    the sans-I/O parser layer.
 
     Caller contract: the bytes MUST already be valid ASCII
     (< 0x80). HTTP/1.1 wire artefacts -- method, URL, version,
@@ -29,6 +29,36 @@ def _ascii_unchecked_string(span: Span[UInt8, _]) -> String:
     7230 token / VCHAR checks the parser already runs upstream.
     """
     return ascii_unchecked_string(span)
+
+
+@always_inline
+def _ascii_safe(s: String) -> String:
+    """Render ``s`` with every byte outside printable ASCII (0x20-0x7E)
+    replaced by ``'?'``.
+
+    Request-line artefacts (method, request-target, version) reach the
+    parser as raw wire bytes and are wrapped into ``String`` via the
+    unchecked ASCII constructor, so they can carry arbitrary
+    attacker-controlled bytes >= 0x80. Concatenating such a ``String``
+    into an ``Error`` message yields a value that is not guaranteed to be
+    valid UTF-8; any downstream codepoint-aware consumer (a logger, the
+    sanitized 4xx body, a fuzz harness scanning the message) then aborts
+    on a non-codepoint-boundary slice. Mapping the message preview to
+    printable ASCII keeps the diagnostic useful without reflecting raw
+    bytes back out.
+    """
+    var n = s.byte_length()
+    if n == 0:
+        return String("")
+    var p = s.unsafe_ptr()
+    var out = String(capacity=n)
+    for i in range(n):
+        var c = p[i]
+        if c >= 32 and c <= 126:
+            out += chr(Int(c))
+        else:
+            out += "?"
+    return out^
 
 
 @always_inline

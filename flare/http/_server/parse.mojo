@@ -20,6 +20,7 @@ from ...net import IpAddr, SocketAddr
 from ...tcp import TcpStream
 
 from .parse_util import (
+    _ascii_safe,
     _ascii_strip_slice,
     _ascii_unchecked_string,
     _find_crlfcrlf,
@@ -99,7 +100,7 @@ def _parse_http_request_bytes(
             sp1 = i
             break
     if sp1 < 0:
-        raise Error("malformed request line: " + req_line)
+        raise Error("malformed request line: " + _ascii_safe(req_line))
     # B3: try the StaticString intern table first — covers the 9
     # RFC 7231 method names (~99 % of real-world traffic is GET /
     # POST). On a hit, the returned String's backing comes from
@@ -126,7 +127,7 @@ def _parse_http_request_bytes(
         if not leniency.allow_mixed_case_method:
             raise Error(
                 "method '"
-                + method
+                + _ascii_safe(method)
                 + "' has lowercase letters (RFC 9110 §9.1"
                 " methods are case-sensitive); set"
                 " H1LeniencyConfig.allow_mixed_case_method to accept"
@@ -381,7 +382,7 @@ def _parse_http_request_bytes_minimal(
             sp1 = i
             break
     if sp1 < 0:
-        raise Error("malformed request line: " + req_line)
+        raise Error("malformed request line: " + _ascii_safe(req_line))
     var interned = intern_method_bytes(req_line.as_bytes()[:sp1])
     var method: String
     if interned:
