@@ -21,10 +21,10 @@ Minimum-friction surface for the C7 reactor state machine:
   contract; ``alpn_selected``, ``protocol``, ``cipher``, and
   ``sni_host`` read introspection state.
 
-Wiring into ``TlsAcceptor`` (which today is API-surface
-scaffolding from S3.1) lands in C7 alongside the reactor
-``STATE_TLS_HANDSHAKE`` state machine; this file is the FFI
-layer those wires plug into.
+Wiring into ``TlsAcceptor`` (whose reactor-side handshake state
+machine is not yet mounted) plugs into the reactor
+``STATE_TLS_HANDSHAKE`` path; this file is the FFI layer those
+wires use.
 
 ## OwnedDLHandle / ASAP-destruction discipline
 
@@ -78,6 +78,15 @@ def _do_ssl_ctx_new_server(
     var cert_c = cert_path.as_c_string_slice()
     var key_c = key_path.as_c_string_slice()
     var addr = f(Int(cert_c.unsafe_ptr()), Int(key_c.unsafe_ptr()))
+    # The C-string pointers escape as raw Int, so the compiler does not
+    # see that the owned path buffers must stay live across the call.
+    # as_c_string_slice may reallocate (a slice-derived, exact-length
+    # path has no spare byte for the NUL), and without anchoring the
+    # owner is ASAP-destroyed before OpenSSL reads the path -- a
+    # heap-use-after-free. Keep both alive until the synchronous call
+    # has consumed them.
+    _ = cert_path^
+    _ = key_path^
     if addr == 0:
         raise Error("flare_ssl_ctx_new_server failed (see TLS error log)")
     return addr
@@ -101,7 +110,11 @@ def _do_ssl_ctx_reload(
     )
     var cert_c = cert_path.as_c_string_slice()
     var key_c = key_path.as_c_string_slice()
-    if Int(f(addr, Int(cert_c.unsafe_ptr()), Int(key_c.unsafe_ptr()))) != 0:
+    var rc = Int(f(addr, Int(cert_c.unsafe_ptr()), Int(key_c.unsafe_ptr())))
+    # Anchor the owned buffers past the call (see _do_ssl_ctx_new_server).
+    _ = cert_path^
+    _ = key_path^
+    if rc != 0:
         raise Error("flare_ssl_ctx_reload failed")
 
 
@@ -122,7 +135,10 @@ def _do_ssl_ctx_set_verify_client_cert(
         "flare_ssl_ctx_set_verify_client_cert"
     )
     var ca_c = ca_path.as_c_string_slice()
-    if Int(f(addr, Int(ca_c.unsafe_ptr()))) != 0:
+    var rc = Int(f(addr, Int(ca_c.unsafe_ptr())))
+    # Anchor the owned buffer past the call (see _do_ssl_ctx_new_server).
+    _ = ca_path^
+    if rc != 0:
         raise Error("flare_ssl_ctx_set_verify_client_cert failed")
 
 

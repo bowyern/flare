@@ -129,7 +129,13 @@ def _do_ssl_ctx_load_ca_bundle(
     # _do_ssl_connect). `ca_path` is owned and outlives the call; `ca_c`
     # views its now-terminated buffer.
     var ca_c = ca_path.as_c_string_slice()
-    return Int(f(ctx, Int(ca_c.unsafe_ptr())))
+    var rc = Int(f(ctx, Int(ca_c.unsafe_ptr())))
+    # The C-string pointer escapes as raw Int; anchor the owned buffer
+    # past the synchronous call so it is not ASAP-destroyed before
+    # OpenSSL reads the path (heap-use-after-free under asan when
+    # as_c_string_slice had to reallocate a slice-derived path).
+    _ = ca_path^
+    return rc
 
 
 def _do_ssl_ctx_load_cert_key(
@@ -145,7 +151,11 @@ def _do_ssl_ctx_load_cert_key(
     # in place. Both owned args outlive the single FFI call.
     var cert_c = cert_path.as_c_string_slice()
     var key_c = key_path.as_c_string_slice()
-    return Int(f(ctx, Int(cert_c.unsafe_ptr()), Int(key_c.unsafe_ptr())))
+    var rc = Int(f(ctx, Int(cert_c.unsafe_ptr()), Int(key_c.unsafe_ptr())))
+    # Anchor the owned buffers past the call (see _do_ssl_ctx_load_ca_bundle).
+    _ = cert_path^
+    _ = key_path^
+    return rc
 
 
 def _do_ssl_ctx_set_alpn_protos(
@@ -181,7 +191,11 @@ def _do_ssl_connect(read lib: OwnedDLHandle, ssl: Int, var sni: String) -> Int:
     # hostname and send a corrupted SNI (some servers reply handshake_failure).
     # `as_c_string_slice` is mutating and `sni` is owned + lives across the call.
     var cstr = sni.as_c_string_slice()
-    return Int(f(ssl, Int(cstr.unsafe_ptr())))
+    var rc = Int(f(ssl, Int(cstr.unsafe_ptr())))
+    # Anchor the owned SNI buffer past the call (see
+    # _do_ssl_ctx_load_ca_bundle); Url.parse(...).host is slice-derived.
+    _ = sni^
+    return rc
 
 
 def _do_ssl_read(
