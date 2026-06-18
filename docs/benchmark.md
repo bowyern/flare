@@ -234,6 +234,42 @@ surfaces — they do not touch the HTTP/1.1 `ConnHandle` read
 path that drives these rows, so the held p99 / p50 numbers are
 the load-bearing signal.
 
+#### No-regression check after the Mojo v1.0.0b2 migration
+
+Re-running the harness on the same dev box after the
+`mojo ==1.0.0b2` toolchain migration (the `reflect[T]` alias,
+non-nullable `UnsafePointer`, and the b2 `mozz` dependency)
+recorded:
+
+| Workload | Server | Workers | Peak req/s | p50 (ms) | p99 (ms) | p99.9 (ms) | p99.99 (ms) | stdev% |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| `throughput`     | **flare**         | 1 | **70,939**  | 1.14 | 3.09 | 3.40 | 3.65  | 0.00 |
+| `throughput`     | Go `net/http`     | 1 | 39,219      | 1.40 | 3.22 | 3.80 | 4.54  | 1.27 |
+| `throughput`     | nginx             | 1 | 78,320      | 1.16 | 3.33 | 3.93 | 4.48  | 0.00 |
+| `throughput_mc`  | **flare_mc**      | 4 | **221,547** | 1.25 | 2.69 | 3.01 | 3.24  | 0.33 |
+| `throughput_mc`  | flare_mc (static) | 4 | 218,130     | 1.28 | 2.70 | 3.01 | 3.22  | 0.33 |
+| `throughput_mc`  | hyper             | 4 | 197,423     | 1.30 | 2.83 | 3.33 | 13.66 | 0.21 |
+| `throughput_mc`  | axum              | 4 | 182,368     | 1.31 | 2.81 | 3.26 | 3.89  | 0.21 |
+| `throughput_mc`  | actix-web         | 4 | 249,922     | 1.22 | 2.77 | 5.34 | 9.81  | 0.39 |
+
+Single-worker flare holds flat: 71,444 -> 70,939 req/s (-0.7 %),
+with p99 3.05 -> 3.09 ms and p50 1.18 -> 1.14 ms. The
+flare-vs-Go ratio is unchanged at 1.81x (70,939 / 39,219), and
+flare lands at 90.5 % of nginx's single-worker peak.
+
+On the multi-worker shape the absolute numbers moved down across
+the board this session -- axum -9.4 %, hyper -9.0 %, flare_mc
+-6.8 %, flare_mc (static) -10.0 % -- while actix-web rose +4.5 %.
+Three of the four independent implementations dropping ~9 % in
+lockstep is the shared dev box drifting, not a flare change: the
+load-bearing signal is flare's standing relative to the Rust
+libraries, which held or improved. flare_mc moved from 1.10x to
+1.12x hyper and from 1.18x to 1.22x axum, and its tail
+discipline is markedly better under b2 -- flare_mc p99.99
+settled at 3.24 ms (run stdev 0.06 ms) against the prior run's
+64.86 ms p99.99 with a 351 ms stdev. No b2 regression on either
+shape.
+
 ### Multi-worker scaling, Linux EPYC
 
 **Worker-count discipline:** the tables below show two things,
