@@ -16,7 +16,7 @@ defensive pattern is documented at length in
 """
 
 from std.collections import List
-from std.ffi import OwnedDLHandle, c_int
+from std.ffi import OwnedDLHandle, c_int, CStringSlice
 
 from ..utils.dylib import find_flare_lib
 
@@ -468,4 +468,8 @@ def _do_last_error(read lib: OwnedDLHandle) -> String:
         def() thin abi("C") -> UnsafePointer[UInt8, MutUntrackedOrigin]
     ]("flare_rustls_quic_last_error")
     var p = f()
-    return String(StringSlice(unsafe_from_utf8_ptr=p))
+    return String(
+        StringSlice(
+            unsafe_from_utf8=CStringSlice(unsafe_from_ptr=p.bitcast[Int8]())
+        )
+    )

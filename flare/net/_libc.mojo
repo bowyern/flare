@@ -26,6 +26,7 @@ from std.ffi import (
     get_errno,
     ErrNo,
     OwnedDLHandle,
+    CStringSlice,
 )
 from std.memory import UnsafePointer, stack_allocation
 from std.sys.info import CompilationTarget, platform_map
@@ -337,7 +338,13 @@ def _read_ip_from_sockaddr(buf: UnsafePointer[UInt8, _]) raises -> String:
     )
     if ntop_buf[0] == 0:
         raise Error("inet_ntop failed: errno " + String(get_errno()))
-    return String(StringSlice(unsafe_from_utf8_ptr=ntop_buf))
+    return String(
+        StringSlice(
+            unsafe_from_utf8=CStringSlice(
+                unsafe_from_ptr=ntop_buf.bitcast[Int8]()
+            )
+        )
+    )
 
 
 @always_inline
@@ -366,7 +373,13 @@ def _read_ipv6_from_sockaddr(buf: UnsafePointer[UInt8, _]) raises -> String:
     )
     if ntop_buf[0] == 0:
         raise Error("inet_ntop (IPv6) failed: errno " + String(get_errno()))
-    return String(StringSlice(unsafe_from_utf8_ptr=ntop_buf))
+    return String(
+        StringSlice(
+            unsafe_from_utf8=CStringSlice(
+                unsafe_from_ptr=ntop_buf.bitcast[Int8]()
+            )
+        )
+    )
 
 
 @always_inline
@@ -405,7 +418,11 @@ def _strerror(code: c_int) -> String:
     ](code)
     if ptr[0] == 0:
         return "unknown error " + String(code)
-    return String(StringSlice(unsafe_from_utf8_ptr=ptr))
+    return String(
+        StringSlice(
+            unsafe_from_utf8=CStringSlice(unsafe_from_ptr=ptr.bitcast[Int8]())
+        )
+    )
 
 
 @always_inline
@@ -702,7 +719,11 @@ def _gai_strerror(code: c_int) -> String:
     ](code)
     if ptr[0] == 0:
         return "unknown getaddrinfo error " + String(code)
-    return String(StringSlice(unsafe_from_utf8_ptr=ptr))
+    return String(
+        StringSlice(
+            unsafe_from_utf8=CStringSlice(unsafe_from_ptr=ptr.bitcast[Int8]())
+        )
+    )
 
 
 @always_inline

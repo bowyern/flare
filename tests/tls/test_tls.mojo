@@ -19,7 +19,7 @@ Test certificates (tests/certs/):
 """
 
 from std.testing import assert_equal, assert_true, assert_false, TestSuite
-from std.ffi import OwnedDLHandle, c_int
+from std.ffi import OwnedDLHandle, c_int, CStringSlice
 from std.memory import UnsafePointer, stack_allocation
 
 
@@ -58,7 +58,11 @@ def _tls_err(lib: OwnedDLHandle) -> String:
         def() thin abi("C") -> UnsafePointer[UInt8, MutUntrackedOrigin]
     ]("flare_ssl_last_error")
     var p = fn_e()
-    return String(StringSlice(unsafe_from_utf8_ptr=p))
+    return String(
+        StringSlice(
+            unsafe_from_utf8=CStringSlice(unsafe_from_ptr=p.bitcast[Int8]())
+        )
+    )
 
 
 # ── Test server wrapper ───────────────────────────────────────────────────────

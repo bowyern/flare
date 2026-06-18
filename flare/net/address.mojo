@@ -9,7 +9,7 @@ on both IPv4 and IPv6; formatting uses ``inet_ntop(3)``.
 
 from std.format import Writable, Writer
 from std.memory import UnsafePointer, stack_allocation
-from std.ffi import external_call, c_int, c_uint, c_char
+from std.ffi import external_call, c_int, c_uint, c_char, CStringSlice
 
 from ._libc import AF_INET, AF_INET6, _inet_pton
 
@@ -110,7 +110,16 @@ struct IpAddr(Copyable, Equatable, ImplicitlyCopyable, Movable, Writable):
             )
             if ntop[0] == 0:
                 raise AddressParseError(s)
-            return IpAddr(String(StringSlice(unsafe_from_utf8_ptr=ntop)), False)
+            return IpAddr(
+                String(
+                    StringSlice(
+                        unsafe_from_utf8=CStringSlice(
+                            unsafe_from_ptr=ntop.bitcast[Int8]()
+                        )
+                    )
+                ),
+                False,
+            )
 
         # Try IPv6
         var ip6 = stack_allocation[16, UInt8]()
@@ -130,7 +139,16 @@ struct IpAddr(Copyable, Equatable, ImplicitlyCopyable, Movable, Writable):
             )
             if ntop[0] == 0:
                 raise AddressParseError(s)
-            return IpAddr(String(StringSlice(unsafe_from_utf8_ptr=ntop)), True)
+            return IpAddr(
+                String(
+                    StringSlice(
+                        unsafe_from_utf8=CStringSlice(
+                            unsafe_from_ptr=ntop.bitcast[Int8]()
+                        )
+                    )
+                ),
+                True,
+            )
 
         raise AddressParseError(s)
 
