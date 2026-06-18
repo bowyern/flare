@@ -37,15 +37,19 @@ from flare.net import SocketAddr
 
 @always_inline
 def _null_arg() -> _OpaquePtr:
-    return _OpaquePtr(unsafe_from_address=0)
+    # b2: UnsafePointer is non-nullable; build C NULL from a runtime 0.
+    var null_addr = 0
+    return _OpaquePtr(unsafe_from_address=null_addr)
 
 
 def _increment(arg: _OpaquePtr) -> _OpaquePtr:
     """Increment the int at ``arg`` and return NULL."""
-    if arg:
+    # b2: UnsafePointer dropped __bool__; check the address explicitly.
+    if Int(arg) != 0:
         var p = arg.bitcast[Int]()
         p[] = p[] + 1
-    return _OpaquePtr(unsafe_from_address=0)
+    var null_addr = 0
+    return _OpaquePtr(unsafe_from_address=null_addr)
 
 
 def target(data: List[UInt8]) raises:
