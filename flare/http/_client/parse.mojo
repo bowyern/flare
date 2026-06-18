@@ -502,9 +502,11 @@ def _parse_hex(s: String) raises -> Int:
     """
     if s.byte_length() == 0:
         raise NetworkError("empty chunk-size in chunked encoding")
-    # A 16-digit hex chunk size already exceeds 64 PiB; reject longer strings
-    # to prevent Int overflow before the digit accumulation below.
-    if s.byte_length() > 16:
+    # Cap at 15 hex digits (max 2^60-1): a 16th digit can push the signed Int
+    # accumulator past 2^63-1 and wrap it negative, which would drive the chunk
+    # cursor negative and index out of bounds. 15 hex digits already addresses
+    # well past 1 EiB, far more than any real chunk.
+    if s.byte_length() > 15:
         raise NetworkError("chunk-size too large in chunked encoding: " + s)
     var result = 0
     for i in range(s.byte_length()):
