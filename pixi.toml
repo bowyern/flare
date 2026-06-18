@@ -34,7 +34,7 @@ scripts = ["flare/tls/ffi/build.sh", "flare/http/ffi/build.sh", "flare/tls/ffi/b
 # as a library picks up. Contributor-only tooling (docs generator, pre-commit
 # hooks) lives under [feature.dev] and is opted into via `pixi install -e dev`.
 [dependencies]
-mojo             = "==1.0.0b1"
+mojo             = "==1.0.0b2"
 openssl          = ">=3.6.1,<4"    # TLS: libssl + libcrypto (SHA-1 for WS handshake)
 ca-certificates  = ">=2025.1.31"   # TLS default CA bundle → $CONDA_PREFIX/ssl/cacert.pem
 zlib             = ">=1.3.1,<2"    # HTTP: Content-Encoding gzip/deflate decompression
@@ -80,19 +80,13 @@ gdb        = ">=14"
 valgrind   = ">=3.22"
 heaptrack  = ">=1.5"
 
-# KNOWN ISSUE (2026-06-16): a fresh build of the fuzz env can fail with
-# "invalid type: string \"mojo ==1.0.0b1\", expected struct MatchSpec".
-# mozz v0.1.3 floats its own build backend (`backend = { name =
-# "pixi-build-rattler-build", version = "*" }`), so once 0.4.x shipped it
-# pulls a backend this pixi rejects -- the same break [package.build] above
-# pins ==0.3.13 to avoid. pixi has no consumer-side override for a git
-# dependency's declared backend version, so the fix lives upstream: re-tag
-# mozz with `backend = { ..., version = "==0.3.13" }` and bump the tag here.
-# Until then, build against a local mozz checkout with that one-line pin.
-# (The flare-side fuzz-http-server crash -- raw wire bytes reflected into
-# Error messages -- is fixed in flare/http/_server/parse_util.mojo::_ascii_safe.)
+# mozz tracks branch=main: the b2-migrated mozz pins its own build backend
+# to ==0.3.13 (matching [package.build] above), so the fuzz env solves and
+# builds cleanly under Mojo 1.0.0b2. (The flare-side fuzz-http-server crash
+# -- raw wire bytes reflected into Error messages -- is fixed in
+# flare/http/_server/parse_util.mojo::_ascii_safe.)
 [feature.fuzz.dependencies]
-mozz = { git = "https://github.com/ehsanmok/mozz.git", tag = "v0.1.3" }
+mozz = { git = "https://github.com/ehsanmok/mozz.git", branch = "main" }
 
 # ── Code-metrics tooling (complexity + coverage proxy) ───────────────────────
 # Opt in with: pixi run -e metrics metrics

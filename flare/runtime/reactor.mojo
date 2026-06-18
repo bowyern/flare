@@ -527,8 +527,10 @@ struct Reactor(Movable):
                     ts,
                 )
             else:
+                # b2: UnsafePointer is non-nullable; C NULL from a runtime 0.
+                var null_addr = 0
                 var null_ts = UnsafePointer[UInt8, MutExternalOrigin](
-                    unsafe_from_address=0
+                    unsafe_from_address=null_addr
                 )
                 n = _kevent(
                     self._fd,

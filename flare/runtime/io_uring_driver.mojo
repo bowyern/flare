@@ -176,8 +176,10 @@ def libc_mmap(
     debug_assert[assert_mode="safe"](
         fd >= -1, "libc_mmap: fd must be >= -1; got ", fd
     )
+    # b2: UnsafePointer is non-nullable; build C NULL from a runtime 0.
+    var null_addr_int = 0
     var null_addr = UnsafePointer[UInt8, MutExternalOrigin](
-        unsafe_from_address=0
+        unsafe_from_address=null_addr_int
     )
     var rc = external_call["mmap", UnsafePointer[UInt8, MutExternalOrigin]](
         null_addr,
@@ -539,8 +541,10 @@ struct IoUringDriver(Movable):
         var k_head = _atomic_load_u32_acquire(self._sq_head_ptr)
         var pending = Int(self._sq_local_tail) - Int(k_head)
         if pending >= self.sq_entries():
+            # b2: UnsafePointer is non-nullable; C NULL from a runtime 0.
+            var null_addr = 0
             return UnsafePointer[UInt8, MutExternalOrigin](
-                unsafe_from_address=0
+                unsafe_from_address=null_addr
             )
         var idx = Int(self._sq_local_tail & self._sq_ring_mask)
         return self._sqes_ptr + idx * IO_URING_SQE_BYTES

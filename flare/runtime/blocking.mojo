@@ -220,7 +220,11 @@ def _block_thunk[
     # _Task allocation itself.
     task_ptr.free()
 
-    return UnsafePointer[UInt8, MutExternalOrigin](unsafe_from_address=0)
+    # b2: UnsafePointer is non-nullable; build C NULL from a runtime 0.
+    var null_addr = 0
+    return UnsafePointer[UInt8, MutExternalOrigin](
+        unsafe_from_address=null_addr
+    )
 
 
 # ── Cancel-reason error formatting ──────────────────────────────────────────
